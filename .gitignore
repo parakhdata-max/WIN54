@@ -5,3 +5,7 @@ build/
 *.log
 coverage/
 .cache/
+
+__pycache__/
+*.pyc
+logs/
