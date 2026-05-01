@@ -1,0 +1,27 @@
+{
+  "enabled_rules": {
+    "party_validator":    true,
+    "product_validator":  true,
+    "rx_validator":       true,
+    "financial_validator": true,
+    "TAX":                true,
+    "FULFILLMENT":        true
+  },
+  "thresholds": {
+    "max_credit_usage": 0.9,
+    "max_rx_qty":       30
+  },
+  "auto_approve": {
+    "allow_with_warnings": true
+  },
+  "tax": {
+    "strict_gst_required": true,
+    "valid_gst_slabs": [0, 5, 12, 18, 28]
+  },
+  "fulfillment": {
+    "rx_tolerance_default":           false,
+    "block_billing_without_purchase": true,
+    "warn_on_supplier_override":      true,
+    "reorder_check_on_order_save":    true
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "enabled_rules": {
+    "ORDER": true,
+    "PARTY": true,
+    "PRODUCT": true,
+    "RX": true,
+    "FINANCIAL": true,
+    "TAX": true
+  },
+  "thresholds": {
+    "max_credit_usage": 0.9,
+    "max_rx_qty": 30
+  },
+  "auto_approve": {
+    "allow_with_warnings": true
+  },
+  "financial": {
+    "warning_ratio": 0.9,
+    "block_ratio": 1.0
+  },
+  "tax": {
+    "strict_gst_required": true,
+    "valid_gst_slabs": [
+      0,
+      5,
+      12,
+      18,
+      28
+    ]
+  }
+}

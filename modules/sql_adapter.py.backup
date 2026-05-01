@@ -1,0 +1,2362 @@
+# modules/sql_adapter.py
+# ==========================================================
+# HARDENED VERSION with Global NaN Safety + NULL Safety
+# ==========================================================
+
+import math
+import pandas as pd
+import psycopg2
+from psycopg2 import Error as PostgresError
+from psycopg2.extras import RealDictCursor
+import time as _time
+import traceback
+import logging
+from psycopg2.extras import RealDictCursor
+from typing import Optional, Union, Tuple, List, Dict, Any
+from functools import wraps
+import time
+
+# -------------------------------------------------
+# LOGGING
+# -------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Slow query threshold — operations above this log a warning
+_SLOW_QUERY_MS = 500
+
+# -------------------------------------------------
+# EXCEPTIONS
+# -------------------------------------------------
+
+class DatabaseError(Exception): pass
+class ConnectionError(DatabaseError): pass
+class QueryError(DatabaseError): pass
+class DataValidationError(DatabaseError): pass
+
+# -------------------------------------------------
+# DB CONFIG
+# -------------------------------------------------
+
+DB_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "user": "postgres",
+    "password": "newpassword123",
+    "dbname": "dv_optical_test",
+    "connect_timeout": 10
+}
+
+# ==========================================================
+# 🔥 GLOBAL VALUE SANITIZER (CORE FIX)
+# Converts NaN/pd.NA/np.nan -> None (Postgres safe)
+# ==========================================================
+
+def _sanitize_value(v):
+    """
+    Convert any form of NaN/NA to None for Postgres safety
+    """
+    if v is None:
+        return None
+
+    # Handle pandas NaN (float NaN)
+    if isinstance(v, float) and math.isnan(v):
+        return None
+
+    # Handle pandas NA, numpy NaN, etc.
+    try:
+        if pd.isna(v):
+            return None
+    except:
+        pass
+
+    # Convert empty strings for numeric fields to None
+    if isinstance(v, str) and v.strip() == "":
+        return None
+
+    return v
+
+
+def _sanitize_params(params):
+    """
+    Sanitize all parameters in a tuple or dict
+    Handles both positional (%s) and named (%(name)s) params
+    """
+    if params is None:
+        return None
+    
+    if isinstance(params, dict):
+        return {k: _sanitize_value(v) for k, v in params.items()}
+    
+    if isinstance(params, (list, tuple)):
+        return tuple(_sanitize_value(p) for p in params)
+    
+    return params
+
+
+def _sanitize_sql_for_legacy_nan(sql: str) -> str:
+    """
+    Emergency fix for legacy f-string queries with raw NaN
+    Prevents crashes even if someone writes bad SQL
+    
+    Uses regex to safely match NaN as a word boundary and handle spacing
+    """
+    import re
+    
+    if re.search(r"\bNaN\b", sql, re.IGNORECASE):
+        # Match = followed by optional whitespace and NaN
+        sql = re.sub(r"=\s*NaN\b", "IS NULL", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"!=\s*NaN\b", "IS NOT NULL", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"<>\s*NaN\b", "IS NOT NULL", sql, flags=re.IGNORECASE)
+        logger.warning("⚠️ Legacy NaN detected in SQL - auto-fixed to IS NULL/IS NOT NULL")
+    return sql
+
+# ==========================================================
+# SECURITY: READ-ONLY MODE FOR CERTAIN TAGS
+# ==========================================================
+
+READ_ONLY_TAGS = {
+    "power_stock", 
+    "case_search", 
+    "product_search",
+    "party_search",
+    "order_search"
+}
+
+def _check_read_only_safety(sql: str, tag: str = None):
+    """
+    Prevent accidental UPDATE/DELETE in read-only contexts
+    """
+    if tag and tag in READ_ONLY_TAGS:
+        sql_upper = sql.strip().upper()
+        if sql_upper.startswith(("UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER")):
+            raise QueryError(f"❌ Blocked unsafe mutation query in read-only context '{tag}'")
+
+# -------------------------------------------------
+# RETRY DECORATOR
+# -------------------------------------------------
+
+def retry_on_failure(max_retries=3, delay=1):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (PostgresError, ConnectionError) as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        time.sleep(delay * (2 ** attempt))
+            raise last_exception
+        return wrapper
+    return decorator
+
+# -------------------------------------------------
+# CONNECTION MANAGEMENT
+# -------------------------------------------------
+
+@retry_on_failure()
+def get_connection():
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = True
+    if conn.closed:
+        raise ConnectionError("DB connection inactive")
+    return conn
+
+def close_connection(conn):
+    if conn and not conn.closed:
+        conn.close()
+
+def get_transaction_connection():
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.autocommit = False   # IMPORTANT
+    if conn.closed:
+        raise ConnectionError("DB connection inactive")
+    return conn
+
+# ==========================================================
+# 🔥 CORE HARDENED EXECUTE_QUERY (REPLACES ALL VERSIONS)
+# - NaN safe
+# - NULL safe  
+# - Param safe
+# - Legacy SQL auto-healing
+# - Read-only protection
+# ==========================================================
+
+def execute_query(
+    sql: str, 
+    tag: str = None, 
+    params: Union[Tuple, List, Dict] = None
+) -> pd.DataFrame:
+    """
+    Global hardened executor for all SQL queries
+    
+    Args:
+        sql: SQL query string
+        tag: Optional tag for logging/security (e.g., 'power_stock', 'orders')
+        params: Query parameters (tuple, list, or dict)
+    
+    Returns:
+        DataFrame with results (empty DataFrame for non-SELECT queries)
+    
+    Features:
+        ✅ Automatic NaN → None conversion
+        ✅ NULL-safe power comparisons
+        ✅ Legacy f-string auto-healing
+        ✅ Read-only context protection
+        ✅ Comprehensive error logging
+    """
+    conn = None
+    try:
+        # Security check for read-only contexts
+        _check_read_only_safety(sql, tag)
+        
+        # Log query with tag
+        if tag:
+            logger.info(f"Executing query [{tag}]")
+        
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Sanitize parameters (NaN → None)
+        safe_params = _sanitize_params(params)
+        
+        # Legacy NaN auto-healing for raw SQL
+        if safe_params is None:
+            sql = _sanitize_sql_for_legacy_nan(sql)
+        
+        # Execute with or without parameters
+        if safe_params:
+            cur.execute(sql, safe_params)
+        else:
+            cur.execute(sql)
+        
+        # Handle SELECT vs non-SELECT queries
+        if cur.description:
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            df = pd.DataFrame(rows, columns=cols)
+            
+            # Sanitize DataFrame NaN values for consistency
+            df = df.where(pd.notnull(df), None)
+            
+            return df
+        
+        # Non-SELECT queries return empty DataFrame
+        return pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Query failed [{tag or 'unknown'}]: {e}")
+        logger.error(f"SQL: {sql}")
+        logger.error(f"Params: {params}")
+        raise QueryError(e)
+    finally:
+        close_connection(conn)
+
+
+# ==========================================================
+# BACKOFFICE QUERY FUNCTIONS (Enhanced with Sanitization)
+# ==========================================================
+
+
+def run_query(sql: str, params=None) -> list:
+    """
+    Execute SQL and return list of plain dicts.
+    Always converts RealDictRow → dict and normalizes bytes/memoryview.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Only pass params if there are actual params to pass
+        if params:
+            cursor.execute(sql, params)
+        else:
+            cursor.execute(sql)
+
+        rows = cursor.fetchall()
+
+        def _norm(v):
+            if isinstance(v, memoryview):
+                v = bytes(v)
+            if isinstance(v, (bytes, bytearray)):
+                try:
+                    return v.decode("utf-8")
+                except Exception:
+                    return str(v)
+            return v
+
+        # Convert RealDictRow → plain dict so .get() always works
+        return [{k: _norm(v) for k, v in dict(row).items()} for row in rows]
+
+    except Exception as e:
+        logger.error(f"run_query failed: {e}")
+        logger.error(f"SQL: {sql}")
+        logger.error(f"Params: {params}")
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        close_connection(conn)
+def run_scalar(sql: str, params: dict = None):
+    """
+    Execute SQL query and return a single scalar value.
+    Used for DB functions that return a single value.
+    
+    Args:
+        sql: SQL query string (can use %(param_name)s format)
+        params: Dictionary of parameter values (optional)
+        
+    Returns:
+        Single value (first column of first row)
+    
+    ✅ NaN-safe
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # Sanitize dict params
+        safe_params = _sanitize_params(params)
+        
+        if safe_params:
+            cursor.execute(sql, safe_params)
+        else:
+            cursor.execute(sql)
+            
+        result = cursor.fetchone()
+        return _sanitize_value(result[0]) if result else None
+        
+    except Exception as e:
+        logger.error(f"run_scalar failed: {e}")
+        logger.error(f"SQL: {sql}")
+        logger.error(f"Params: {params}")
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        close_connection(conn)
+
+
+def run_write(sql: str, params: dict = None) -> bool:
+    """
+    Execute SQL write operation (INSERT/UPDATE/DELETE).
+    Uses transaction connection for safety.
+    
+    Args:
+        sql: SQL query string (can use %(param_name)s format)
+        params: Dictionary of parameter values (optional)
+        
+    Returns:
+        True if successful
+    
+    ✅ NaN-safe
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_transaction_connection()
+        cursor = conn.cursor()
+        
+        # Sanitize dict params
+        safe_params = _sanitize_params(params)
+        
+        if safe_params:
+            cursor.execute(sql, safe_params)
+        else:
+            cursor.execute(sql)
+            
+        conn.commit()
+        return True
+        
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"run_write failed: {e}")
+        logger.error(f"SQL: {sql}")
+        logger.error(f"Params: {params}")
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+def run_transaction(steps: list) -> bool:
+    """
+    Execute multiple SQL statements in a single atomic transaction.
+    All steps succeed or all are rolled back — no partial commits.
+    """
+    conn   = None
+    cursor = None
+    try:
+        conn   = get_transaction_connection()
+        cursor = conn.cursor()
+
+        for sql, params in steps:
+            safe_params = _sanitize_params(params) if params else None
+            if safe_params:
+                cursor.execute(sql, safe_params)
+            else:
+                cursor.execute(sql)
+
+        conn.commit()
+        return True
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"run_transaction failed — rolled back: {e}")
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def run_transaction_fn(fn) -> any:
+    """
+    Execute an arbitrary function inside a single atomic transaction.
+    Passes (conn, cursor) to fn. fn returns a result value.
+
+    This is the CORRECT pattern for doc-number + INSERT atomicity:
+
+        def create_challan(conn, cursor):
+            _, n = next_order_number(cursor, "CHALLAN")
+            ch_no = format_doc_number("CHALLAN", n)
+            cursor.execute(INSERT_CHALLAN_SQL, {..., "challan_no": ch_no})
+            return ch_no
+
+        ch_no = run_transaction_fn(create_challan)
+
+    The doc-number allocation (FOR UPDATE) and the INSERT run in the
+    same transaction. If INSERT fails, number rolls back. Zero gap.
+
+    Raises QueryError on failure.
+    """
+    conn   = None
+    cursor = None
+    try:
+        conn   = get_transaction_connection()
+        cursor = conn.cursor()
+        result = fn(conn, cursor)
+        conn.commit()
+        return result
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"run_transaction_fn failed — rolled back: {e}")
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def status_change_atomic(order_no: str, expected_status: str, new_status: str,
+                          changed_by: str = "system", remarks: str = "") -> bool:
+    """
+    Atomically move an order from expected_status to new_status.
+    Uses WHERE status = expected_status so concurrent updates are safe:
+      - If rows_affected == 1: success, we won the race
+      - If rows_affected == 0: someone else already moved it — caller handles
+
+    This is the SAP/Tally pattern for optimistic status locking.
+
+    Returns True if status was updated, False if pre-condition not met.
+    Raises QueryError on DB error.
+    """
+    conn   = None
+    cursor = None
+    try:
+        conn   = get_transaction_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            UPDATE orders
+            SET    status     = %(new)s,
+                   updated_at = NOW()
+            WHERE  order_no   = %(ono)s
+              AND  status     = %(exp)s
+        """, {"new": new_status, "ono": order_no, "exp": expected_status})
+
+        rows_affected = cursor.rowcount
+
+        if rows_affected == 1:
+            # Log status history
+            try:
+                cursor.execute("""
+                    INSERT INTO order_status_history
+                        (order_id, from_status, to_status, changed_by_name, remarks, changed_at)
+                    SELECT id, %(exp)s, %(new)s, %(by)s, %(rmk)s, NOW()
+                    FROM   orders WHERE order_no = %(ono)s
+                """, {
+                    "exp": expected_status, "new": new_status,
+                    "by": changed_by, "rmk": remarks or f"{expected_status} -> {new_status}",
+                    "ono": order_no,
+                })
+            except Exception:
+                pass  # history is non-fatal
+            conn.commit()
+            return True
+        else:
+            conn.rollback()
+            return False  # pre-condition not met — another user changed it first
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"status_change_atomic failed for {order_no}: {e}")
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def payment_collect_atomic(invoice_id: str, amount: float,
+                            payment_fn) -> bool:
+    """
+    Collect a payment atomically.
+    Locks the invoice row, checks balance_due >= amount, then calls payment_fn(cursor).
+    Prevents double-payment race condition.
+
+    payment_fn(cursor) should execute the INSERT INTO payments statement.
+    Returns True on success, False if balance insufficient.
+    """
+    conn   = None
+    cursor = None
+    try:
+        conn   = get_transaction_connection()
+        cursor = conn.cursor()
+
+        # Lock invoice row and check balance
+        cursor.execute("""
+            SELECT COALESCE(grand_total, 0) - COALESCE(amount_paid, 0) AS balance_due
+            FROM   invoices
+            WHERE  id = %(id)s::uuid
+            FOR UPDATE
+        """, {"id": invoice_id})
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False
+        balance = float(row[0])
+        if balance < amount - 0.01:  # 1 paisa tolerance
+            conn.rollback()
+            return False
+
+        payment_fn(cursor)
+        conn.commit()
+        return True
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"payment_collect_atomic failed: {e}")
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def consult_convert_atomic(consultation_order_no: str, new_retail_no: str) -> bool:
+    """
+    Mark a consultation as converted atomically.
+    Uses WHERE is_converted = FALSE so only one conversion can succeed.
+
+    Returns True if this call won the conversion, False if already converted.
+    """
+    conn   = None
+    cursor = None
+    try:
+        conn   = get_transaction_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            UPDATE orders
+            SET    is_converted    = TRUE,
+                   linked_retail_no = %(rno)s,
+                   updated_at       = NOW()
+            WHERE  order_no        = %(ono)s
+              AND  (is_converted IS NULL OR is_converted = FALSE)
+        """, {"rno": new_retail_no, "ono": consultation_order_no})
+
+        won = cursor.rowcount == 1
+        if won:
+            conn.commit()
+        else:
+            conn.rollback()
+        return won
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+# ==========================================================
+# 🔥 OPTIONAL: SQL BUILDER PATTERN (For Complex Queries)
+# ==========================================================
+
+
+def stock_allocate_atomic(order_line_id: str, batch_no: str,
+                           product_id: str, qty: int) -> bool:
+    """
+    Atomically allocate stock for an order line.
+
+    SAP/Tally pattern:
+      1. Lock the inventory_stock row (FOR UPDATE)
+      2. Check available = physical_qty - already_allocated >= qty
+      3. If yes: write allocation, return True
+      4. If no: return False (caller shows "insufficient stock" message)
+
+    Prevents two staff allocating the same physical unit to two orders.
+    Returns True on success, False if stock insufficient.
+    Raises QueryError on DB error.
+    """
+    conn   = None
+    cursor = None
+    try:
+        conn   = get_transaction_connection()
+        cursor = conn.cursor()
+
+        # Lock the batch row
+        cursor.execute("""
+            SELECT COALESCE(physical_qty, quantity, 0)       AS physical_qty,
+                   COALESCE(allocated_qty, 0)                AS allocated_qty,
+                   COALESCE(reserved_qty, 0)                 AS reserved_qty
+            FROM   inventory_stock
+            WHERE  product_id = %(pid)s::uuid
+              AND  batch_no   = %(bno)s
+            FOR UPDATE
+        """, {"pid": product_id, "bno": batch_no})
+
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False
+
+        physical   = int(row[0])
+        already    = int(row[1]) + int(row[2])
+        available  = physical - already
+
+        if available < qty:
+            conn.rollback()
+            return False
+
+        # Idempotency guard: only proceed if this line is NOT already allocated.
+        # Uses RETURNING so the entire block is skipped on retry/double-save.
+        # batch_status = 'ALLOCATED' is the natural idempotency key.
+        cursor.execute("""
+            UPDATE order_lines
+            SET    allocated_qty = %(qty)s,
+                   batch_status  = 'ALLOCATED',
+                   updated_at    = NOW()
+            WHERE  id            = %(lid)s::uuid
+              AND  COALESCE(batch_status, '') != 'ALLOCATED'
+            RETURNING id
+        """, {"qty": qty, "lid": order_line_id})
+
+        _claimed = cursor.fetchone()
+
+        if not _claimed:
+            # Line already allocated — skip inventory deduction entirely.
+            # This is a retry / double-save — safe to commit and return True.
+            conn.commit()
+            return True
+
+        # Reserve the stock — only runs when _claimed row returned above
+        cursor.execute("""
+            UPDATE inventory_stock
+            SET    allocated_qty = COALESCE(allocated_qty, 0) + %(qty)s,
+                   updated_at    = NOW()
+            WHERE  product_id = %(pid)s::uuid
+              AND  batch_no   = %(bno)s
+        """, {"qty": qty, "pid": product_id, "bno": batch_no})
+
+        conn.commit()
+        return True
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"stock_allocate_atomic failed: {e}")
+        raise QueryError(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def get_fresh_order_status(order_no: str) -> str:
+    """
+    Fetch current order status directly from DB — bypasses session cache.
+    Use before any write action to detect stale UI state.
+    Returns status string or empty string if not found.
+    """
+    try:
+        rows = run_query(
+            "SELECT status FROM orders WHERE order_no = %s LIMIT 1",
+            (order_no,)
+        )
+        return str(rows[0]["status"]).upper() if rows else ""
+    except Exception:
+        return ""
+
+def sql_builder(base_sql: str) -> Dict[str, Any]:
+    """
+    Initialize a SQL builder for dynamic query construction
+    
+    Usage:
+        b = sql_builder("SELECT * FROM table WHERE 1=1")
+        sql_add(b, " AND sph = %s", sph)
+        sql_add(b, " AND cyl = %s", cyl)
+        df = execute_query(b["sql"], params=b["params"])
+    """
+    return {
+        "sql": base_sql,
+        "params": []
+    }
+
+
+def sql_add(builder: Dict[str, Any], clause: str, value: Any):
+    """
+    Add a clause and parameter to SQL builder
+    Automatically sanitizes the value
+    """
+    if value is not None:
+        builder["sql"] += clause
+        builder["params"].append(_sanitize_value(value))
+
+
+def sql_finalize(builder: Dict[str, Any]) -> Tuple[str, Tuple]:
+    """
+    Finalize SQL builder and return (sql, params) tuple
+    """
+    return builder["sql"], tuple(builder["params"])
+
+# ==========================================================
+# 🔥 OPTICAL-SAFE POWER FILTER (FINAL VERSION)
+# ==========================================================
+
+def add_power_filters(
+    sql: str,
+    params: List,
+    sph=None,
+    cyl=None,
+    axis=None,
+    add_power=None
+) -> Tuple[str, List]:
+    """
+    Optical-safe power filters
+
+    Fixes:
+    ✔ NULL vs 0 mismatches
+    ✔ Contact lens axis issues
+    ✔ ADD power failures
+    ✔ Retail + Wholesale safe
+    """
+
+    # ------------------------------------------------------
+    # SPH (always required)
+    # ------------------------------------------------------
+    sql += " AND sph IS NOT DISTINCT FROM %s"
+    params.append(_sanitize_value(sph))
+
+    # ------------------------------------------------------
+    # CYL (ignore empty values)
+    # ------------------------------------------------------
+    if cyl not in (None, "", 0, 0.0, "0", "0.0"):
+        sql += " AND cyl IS NOT DISTINCT FROM %s"
+        params.append(_sanitize_value(cyl))
+
+    # ------------------------------------------------------
+    # AXIS (only if cyl exists)
+    # prevents contact lens failures
+    # ------------------------------------------------------
+    if cyl not in (None, "", 0, 0.0, "0", "0.0"):
+        if axis not in (None, "", 0, "0"):
+            sql += " AND axis IS NOT DISTINCT FROM %s"
+            params.append(_sanitize_value(axis))
+
+    # ------------------------------------------------------
+    # ADD POWER (progressive / multifocal safe)
+    # ------------------------------------------------------
+    if add_power not in (None, "", 0, 0.0, "0", "0.0"):
+        sql += " AND add_power IS NOT DISTINCT FROM %s"
+        params.append(_sanitize_value(add_power))
+
+    return sql, params
+
+# -------------------------------------------------
+# PRODUCT MASTER (mapped to 'products' table)
+# -------------------------------------------------
+
+def read_product_master() -> pd.DataFrame:
+    """
+    Reads from 'products' table in PostgreSQL.
+    Maps PostgreSQL columns to match old MySQL column names for compatibility.
+    
+    UNIVERSAL BOX PRODUCT RULE:
+    A product is treated as a box product if:
+    - unit = 'BOX' AND box_size > 1
+    
+    This applies to ALL products (contact lenses, cosmetics, solutions, accessories, etc.)
+    NOT category-based. ONLY unit + box_size based.
+    
+    allow_loose controls whether partial boxes can be sold:
+    - allow_loose = true: Can sell BOX + PCS (e.g., 2 BOX + 3 PCS)
+    - allow_loose = false: Only full BOX allowed
+    
+    All quantities are stored in PCS internally. BOX is for display only.
+    """
+
+    sql = """
+    SELECT
+        id AS product_id,
+
+        product_name,
+        brand,
+        main_group,
+
+        category,
+        category AS type,
+
+        material,
+        colour,
+
+        coating,
+        coating_type,
+
+        index_value,
+        index_value AS lens_index,
+
+        lens_category,
+
+        COALESCE(unit, 'PCS') AS unit,
+
+        COALESCE(hsn_code, '') AS hsn_code,
+
+        gst_percent,
+
+        COALESCE(box_size, 1) AS box_size,
+        COALESCE(allow_loose, false) AS allow_loose,
+
+        COALESCE(is_batch_applicable, false) AS is_batch_applicable,
+        COALESCE(is_eye_specific, false) AS is_eye_specific,
+
+        COALESCE(is_active, true) AS is_active,
+
+        created_at
+
+    FROM products
+    WHERE COALESCE(is_active, true) = true
+    """
+
+    df = execute_query(sql, "products")
+
+    # -------------------------------
+    # Safety Normalization
+    # -------------------------------
+
+    if not df.empty:
+
+        df["box_size"] = df["box_size"].fillna(0).astype(int)
+
+        df["allow_loose"] = (
+            df["allow_loose"]
+            .fillna(False)
+            .astype(bool)
+        )
+
+    return df
+
+# ==========================================================
+# LEGACY COMPAT: read_party_master
+# ==========================================================
+def read_party_master(include_inactive=False):
+    """
+    Safe party reader for flexible schemas
+    """
+
+    import pandas as pd
+    conn = get_connection()
+
+    query = """
+        SELECT
+            id AS party_id,
+            party_name,
+            party_type,
+            mobile,
+            COALESCE(is_active, TRUE)               AS is_active,
+            COALESCE(payment_mode, 'ON_COMPLETION') AS payment_mode,
+            COALESCE(credit_days, 30)               AS credit_days,
+            COALESCE(credit_limit, 0)               AS credit_limit
+        FROM parties
+    """
+
+    df = pd.read_sql(query, conn)
+
+    if not include_inactive:
+        df = df[df["is_active"] == True]
+
+    return df
+
+
+# ==========================================================
+# FINAL: read_patient_visits (NO doctor_name)
+# ==========================================================
+
+def read_patient_visits(patient_id: Optional[str] = None) -> pd.DataFrame:
+    """
+    Retail-safe visits reader (legacy schema)
+    """
+
+    try:
+        sql = """
+            SELECT
+                id as visit_id,
+                patient_id,
+                record_no as case_no,
+                visit_date,
+                visit_name,
+                right_sph,
+                right_cyl,
+                right_axis,
+                right_add as right_add_power,
+                left_sph,
+                left_cyl,
+                left_axis,
+                left_add as left_add_power,
+                created_at
+            FROM patient_visits
+            WHERE 1=1
+        """
+
+        params = []
+
+        if patient_id:
+            sql += " AND patient_id = %s"
+            params.append(patient_id)
+
+        sql += " ORDER BY visit_date DESC, created_at DESC"
+
+        df = execute_query(sql, "patient_visits", params=tuple(params) if params else None)
+        return df if df is not None else pd.DataFrame()
+
+    except Exception:
+        return pd.DataFrame()
+
+
+# -------------------------------------------------
+# CASES (Frame Cases, Contact Lens Cases, etc.)
+# -------------------------------------------------
+
+def read_case_master() -> pd.DataFrame:
+    """
+    Reads from 'cases' table
+    """
+
+    sql = """
+        SELECT
+            id as case_id,
+
+            case_name,
+            case_type,
+            brand,
+
+            max_capacity,
+
+            price,
+
+            COALESCE(is_active, true) as is_active,
+
+            created_at
+
+        FROM cases
+
+        WHERE COALESCE(is_active, true) = true
+    """
+
+    return execute_query(sql, "cases")
+
+
+# -------------------------------------------------
+# BATCH MASTER (For products requiring batch tracking)
+# -------------------------------------------------
+
+def read_batch_master() -> pd.DataFrame:
+    """
+    Reads from 'batches' table
+    """
+
+    sql = """
+        SELECT
+            id as batch_id,
+
+            batch_no,
+            product_id,
+
+            mfg_date,
+            exp_date,
+
+            mrp,
+            cost_price,
+
+            COALESCE(is_active, true) as is_active,
+
+            created_at
+
+        FROM batches
+
+        WHERE COALESCE(is_active, true) = true
+    """
+
+    return execute_query(sql, "batches")
+
+
+# -------------------------------------------------
+# INVENTORY STOCK
+# -------------------------------------------------
+
+def read_inventory_stock() -> pd.DataFrame:
+    """
+    Reads from 'inventory_stock' table
+    Returns current stock levels for all products
+    """
+
+    sql = """
+        SELECT
+            id as stock_id,
+
+            product_id,
+            batch_id,
+
+            sph,
+            cyl,
+            axis,
+            add_power,
+
+            eye_side,
+
+            quantity,
+
+            location,
+            bin_no,
+
+            COALESCE(is_active, true) as is_active,
+
+            created_at,
+            updated_at
+
+        FROM inventory_stock
+
+        WHERE COALESCE(is_active, true) = true
+    """
+
+    return execute_query(sql, "inventory_stock")
+
+
+# -------------------------------------------------
+# INVENTORY TRANSACTIONS
+# -------------------------------------------------
+
+def read_inventory_transactions(
+    start_date: str = None,
+    end_date: str = None,
+    product_id: int = None
+) -> pd.DataFrame:
+    """
+    Reads from 'inventory_transactions' table
+    Optional filters for date range and product
+    """
+
+    sql = """
+        SELECT
+            id as txn_id,
+
+            txn_type,
+            txn_date,
+
+            product_id,
+            batch_id,
+
+            sph,
+            cyl,
+            axis,
+            add_power,
+
+            eye_side,
+
+            quantity,
+            unit_price,
+
+            reference_type,
+            reference_id,
+
+            notes,
+
+            created_at
+
+        FROM inventory_transactions
+
+        WHERE 1=1
+    """
+
+    params = []
+
+    if start_date:
+        sql += " AND txn_date >= %s"
+        params.append(start_date)
+
+    if end_date:
+        sql += " AND txn_date <= %s"
+        params.append(end_date)
+
+    if product_id:
+        sql += " AND product_id = %s"
+        params.append(product_id)
+
+    sql += " ORDER BY txn_date DESC, created_at DESC"
+
+    return execute_query(sql, "inventory_transactions", params=tuple(params) if params else None)
+
+
+# -------------------------------------------------
+# ORDERS
+# -------------------------------------------------
+
+def read_orders(
+    start_date: str = None,
+    end_date: str = None,
+    status: str = None
+) -> pd.DataFrame:
+    """
+    Reads from 'orders' table
+    Optional filters for date range and status
+    """
+
+    sql = """
+        SELECT
+            id as order_id,
+
+            order_no,
+            order_date,
+
+            party_id,
+            patient_name,
+
+            prescription_id,
+
+            status,
+
+            subtotal,
+            discount,
+            tax_amount,
+            total_amount,
+
+            payment_status,
+            payment_mode,
+
+            notes,
+
+            created_at,
+            updated_at
+
+        FROM orders
+
+        WHERE 1=1
+    """
+
+    params = []
+
+    if start_date:
+        sql += " AND order_date >= %s"
+        params.append(start_date)
+
+    if end_date:
+        sql += " AND order_date <= %s"
+        params.append(end_date)
+
+    if status:
+        sql += " AND status = %s"
+        params.append(status)
+
+    sql += " ORDER BY order_date DESC, created_at DESC"
+
+    return execute_query(sql, "orders", params=tuple(params) if params else None)
+
+
+# -------------------------------------------------
+# ORDER LINES
+# -------------------------------------------------
+
+def read_order_lines(order_id: int = None) -> pd.DataFrame:
+    """
+    Reads from 'order_lines' table
+    Optional filter for specific order
+    """
+
+    sql = """
+        SELECT
+            id as line_id,
+
+            order_id,
+            line_no,
+
+            product_id,
+            batch_id,
+
+            sph,
+            cyl,
+            axis,
+            add_power,
+
+            eye_side,
+
+            quantity,
+            unit_price,
+            discount,
+            tax_amount,
+            total_price,
+
+            status,
+
+            lens_params,
+            boxing_params,
+
+            notes,
+
+            created_at
+
+        FROM order_lines
+
+        WHERE 1=1
+    """
+
+    params = []
+
+    if order_id:
+        sql += " AND order_id = %s"
+        params.append(order_id)
+
+    sql += " ORDER BY order_id DESC, line_no"
+
+    return execute_query(sql, "order_lines", params=tuple(params) if params else None)
+
+
+# -------------------------------------------------
+# PRESCRIPTIONS
+# -------------------------------------------------
+
+def read_prescriptions(patient_name: str = None) -> pd.DataFrame:
+    """
+    Reads from 'prescriptions' table
+    Optional filter for specific patient
+    """
+
+    sql = """
+        SELECT
+            id as prescription_id,
+
+            patient_name,
+            age,
+            gender,
+
+            right_sph,
+            right_cyl,
+            right_axis,
+            right_add,
+
+            left_sph,
+            left_cyl,
+            left_axis,
+            left_add,
+
+            pd_distance,
+            pd_near,
+
+            prescription_date,
+            doctor_name,
+
+            notes,
+
+            created_at
+
+        FROM prescriptions
+
+        WHERE 1=1
+    """
+
+    params = []
+
+    if patient_name:
+        sql += " AND LOWER(patient_name) LIKE LOWER(%s)"
+        params.append(f"%{patient_name}%")
+
+    sql += " ORDER BY prescription_date DESC, created_at DESC"
+
+    return execute_query(sql, "prescriptions", params=tuple(params) if params else None)
+
+
+# -------------------------------------------------
+# SUPPLIER ORDERS (COMPLETE SYSTEM)
+# -------------------------------------------------
+
+def save_supplier_order(supplier_order: dict):
+    """
+    Save or update supplier order with items + history
+    ✅ NaN-safe with automatic sanitization
+    """
+
+    conn = None
+    cursor = None
+
+    try:
+        conn = get_transaction_connection()
+        cursor = conn.cursor()
+
+        so_id = supplier_order['supplier_order_id']
+
+        # Check if exists
+        cursor.execute(
+            "SELECT 1 FROM supplier_orders WHERE supplier_order_id = %s",
+            (so_id,)
+        )
+
+        exists = cursor.fetchone()
+
+        if exists:
+            # ---------- UPDATE ----------
+            cursor.execute("""
+                UPDATE supplier_orders
+                SET
+                    supplier_id = %s,
+                    order_date = %s,
+                    status = %s,
+                    expected_delivery = %s,
+                    notes = %s,
+                    total_amount = %s,
+                    updated_at = NOW()
+                WHERE supplier_order_id = %s
+            """, (
+                supplier_order.get('supplier_id'),
+                supplier_order.get('order_date'),
+                supplier_order.get('status', 'PENDING'),
+                supplier_order.get('expected_delivery'),
+                supplier_order.get('notes'),
+                supplier_order.get('total_amount', 0),
+                so_id
+            ))
+
+            # Delete old items
+            cursor.execute(
+                "DELETE FROM supplier_order_items WHERE supplier_order_id = %s",
+                (so_id,)
+            )
+
+        else:
+            # ---------- INSERT ----------
+            cursor.execute("""
+                INSERT INTO supplier_orders (
+                    supplier_order_id,
+                    supplier_id,
+                    order_date,
+                    status,
+                    expected_delivery,
+                    notes,
+                    total_amount,
+                    created_by
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                so_id,
+                supplier_order.get('supplier_id'),
+                supplier_order.get('order_date'),
+                supplier_order.get('status', 'PENDING'),
+                supplier_order.get('expected_delivery'),
+                supplier_order.get('notes'),
+                supplier_order.get('total_amount', 0),
+                supplier_order.get('created_by', 'system')
+            ))
+
+        # ---------- Items ----------
+        for item in supplier_order.get('items', []):
+            
+            # Sanitize all item values
+            sanitized_item = {k: _sanitize_value(v) for k, v in item.items()}
+            
+            cursor.execute("""
+                INSERT INTO supplier_order_items (
+                    supplier_order_id,
+                    item_no,
+                    product_id,
+                    product_name,
+                    brand,
+                    eye_side,
+                    sph,
+                    cyl,
+                    axis,
+                    add_power,
+                    ordered_qty,
+                    received_qty,
+                    pending_qty,
+                    unit_price,
+                    total_price,
+                    customer_line_id,
+                    item_status
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                so_id,
+                sanitized_item.get('item_no'),
+                sanitized_item.get('product_id'),
+                sanitized_item['product_name'],
+                sanitized_item.get('brand'),
+                sanitized_item.get('eye_side'),
+                sanitized_item.get('sph'),
+                sanitized_item.get('cyl'),
+                sanitized_item.get('axis'),
+                sanitized_item.get('add_power'),
+                sanitized_item['ordered_qty'],
+                sanitized_item.get('received_qty', 0),
+                sanitized_item['pending_qty'],
+                sanitized_item.get('unit_price', 0),
+                sanitized_item.get('total_price', 0),
+                sanitized_item.get('customer_line_id'),
+                sanitized_item.get('item_status', 'PENDING')
+            ))
+
+        # ---------- Status History ----------
+        for h in supplier_order.get('status_history', []):
+
+            cursor.execute("""
+                INSERT INTO supplier_order_status_history (
+                    supplier_order_id,
+                    status,
+                    timestamp,
+                    notes,
+                    changed_by
+                )
+                VALUES (%s,%s,%s,%s,%s)
+            """, (
+                so_id,
+                h.get('status'),
+                h.get('timestamp'),
+                h.get('notes'),
+                h.get('changed_by', 'system')
+            ))
+
+        conn.commit()
+        return True
+
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+
+        logger.error(f"save_supplier_order failed: {e}")
+        raise QueryError(e)
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def fetch_supplier_orders():
+    """
+    Fetch all supplier orders with items + history
+    ✅ NaN-safe results
+    """
+
+    conn = None
+    cursor = None
+
+    try:
+        conn = get_transaction_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # --------- Orders ----------
+        cursor.execute("""
+            SELECT *
+            FROM supplier_orders
+            ORDER BY order_date DESC
+        """)
+
+        orders = cursor.fetchall()
+
+        results = []
+
+        for order in orders:
+
+            # Use integer PK (id) to join items/history — supplier_order_id is varchar ref code
+            so_pk = int(order['id'])
+
+            # -------- Items ----------
+            cursor.execute("""
+                SELECT *
+                FROM supplier_order_items
+                WHERE supplier_order_id = %s
+                ORDER BY item_no
+            """, (so_pk,))
+
+            items = cursor.fetchall()
+
+            # -------- History ----------
+            cursor.execute("""
+                SELECT *
+                FROM supplier_order_status_history
+                WHERE supplier_order_id = %s
+                ORDER BY timestamp DESC
+            """, (so_pk,))
+
+            history = cursor.fetchall()
+
+            # Sanitize nested data
+            order['items'] = [
+                {k: _sanitize_value(v) for k, v in dict(item).items()}
+                for item in items
+            ]
+            order['status_history'] = [
+                {k: _sanitize_value(v) for k, v in dict(h).items()}
+                for h in history
+            ]
+
+            results.append(dict(order))
+
+        return results
+
+
+    except Exception as e:
+
+        logger.error(f"fetch_supplier_orders failed: {e}")
+        raise QueryError(e)
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
+
+
+def update_supplier_order_status(
+    supplier_order_id: str,
+    new_status: str,
+    notes: str = None,
+    changed_by: str = "system"
+):
+    """
+    Update supplier order status + history
+    """
+
+    conn = None
+    cursor = None
+
+    try:
+        conn = get_transaction_connection()
+        cursor = conn.cursor()
+
+        # Update main table
+        cursor.execute("""
+            UPDATE supplier_orders
+            SET status = %s,
+                updated_at = NOW()
+            WHERE supplier_order_id = %s
+        """, (
+            new_status,
+            supplier_order_id
+        ))
+
+        # Insert history
+        cursor.execute("""
+            INSERT INTO supplier_order_status_history (
+                supplier_order_id,
+                status,
+                notes,
+                changed_by
+            )
+            VALUES (%s,%s,%s,%s)
+        """, (
+            supplier_order_id,
+            new_status,
+            notes,
+            changed_by
+        ))
+
+        conn.commit()
+        return True
+
+
+    except Exception as e:
+
+        if conn:
+            conn.rollback()
+
+        logger.error(f"update_supplier_order_status failed: {e}")
+        raise QueryError(e)
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
+
+
+def fetch_orders_with_lines(order_nos: list):
+    """
+    Fetch multiple orders + lines + products in ONE query
+    (Fast + Stable batch loader)
+    ✅ NaN-safe DataFrame
+    """
+
+    if not order_nos:
+        return None
+
+    conn = None
+
+    try:
+        conn = get_connection()
+
+        sql = """
+            SELECT
+                o.id AS order_id,
+                o.order_no,
+                o.created_at,
+                o.status,
+                o.patient_name,
+                o.party_name,
+                o.order_type,
+
+                l.id AS line_id,
+                l.order_id AS line_order_id,
+                l.product_id,
+                l.sph,
+                l.cyl,
+                l.axis,
+                l.add_power,
+                l.eye_side,
+                l.quantity AS billing_qty,
+                l.unit_price,
+                l.total_price AS billing_total,
+                l.gst_percent,
+                l.gst_amount,
+                l.status AS batch_status,
+                l.allocated_qty,
+                COALESCE(l.ready_qty, 0) AS ready_qty,
+                l.lens_params,
+                l.boxing_params,
+
+                p.main_group,
+                p.product_name,
+                p.brand,
+                p.gst_percent AS product_gst_percent
+
+            FROM orders o
+
+            LEFT JOIN order_lines l
+                ON  o.id = l.order_id
+                AND COALESCE(l.is_deleted, FALSE) = FALSE
+
+            LEFT JOIN products p
+                ON l.product_id = p.id
+
+            WHERE o.order_no = ANY(%s)
+
+            ORDER BY o.created_at DESC
+        """
+
+        df = pd.read_sql(sql, conn, params=(order_nos,))
+        
+        # Sanitize DataFrame
+        df = df.where(pd.notnull(df), None)
+
+        return df
+
+
+    except Exception as e:
+
+        logger.error(f"Batch fetch failed: {e}")
+        raise
+
+
+    finally:
+
+        if conn:
+            conn.close()
+
+
+# ==========================================================
+# 🔥 POWER-WISE STOCK (HARDENED VERSION)
+# Fully NaN-safe, NULL-safe, injection-safe
+# ==========================================================
+
+def get_power_wise_stock(product_id, sph, cyl=None, axis=None, add_power=None):
+    """
+    Returns total PCS stock for given product + power
+    ✅ NULL-safe with IS NOT DISTINCT FROM
+    ✅ NaN-safe with automatic sanitization
+    ✅ SQL injection-safe with parameterized queries
+    ✅ Dynamic filtering (only adds filters for provided values)
+    
+    Args:
+        product_id: Product ID (required)
+        sph: Spherical power (required, can be None/NaN)
+        cyl: Cylindrical power (optional)
+        axis: Axis (optional)
+        add_power: Addition power (optional)
+    
+    Returns:
+        int: Total quantity in PCS
+    """
+    
+    sql = """
+        SELECT COALESCE(SUM(quantity), 0) AS total_qty
+        FROM inventory_stock
+        WHERE product_id = %s
+        AND is_active = true
+    """
+    
+    params = [product_id]
+    
+    # Add ALL power filters dynamically using helper (including sph)
+    sql, params = add_power_filters(sql, params, sph, cyl, axis, add_power)
+    
+    df = execute_query(sql, "power_stock", params=tuple(params))
+    
+    if df.empty:
+        return 0
+    
+    return int(df.iloc[0]["total_qty"] or 0)
+
+
+# ==========================================================
+# LEGACY COMPATIBILITY: Keep old function signature
+# ==========================================================
+
+def execute_query_legacy(sql: str, table_name: str) -> pd.DataFrame:
+    """
+    Legacy compatibility wrapper
+    Redirects to new hardened execute_query
+    """
+    return execute_query(sql, tag=table_name)
+# ==========================================================
+# LEGACY COMPAT: search_patients
+# ==========================================================
+
+def search_patients(search_term: str) -> pd.DataFrame:
+    """
+    Search patients by name OR mobile.
+    Returns all matches — multiple patients can share a mobile (family members).
+
+    Identity model:
+      name + mobile = unique patient
+      Same mobile, different names = different family members (son, wife etc.)
+      Same name, different mobile = different person (common name)
+    """
+    if not search_term:
+        return pd.DataFrame()
+
+    term = search_term.strip()
+    sql = """
+        SELECT
+            id              AS patient_id,
+            master_name     AS patient_name,
+            mobile,
+            COALESCE(relation,'Self')   AS relation,
+            COALESCE(gender,'')         AS gender,
+            COALESCE(ref_mobile,'')     AS ref_mobile,
+            record_no
+        FROM patients
+        WHERE master_name ILIKE %s
+           OR mobile ILIKE %s
+           OR ref_mobile ILIKE %s
+           OR barcode ILIKE %s
+           OR record_no ILIKE %s
+        ORDER BY master_name
+        LIMIT 30
+    """
+    return execute_query(sql, "patient_search",
+                         params=(f"%{term}%", f"%{term}%", f"%{term}%",
+                                 f"%{term}%", f"%{term}%"))
+# ==========================================================
+# LEGACY COMPAT: read_product_batch
+# ==========================================================
+
+def read_product_batch(product_id: int = None) -> pd.DataFrame:
+    """
+    Legacy batch reader for wholesale/backoffice compatibility
+    """
+    sql = """
+        SELECT
+            id as batch_id,
+            batch_no,
+            product_id,
+            mfg_date,
+            exp_date,
+            mrp,
+            cost_price,
+            COALESCE(is_active, true) as is_active
+        FROM batches
+        WHERE COALESCE(is_active, true) = true
+    """
+
+    params = []
+
+    if product_id:
+        sql += " AND product_id = %s"
+        params.append(product_id)
+
+    return execute_query(
+        sql,
+        "batches",
+        params=tuple(params) if params else None
+    )
+
+# ==========================================================
+# FIXED: read_patient_visits (OLD COMPAT)
+# ==========================================================
+
+def read_patients(include_temporary: bool = False) -> pd.DataFrame:
+    try:
+        sql = """
+            SELECT
+                id::text as patient_id,  -- ✅ FORCE STRING ID
+                master_name as patient_name,
+                mobile AS mobile_number,
+                record_no,
+                is_temporary,
+                created_at
+            FROM patients
+            WHERE 1=1
+        """
+
+        if not include_temporary:
+            sql += " AND COALESCE(is_temporary, false) = false"
+
+        sql += " ORDER BY created_at DESC"
+
+        df = execute_query(sql, "patients")
+
+        if df is None:
+            return pd.DataFrame()
+
+        # 🛡 Ensure no null IDs
+        df["patient_id"] = df["patient_id"].fillna("").astype(str)
+
+        return df
+
+    except Exception:
+        return pd.DataFrame()
+# ==========================================================
+# LEGACY COMPAT: read_ophthalmic_stock
+# ==========================================================
+
+def read_ophthalmic_stock() -> pd.DataFrame:
+    """
+    FINAL stock reader with pricing support
+    Compatible with:
+    - Retail pricing
+    - Wholesale pricing
+    - Last nail fallback
+    """
+
+    sql = """
+        SELECT
+            id,
+            product_id,
+            batch_no,
+            sph,
+            cyl,
+            axis,
+            add_power,
+            eye_side,
+            quantity,
+
+            -- 🔥 PRICE FIELDS (CRITICAL)
+            -- selling_price = W/S trade price
+            -- mrp = retail counter/sticker price (GST inclusive)
+            -- COALESCE ensures retail always gets a usable mrp even if only selling_price is set
+            COALESCE(selling_price, 0)                    AS selling_price,
+            COALESCE(mrp, selling_price, 0)               AS mrp,
+            COALESCE(purchase_rate, 0)                    AS purchase_rate,
+
+            location,
+            COALESCE(is_active, true) as is_active,
+            created_at,
+            updated_at
+        FROM inventory_stock
+        WHERE COALESCE(is_active, true) = true
+    """
+
+    return execute_query(sql, "inventory_stock")
+
+
+# ==========================================================
+
+# ==========================================================
+# LEGACY COMPAT: read_solution_batch
+# ==========================================================
+
+def read_solution_batch(product_id: int = None) -> pd.DataFrame:
+    """
+    Solution/accessory stock from batches table.
+    All three price tiers returned:
+      mrp           = retail counter price
+      selling_price = W/S trade price
+      purchase_rate = cost / inward price
+    """
+    sql = """
+        SELECT
+            id AS batch_id,
+            id AS id,
+            batch_no,
+            product_id,
+            mfg_date,
+            exp_date,
+            COALESCE(mrp, selling_price, cost_price, 0)           AS mrp,
+            COALESCE(selling_price, mrp, cost_price, 0)           AS selling_price,
+            COALESCE(cost_price, 0)                               AS purchase_rate,
+            COALESCE(qty_available, 0)                            AS qty_available,
+            COALESCE(qty_available, 0)                            AS quantity,
+            COALESCE(is_active, true) AS is_active
+        FROM batches
+        WHERE COALESCE(is_active, true) = true
+    """
+
+    params = []
+
+    if product_id:
+        sql += " AND product_id = %s"
+        params.append(product_id)
+
+    return execute_query(
+        sql,
+        "batches",
+        params=tuple(params) if params else None
+    )
+# ==========================================================
+# LEGACY COMPAT: get_patient_last_visit
+# ==========================================================
+
+def get_patient_last_visit(patient_id: int):
+    """
+    Returns latest visit record_no for a patient
+    Used in retail auto-Rx loading
+    """
+    sql = """
+        SELECT record_no
+        FROM patient_visits
+        WHERE patient_id = %s
+        ORDER BY visit_date DESC
+        LIMIT 1
+    """
+
+    df = execute_query(sql, "patient_last_visit", params=(patient_id,))
+
+    if df.empty:
+        return None
+
+    return df.iloc[0]["record_no"]
+# ==========================================================
+# LEGACY COMPAT: read_frame_sku
+# ==========================================================
+
+def read_frame_sku() -> pd.DataFrame:
+    """
+    Frame stock reader — joins inventory_stock for mrp/selling_price/quantity.
+    mrp   = retail counter price (COALESCED so retail pricing always works)
+    selling_price = W/S trade price
+    """
+    sql = """
+        SELECT
+            s.id,
+            s.product_id,
+            s.batch_no,
+            s.eye_side,
+            s.quantity,
+            COALESCE(s.selling_price, 0)               AS selling_price,
+            COALESCE(s.mrp, s.selling_price, 0)        AS mrp,
+            COALESCE(s.purchase_rate, 0)               AS purchase_rate,
+            p.product_name,
+            p.brand,
+            p.category,
+            COALESCE(p.unit, 'PCS')                    AS unit,
+            COALESCE(p.box_size, 1)                    AS box_size,
+            COALESCE(p.allow_loose, false)             AS allow_loose,
+            s.location,
+            s.created_at,
+            s.updated_at
+        FROM inventory_stock s
+        JOIN products p ON p.id = s.product_id
+        WHERE LOWER(p.category) = 'frame'
+          AND COALESCE(s.is_active, true) = true
+          AND COALESCE(p.is_active, true) = true
+        ORDER BY p.product_name
+    """
+    return execute_query(sql, "frame_products")
+# ==========================================================
+# LEGACY COMPAT: fetch_backoffice_orders
+# ==========================================================
+
+def fetch_backoffice_orders(
+    start_date: str = None,
+    end_date: str = None,
+    limit: int = 10,
+    offset: int = 0,
+    include_closed: bool = False,
+):
+    """
+    Fetch orders for backoffice display — headers ONLY (no JOIN to lines).
+    Lines are batch-fetched separately in load_orders_from_database().
+
+    Smart loading:
+      - Default limit=10 (auto-load on page open)
+      - Caller passes offset for "load more"
+      - Active orders only by default; include_closed for history
+      - Headers-only query is fast: no JOIN to order_lines
+    """
+    sql = """
+        SELECT
+            o.id              AS order_id,
+            o.order_no,
+            o.display_order_no,
+            o.created_at,
+            o.status,
+            o.patient_name,
+            o.party_name,
+            o.party_id,
+            o.order_type,
+            o.total_value,
+            o.patient_mobile,
+            o.customer_order_no,
+            o.expected_supply_date,
+            COALESCE(o.extra_data, '{}'::jsonb) AS extra_data
+        FROM orders o
+        WHERE COALESCE(o.is_deleted, FALSE) = FALSE
+    """
+
+    params = []
+
+    if not include_closed:
+        sql += " AND o.status NOT IN ('CLOSED', 'DELIVERED', 'CANCELLED', 'RETURNED')"
+
+    sql += " AND UPPER(COALESCE(o.order_type,'')) != 'CONSULTATION'"
+
+    if start_date:
+        sql += " AND o.created_at >= %s"
+        params.append(start_date)
+
+    if end_date:
+        sql += " AND o.created_at <= %s"
+        params.append(end_date)
+
+    sql += " ORDER BY o.created_at DESC, o.id DESC"
+
+    _limit = max(1, int(limit or 10))
+    sql += f" LIMIT {_limit}"
+
+    if offset:
+        sql += f" OFFSET {int(offset)}"
+
+    return execute_query(
+        sql,
+        "backoffice_orders",
+        params=tuple(params) if params else None
+    )
+# ==========================================================
+# LEGACY COMPAT: get_database_info
+# ==========================================================
+
+def get_database_info():
+    info = {}
+
+    try:
+        version_df = execute_query("SELECT version()", "db_info")
+        info["postgres_version"] = version_df.iloc[0, 0] if not version_df.empty else "unknown"
+
+        db_df = execute_query("SELECT current_database()", "db_info")
+        info["database"] = db_df.iloc[0, 0] if not db_df.empty else DB_CONFIG.get("dbname")
+
+        conn_df = execute_query("SELECT COUNT(*) FROM pg_stat_activity", "db_info")
+        info["active_connections"] = int(conn_df.iloc[0, 0]) if not conn_df.empty else 0
+
+        info["status"] = "ok"        # ✅ UI expects this
+        info["connected"] = True    # ✅ extra compatibility
+
+    except Exception as e:
+        info["status"] = "error"
+        info["connected"] = False
+        info["error"] = str(e)
+
+    return info
+# ==========================================================
+# SAFE LEGACY RESTORE (DataFrame-compatible)
+# ==========================================================
+import pandas as pd
+
+def read_blank_inventory(
+    category: str = None,
+    material: str = None,
+    brand: str = None,
+    add_power: float = None,
+    active_only: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetch blank inventory rows with optional filters.
+
+    Filters applied only when the argument is not None:
+      category    → exact match (case-insensitive)
+      material    → exact match (case-insensitive)
+      brand       → exact match (case-insensitive)
+      add_power   → exact match OR NULL/0 rows included (0.25 tolerance)
+      active_only → WHERE COALESCE(is_active, true) = true
+
+    Returns a DataFrame with all blank_inventory columns.
+    Returns empty DataFrame on any error (never crashes callers).
+
+    NOTE: In this system, blank_inventory.material stores COATING type
+    (e.g. "Clear", "Blue Cut", "Photo Sun") — not lens index.
+    Callers use it as a display/selection filter, which is correct.
+    """
+    try:
+        clauses = ["1=1"]
+        params: dict = {}
+
+        if active_only:
+            clauses.append("COALESCE(is_active, true) = true")
+
+        if category is not None:
+            clauses.append("LOWER(category) = LOWER(%(category)s)")
+            params["category"] = category
+
+        if material is not None:
+            clauses.append("LOWER(material) = LOWER(%(material)s)")
+            params["material"] = material
+
+        if brand is not None:
+            clauses.append("LOWER(brand) = LOWER(%(brand)s)")
+            params["brand"] = brand
+
+        if add_power is not None:
+            # Allow blanks whose add_power matches OR is NULL/0
+            # (universal blanks work for any ADD in real labs)
+            clauses.append(
+                "(add_power IS NULL OR add_power = 0 "
+                " OR ABS(add_power - %(add_power)s) < 0.01)"
+            )
+            params["add_power"] = float(add_power)
+
+        where = " AND ".join(clauses)
+        sql = f"""
+            SELECT
+                id,
+                brand,
+                category,
+                material,
+                colour,
+                add_power,
+                COALESCE(qty_right,       0) AS qty_right,
+                COALESCE(qty_left,        0) AS qty_left,
+                COALESCE(qty_independent, 0) AS qty_independent,
+                base_recommended,
+                base_1,
+                base_2,
+                base_3,
+                batch_no,
+                location,
+                COALESCE(barcode,'')        AS barcode,
+                COALESCE(item_code,'')      AS item_code,
+                min_stock,
+                cost_price,
+                COALESCE(is_active, true)   AS is_active,
+                created_at,
+                updated_at
+            FROM blank_inventory
+            WHERE {where}
+            ORDER BY brand, material, add_power NULLS LAST
+        """
+        return execute_query(sql, "blank_inventory", params=params or None)
+
+    except Exception as exc:
+        logger.warning(f"read_blank_inventory failed: {exc}")
+        return pd.DataFrame()
+
+
+def get_blank_base_curves(blank_id: str) -> pd.DataFrame:
+    """
+    Fetch base curve options for a specific blank.
+    Returns rows with columns: base_recommended, base_1, base_2, base_3.
+    Returns empty DataFrame on error.
+    """
+    try:
+        sql = """
+            SELECT
+                id,
+                base_recommended,
+                base_1,
+                base_2,
+                base_3
+            FROM blank_inventory
+            WHERE id = %(blank_id)s::uuid
+            LIMIT 1
+        """
+        return execute_query(sql, "blank_base_curves", params={"blank_id": str(blank_id)})
+    except Exception as exc:
+        logger.warning(f"get_blank_base_curves failed: {exc}")
+        return pd.DataFrame()
+
+
+def update_blank_quantity(
+    blank_id: str,
+    qty_change: int,
+    eye_side: str = None,
+) -> bool:
+    """
+    Decrement blank quantity after allocation.
+
+    eye_side = "R"  → decrements qty_right
+    eye_side = "L"  → decrements qty_left
+    eye_side = None → decrements qty_independent
+
+    Enforces no-negative constraint: skips update if current qty
+    would go below 0 (returns False so caller can handle it).
+
+    Returns True on success, False on failure or insufficient stock.
+    """
+    try:
+        bid = str(blank_id)
+
+        if eye_side and eye_side.upper() == "R":
+            col = "qty_right"
+        elif eye_side and eye_side.upper() == "L":
+            col = "qty_left"
+        else:
+            col = "qty_independent"
+
+        conn = get_transaction_connection()
+        cur  = conn.cursor()
+        try:
+            # ── FOR UPDATE: lock the row so concurrent saves
+            #    can't both read the same qty and both succeed ──
+            cur.execute(
+                f"SELECT {col} FROM blank_inventory "
+                f"WHERE id = %(bid)s::uuid FOR UPDATE",
+                {"bid": bid}
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False   # blank not found
+
+            current_qty = int(row[0] or 0)
+            new_qty     = current_qty + int(qty_change)
+
+            # Enforce no-negative at application layer (DB CHECK is backup)
+            if new_qty < 0:
+                conn.rollback()
+                return False   # insufficient stock
+
+            cur.execute(
+                f"UPDATE blank_inventory "
+                f"SET {col} = %(nq)s, updated_at = NOW() "
+                f"WHERE id = %(bid)s::uuid",
+                {"nq": new_qty, "bid": bid}
+            )
+            conn.commit()
+            return True
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+
+    except Exception as exc:
+        logger.warning(f"update_blank_quantity failed: {exc}")
+        return False
+
+
+# ==========================================================
+# PRICING FALLBACK: fetch_last_product_price
+# Returns the last known unit_price from order_lines for a
+# product — used when stock has no price stored.
+# Called by backoffice_helpers.get_max_historical_price()
+# ==========================================================
+
+def fetch_last_product_price(product_id: str) -> float:
+    """
+    Fetch the last confirmed unit_price for a product from order_lines.
+    This is the price the customer actually paid — most accurate fallback
+    when inventory_stock has no selling_price recorded.
+
+    Priority:
+      1. Most recent order_line unit_price > 0
+      2. inventory_stock selling_price / mrp (any power for that product)
+      3. 0.0 if nothing found
+    """
+    try:
+        pid = str(product_id)
+
+        # 1. Last order line price for this product
+        sql1 = """
+            SELECT unit_price
+            FROM order_lines
+            WHERE product_id::text = %(pid)s
+              AND unit_price > 0
+            ORDER BY id DESC
+            LIMIT 1
+        """
+        rows = run_query(sql1, {"pid": pid})
+        if rows:
+            v = float(rows[0].get("unit_price") or 0)
+            if v > 0:
+                return v
+
+        # 2. inventory_stock selling_price (any power for this product)
+        sql2 = """
+            SELECT
+                COALESCE(selling_price, mrp, purchase_rate, 0) AS price
+            FROM inventory_stock
+            WHERE product_id::text = %(pid)s
+              AND COALESCE(is_active, true) = true
+              AND COALESCE(selling_price, mrp, purchase_rate, 0) > 0
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT 1
+        """
+        rows2 = run_query(sql2, {"pid": pid})
+        if rows2:
+            v = float(rows2[0].get("price") or 0)
+            if v > 0:
+                return v
+
+        return 0.0
+
+    except Exception:
+        return 0.0
