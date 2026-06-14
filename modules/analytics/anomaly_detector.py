@@ -37,20 +37,20 @@ def detect_anomalies(lookback: int = 10) -> List[Dict]:
         rows = run_query(
             """
             SELECT
-                import_id,
+                id AS import_id,
                 file_type,
-                mode,
+                import_mode AS mode,
                 status,
                 COALESCE(rows_total, 0)  AS total,
                 COALESCE(error_count, 0) AS errors,
                 COALESCE(duration_s, 0)  AS duration,
                 imported_at
             FROM loader_import_log
-            WHERE mode != 'DRY'
+            WHERE COALESCE(import_mode, '') != 'DRY'
             ORDER BY imported_at DESC
-            LIMIT %s
+            LIMIT %(lookback)s
             """,
-            (lookback,),
+            {"lookback": lookback},
         )
     except Exception as e:
         logger.warning(f"[ANOMALY] Could not query import log: {e}")
@@ -153,11 +153,11 @@ def get_import_health_score(lookback: int = 20) -> int:
                 COALESCE(rows_total, 0)  AS total,
                 COALESCE(error_count, 0) AS errors
             FROM loader_import_log
-            WHERE mode != 'DRY'
+            WHERE COALESCE(import_mode, '') != 'DRY'
             ORDER BY imported_at DESC
-            LIMIT %s
+            LIMIT %(lookback)s
             """,
-            (lookback,),
+            {"lookback": lookback},
         )
     except Exception as e:
         logger.warning(f"[HEALTH] Could not compute health score: {e}")

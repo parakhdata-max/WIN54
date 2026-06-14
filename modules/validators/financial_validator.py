@@ -129,6 +129,12 @@ class FinancialValidator(BaseValidator):
             unit_price = line.get("unit_price", 0)
             total_price = line.get("total_price", 0)
             gst = line.get("gst_percent", 0)
+            order_type = str(
+                line.get("order_type")
+                or order.get("order_type")
+                or party_type
+                or "RETAIL"
+            ).upper()
 
 
             # Quantity
@@ -155,13 +161,36 @@ class FinancialValidator(BaseValidator):
 
             # Total price — use billing_total if present (BOX-normalised value)
             # unit_price is per-PCS, billing_total already accounts for BOX/PCS
-            # conversion. Only check if both values are present and non-zero.
+            # conversion. Compare against the NET expected value (gross minus
+            # discount), not gross alone — otherwise every discounted line is
+            # a false positive.
+            #
+            # Reference behaviour (order_pipeline.py:179-181 and elsewhere):
+            #   billing_total = (unit_price × qty) − discount_amount
+            #
+            # Only check if values are present and non-zero.
             billing_total = line.get("billing_total") or total_price
             if billing_total and unit_price and qty:
-                expected = round(unit_price * qty, 2)
+                gross    = round(unit_price * qty, 2)
+                disc_amt = float(line.get("discount_amount") or 0)
+                gst_pct  = float(gst or 0)
+                is_service = (
+                    bool(line.get("is_service_line"))
+                    or str(line.get("eye_side") or "").upper() in ("S", "SERVICE")
+                )
+                lp = line.get("lens_params") or {}
+                if isinstance(lp, dict):
+                    route_txt = str(lp.get("manufacturing_route") or lp.get("service_production_type") or "").upper()
+                    is_service = is_service or bool(lp.get("service_type") or lp.get("charge_type")) or route_txt in ("FITTING", "COLOURING", "SERVICE")
+                net_expected = round(max(0.0, gross - disc_amt), 2)
+                expected = net_expected
+                if is_service and gst_pct > 0 and order_type != "RETAIL":
+                    expected = round(net_expected * (1 + gst_pct / 100), 2)
                 actual   = round(float(billing_total), 2)
-                # Allow 1% tolerance for floating point + BOX rounding
-                tolerance = max(0.05, round(expected * 0.01, 2))
+                # Allow 1% tolerance for floating point + BOX rounding.
+                # Tolerance is computed off the GROSS so a 100% discount still
+                # gives a sensible epsilon.
+                tolerance = max(0.05, round(max(gross, expected) * 0.01, 2))
                 if abs(actual - expected) > tolerance:
                     return ValidationResult(
                         rule="PRICE_MISMATCH",
@@ -169,7 +198,9 @@ class FinancialValidator(BaseValidator):
                         severity="WARNING",   # WARNING not CRITICAL — BOX products legitimately differ
                         message=(
                             f"Line {idx}: billing_total {actual} differs from "
-                            f"unit_price×qty {expected} by more than tolerance {tolerance}"
+                            f"expected amount {expected} "
+                            f"(gross {gross}, discount {disc_amt}) "
+                            f"by more than tolerance {tolerance}"
                         )
                     )
 

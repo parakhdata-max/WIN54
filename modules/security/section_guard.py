@@ -28,8 +28,21 @@ def _can_view_section(module_key: str, action_key: str,
     try:
         from modules.security.permission_engine import can_do
         return can_do(action_key, user_id, role, module_key)
-    except Exception:
-        return True  # fail-open
+    except Exception as e:
+        # Stage 2: FAIL CLOSED. Previously returned True (fail-open) — any
+        # import/engine error silently granted everyone everything. Now we
+        # deny and log loudly so the failure is caught in testing, never
+        # silently bypassed in production.
+        try:
+            import logging
+            logging.error(
+                "[section_guard] permission check failed for "
+                "module=%s action=%s role=%s — DENYING. %s",
+                module_key, action_key, role, e,
+            )
+        except Exception:
+            pass
+        return False
 
 
 def _register_tabs(module_key: str,

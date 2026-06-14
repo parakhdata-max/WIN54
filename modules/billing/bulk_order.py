@@ -33,12 +33,13 @@ try:
     _HAS_OPH = True
 except ImportError:
     _HAS_OPH = False
-    _oph_sel = None; _oph_price = None; _oph_grid = None
+    _oph_sel = None; _oph_price = None; _oph_name = None; _oph_grid = None
 try:
     from modules.price_governor import get_billing_price, validate_price
     from modules.price_dropdown_ui import render_price_selector as _render_price
 except Exception:
     _render_price = None
+_price_selector = None
 try:
     from modules.power_intelligence_ui import render_power_intelligence_panel as _pi_panel
 except Exception:
@@ -122,6 +123,48 @@ def _scalar(sql: str, params=None):
         return None
 
 
+def _ensure_service_product_id(charge_type: str = "MISC", label: str = "Service Charge") -> str:
+    """Find/create the lightweight Services product used for service-only bulk billing."""
+    try:
+        _ct = str(charge_type or "MISC").upper().strip()
+        _label = str(label or _ct.title()).strip()
+        _prod_name = f"{_label} Charge" if not _label.lower().endswith("charge") else _label
+        rows = _rq("""
+            SELECT id::text AS id FROM products
+            WHERE LOWER(product_name)=LOWER(%(n)s)
+              AND COALESCE(is_active, TRUE)=TRUE
+            LIMIT 1
+        """, {"n": _prod_name})
+        if rows:
+            return str(rows[0]["id"])
+        pid = str(uuid.uuid4())
+        _rw("""
+            INSERT INTO products
+                (id, product_name, main_group, category, unit,
+                 gst_percent, is_active, created_at)
+            VALUES (%(id)s::uuid, %(n)s, 'Services', 'Services', 'S',
+                    %(gst)s, TRUE, NOW())
+            ON CONFLICT DO NOTHING
+        """, {"id": pid, "n": _prod_name, "gst": 18})
+        return pid
+    except Exception:
+        return ""
+
+
+def _service_master_rows(order_type: str, party_id: str = "") -> list:
+    try:
+        from modules.backoffice.service_master import fetch_service_types, service_price
+        rows = fetch_service_types(active_only=True)
+        out = []
+        for r in rows:
+            rr = dict(r)
+            rr["default_price"] = service_price(rr, order_type, party_id=party_id)
+            out.append(rr)
+        return out
+    except Exception:
+        return []
+
+
 # ── Session state init ────────────────────────────────────────────────────────
 
 def _init():
@@ -147,21 +190,155 @@ def _init():
             st.session_state[k] = v
 
 
+def bulk_hard_reset(keep_mode: bool = False):
+    """
+    Complete wipe of all bulk order state.
+    Clears structured bo_* keys AND all widget key prefixes.
+    keep_mode=True preserves bo_mode (for mode-switch reset).
+    """
+    _mode = st.session_state.get("bo_mode", "RETAIL")
+
+    # ── Structured bo_* keys ──────────────────────────────────────────────
+    _BO_KEYS = [
+        "bo_party_id","bo_party_name","bo_party_type",
+        "bo_billing_category","bo_credit_limit","bo_credit_days",
+        "bo_cart","bo_order_id","bo_order_no","bo_challan_no",
+        "bo_invoice_id","bo_invoice_no","bo_paid","bo_tab",
+        # Payment widgets
+        "bo_pay_mode","bo_pay_amount","bo_pay_ref",
+        # Post-save snapshot
+        "_bo_post_save_data","_bo_source_order_no",
+        # Advance at order stage
+        "bo_advance_mode","bo_advance_amount","bo_advance_ref","bo_collect_advance",
+    ]
+    for k in _BO_KEYS:
+        st.session_state.pop(k, None)
+
+    # ── Widget key prefixes ───────────────────────────────────────────────
+    _PREFIXES = (
+        "bo_scan", "bo_sph", "bo_cyl", "bo_axis", "bo_add",
+        "bo_price", "bo_qty", "bo_eye", "bo_brand",
+        "bo_search", "bo_party", "bo_mode_",
+        "bo_svc_", "bo_wa_",
+        "bo_print_", "bo_whatsapp",
+        "bo_record_", "bo_new_", "bo_dup_",
+    )
+    for k in list(st.session_state.keys()):
+        if any(k.startswith(p) for p in _PREFIXES):
+            st.session_state.pop(k, None)
+
+    # ── Restore mode + reinit defaults ───────────────────────────────────
+    if keep_mode:
+        st.session_state["bo_mode"] = _mode
+    _init()
+
+
 def _reset():
-    keys = ["bo_party_id","bo_party_name","bo_party_type",
-            "bo_billing_category","bo_credit_limit","bo_credit_days",
-            "bo_cart","bo_order_id","bo_order_no","bo_challan_no",
-            "bo_invoice_id","bo_invoice_no","bo_paid","bo_tab"]
-    for k in keys:
-        if k in st.session_state:
-            del st.session_state[k]
+    """Alias kept for backward-compatible callers."""
+    bulk_hard_reset(keep_mode=True)
     st.rerun()
+
+
+def duplicate_current_bulk_order():
+    """
+    Duplicate: restore party + mode + cart snapshot.
+    Clears all order/challan/invoice/payment IDs so a NEW order is created.
+    Sets _bo_duplicate_mode=True.
+    """
+    _snap = st.session_state.get("_bo_post_save_data") or {}
+
+    # Save source order ref before reset
+    _src_ono = _snap.get("order_no","")
+
+    # Capture what to restore
+    _party_id   = _snap.get("_party_id") or st.session_state.get("bo_party_id","")
+    _party_name = _snap.get("_party_name") or st.session_state.get("bo_party_name","")
+    _party_type = _snap.get("_party_type") or st.session_state.get("bo_party_type","RETAIL")
+    _mode       = _snap.get("_mode") or st.session_state.get("bo_mode","RETAIL")
+    _bill_cat   = _snap.get("_billing_category") or st.session_state.get("bo_billing_category","ADVANCE_BALANCE")
+    _cart_snap  = _snap.get("_cart") or []
+
+    # Hard reset keeping mode
+    bulk_hard_reset(keep_mode=False)
+
+    # Restore party + mode + cart
+    st.session_state["bo_mode"]             = _mode
+    st.session_state["bo_party_id"]         = _party_id
+    st.session_state["bo_party_name"]       = _party_name
+    st.session_state["bo_party_type"]       = _party_type
+    st.session_state["bo_billing_category"] = _bill_cat
+    st.session_state["bo_cart"]             = list(_cart_snap)  # restored cart, new order ID
+    st.session_state["bo_tab"]              = 1    # go straight to cart review
+
+    # Persist source for audit trail
+    if _src_ono:
+        st.session_state["_bo_source_order_no"] = _src_ono
+
+    # Mark duplicate mode
+    st.session_state["_bo_duplicate_mode"] = True
+
+
+def _rx_text_input(container, label, key, default="", placeholder="0.00"):
+    raw = st.session_state.get(key, default)
+    return container.text_input(label, value="" if raw is None else str(raw), key=key,
+                                placeholder=placeholder)
+
+
+def _parse_rx_value(raw, *, is_axis=False):
+    txt = str(raw or "").strip()
+    if txt in ("", "+", "-", ".", "+.", "-."):
+        return None
+    try:
+        val = int(float(txt)) if is_axis else float(txt)
+    except Exception:
+        return None
+    if is_axis:
+        return val if 0 <= val <= 180 and val != 0 else None
+    return val if abs(val) > 0.0001 else None
+
+
+def _oph_spec_pair_price(spec: dict, party_type: str = "WHOLESALE") -> float:
+    if not spec:
+        return 0.0
+    price = spec.get("price") or {}
+    keys = ("srp", "mrp", "selling", "selling_price", "price") if party_type == "RETAIL" else (
+        "wlp", "selling", "selling_price", "price", "srp", "mrp"
+    )
+    for key in keys:
+        try:
+            val = float(price.get(key) or 0)
+        except Exception:
+            val = 0.0
+        if val > 0:
+            return val
+    try:
+        return float(spec.get("pair_price") or spec.get("selling_price") or 0)
+    except Exception:
+        return 0.0
+
+
+def _oph_spec_per_lens_price(spec: dict, party_type: str = "WHOLESALE") -> float:
+    pair = _oph_spec_pair_price(spec, party_type)
+    return round(pair / 2.0, 2) if pair > 0 else 0.0
+
+
+def _oph_lens_params(spec: dict) -> dict:
+    if not spec:
+        return {}
+    return {
+        "index": spec.get("index"),
+        "index_value": spec.get("index"),
+        "coating": spec.get("coating"),
+        "treatment": spec.get("treatment"),
+        "manufacturing_route": "STOCK",
+        "order_source": "BULK",
+    }
 
 
 # ── Stock helpers ─────────────────────────────────────────────────────────────
 
 def _get_stock(product_id: str, sph=None, cyl=None, axis=None,
-               add_power=None, eye_side: str = "B") -> dict:
+               add_power=None, eye_side: str = "B", coating: str = None) -> dict:
     """
     Get combined available stock for a product+power+eye combination.
     Returns {available, r_stock_id, l_stock_id, b_stock_id, is_split}
@@ -170,7 +347,7 @@ def _get_stock(product_id: str, sph=None, cyl=None, axis=None,
     """
     # Normalize early — maps O/OTHER/None → B so all downstream logic is clean
     eye_side = normalize_eye_side(eye_side, service_aware=False)
-    cache_key = f"bo_stock_{product_id}_{sph or 0}_{cyl or 0}_{axis or 0}_{add_power or 0}_{eye_side}"
+    cache_key = f"bo_stock_{product_id}_{sph or 0}_{cyl or 0}_{axis or 0}_{add_power or 0}_{eye_side}_{coating or ''}"
     if cache_key in st.session_state:
         return st.session_state[cache_key]
 
@@ -180,21 +357,36 @@ def _get_stock(product_id: str, sph=None, cyl=None, axis=None,
         "cyl": cyl  or 0,
         "ax":  axis or 0,
         "add": add_power or 0,
+        "coat": coating or "",
+        "coats": (
+            [str(coating or "").lower(), "murk vision"]
+            if (add_power or 0) and str(coating or "").strip().lower() == "green"
+            else [str(coating or "").lower()]
+        ),
     }
 
     # Sum stock across ALL batches for each eye side — only real batched rows (qty > 0)
     def _sum_stock(eye_values):
         rows = _rq("""
-            SELECT COALESCE(SUM(quantity), 0) AS total_qty,
+            SELECT COALESCE(SUM(GREATEST(0, COALESCE(quantity,0) - COALESCE(allocated_qty,0))), 0) AS total_qty,
                    COUNT(*) AS batch_count
             FROM inventory_stock
             WHERE product_id = %(pid)s::uuid
-              AND COALESCE(sph,0)=%(sph)s AND COALESCE(cyl,0)=%(cyl)s
-              AND COALESCE(axis,0)=%(ax)s  AND COALESCE(add_power,0)=%(add)s
+              AND COALESCE(sph,0)=%(sph)s
+              AND (
+                    COALESCE(cyl,0)=%(cyl)s
+                    OR (%(add)s <> 0 AND COALESCE(cyl,0)=0)
+                  )
+              AND (
+                    COALESCE(axis,0)=0
+                    OR ABS(COALESCE(axis,0) - %(ax)s) <= 1
+                  )
+              AND COALESCE(add_power,0)=%(add)s
+              AND (%(coat)s = '' OR LOWER(COALESCE(coating,'')) = ANY(%(coats)s))
               AND UPPER(eye_side) = ANY(%(eyes)s)
               AND COALESCE(is_active,TRUE)=TRUE
               AND batch_no IS NOT NULL
-              AND COALESCE(quantity,0) > 0
+              AND GREATEST(0, COALESCE(quantity,0) - COALESCE(allocated_qty,0)) > 0
         """, {**p, "eyes": eye_values})
         qty   = int(rows[0]["total_qty"]   if rows else 0)
         count = int(rows[0]["batch_count"] if rows else 0)
@@ -202,12 +394,7 @@ def _get_stock(product_id: str, sph=None, cyl=None, axis=None,
 
     r_qty, r_has = _sum_stock(['R','RIGHT'])
     l_qty, l_has = _sum_stock(['L','LEFT'])
-    b_qty, b_has = _sum_stock(['B','BOTH'])
-
-    # Backwards-compat placeholders for is_split check
-    r_row = [{"qty": r_qty}] if r_has else []
-    l_row = [{"qty": l_qty}] if l_has else []
-    b_row = [{"qty": b_qty}] if b_has else []
+    b_qty, b_has = _sum_stock(['B','BOTH','PAIR','MAIN',''])
 
     # B eye requested + separate R/L rows exist → split mode (pair)
     is_split = (eye_side.upper() == "B" and r_has and l_has
@@ -216,9 +403,9 @@ def _get_stock(product_id: str, sph=None, cyl=None, axis=None,
     if is_split:
         available = min(r_qty, l_qty)   # pairs = min of R and L
     elif eye_side.upper() in ("R", "RIGHT"):
-        available = r_qty
+        available = r_qty or b_qty
     elif eye_side.upper() in ("L", "LEFT"):
-        available = l_qty
+        available = l_qty or b_qty
     else:
         # B with single B row (contact lens)
         available = b_qty
@@ -260,10 +447,10 @@ def _price_for_party(product_id: str, party_type: str,
         FROM inventory_stock
         WHERE product_id = %(pid)s::uuid
           AND COALESCE(sph,0)=%(sph)s AND COALESCE(cyl,0)=%(cyl)s
-          AND COALESCE(axis,0)=%(ax)s  AND COALESCE(add_power,0)=%(add)s
+          AND COALESCE(add_power,0)=%(add)s
           AND COALESCE(is_active,TRUE)=TRUE
           AND batch_no IS NOT NULL
-          AND COALESCE(quantity,0) > 0
+          AND GREATEST(0, COALESCE(quantity,0) - COALESCE(allocated_qty,0)) > 0
           AND COALESCE(mrp,0) > 0
         ORDER BY expiry_date ASC NULLS LAST
         LIMIT 1
@@ -281,7 +468,7 @@ def _price_for_party(product_id: str, party_type: str,
             FROM inventory_stock
             WHERE product_id = %(pid)s::uuid
               AND COALESCE(sph,0)=%(sph)s AND COALESCE(cyl,0)=%(cyl)s
-              AND COALESCE(axis,0)=%(ax)s  AND COALESCE(add_power,0)=%(add)s
+              AND COALESCE(add_power,0)=%(add)s
               AND COALESCE(is_active,TRUE)=TRUE
               AND batch_no IS NOT NULL
               AND COALESCE(mrp,0) > 0
@@ -289,15 +476,28 @@ def _price_for_party(product_id: str, party_type: str,
             LIMIT 1
         """, p)
 
-    # Fallback 2: product-level price
+    # Fallback 2: official DB price resolver (Price Master / Oph Specs /
+    # inventory fallback). Do not read pricing from products; product master
+    # does not own MRP/Selling/Purchase in this schema.
     if not rows or not float(rows[0].get("mrp") or 0):
-        rows = _rq("""
-            SELECT COALESCE(mrp,0) AS mrp,
-                   COALESCE(selling_price,0) AS selling_price,
-                   0 AS purchase_rate,
-                   COALESCE(gst_percent,12) AS gst_pct
-            FROM products WHERE id=%(pid)s::uuid LIMIT 1
-        """, p)
+        try:
+            from modules.core.price_source_resolver import resolve_db_price
+
+            resolved = resolve_db_price(
+                product_id,
+                party_type,
+                product={"product_id": product_id},
+                prefer_batch=True,
+            )
+            if resolved.get("found"):
+                rows = [{
+                    "mrp": resolved.get("mrp", 0),
+                    "selling_price": resolved.get("selling_price", 0),
+                    "purchase_rate": resolved.get("purchase_rate", 0),
+                    "gst_pct": resolved.get("gst_percent", 12),
+                }]
+        except Exception:
+            rows = []
 
     r = rows[0] if rows else {}
     mrp  = float(r.get("mrp") or 0)
@@ -315,7 +515,8 @@ def _price_for_party(product_id: str, party_type: str,
 # ── FIFO batch fetcher ────────────────────────────────────────────────────────
 
 def _get_fifo_batches(product_id: str, sph=None, cyl=None, axis=None,
-                      add_power=None, eye_side: str = "B") -> list:
+                      add_power=None, eye_side: str = "B",
+                      coating: str = None) -> list:
     """
     FIFO batch fetcher for billing screens.
 
@@ -336,6 +537,12 @@ def _get_fifo_batches(product_id: str, sph=None, cyl=None, axis=None,
         "cyl": cyl  or 0,
         "ax":  axis or 0,
         "add": add_power or 0,
+        "coat": coating or "",
+        "coats": (
+            [str(coating or "").lower(), "murk vision"]
+            if (add_power or 0) and str(coating or "").strip().lower() == "green"
+            else [str(coating or "").lower()]
+        ),
     }
 
     def _fetch(eyes: list) -> list:
@@ -344,7 +551,7 @@ def _get_fifo_batches(product_id: str, sph=None, cyl=None, axis=None,
                 id::text                            AS stock_id,
                 batch_no,
                 expiry_date::text                   AS expiry_date,
-                COALESCE(quantity, 0)               AS available_qty,
+                GREATEST(0, COALESCE(quantity, 0) - COALESCE(allocated_qty, 0)) AS available_qty,
                 COALESCE(mrp, 0)                    AS mrp,
                 COALESCE(selling_price, 0)          AS selling_price,
                 COALESCE(purchase_rate, 0)          AS purchase_rate,
@@ -353,13 +560,20 @@ def _get_fifo_batches(product_id: str, sph=None, cyl=None, axis=None,
             FROM inventory_stock
             WHERE product_id = %(pid)s::uuid
               AND COALESCE(sph,       0) = %(sph)s
-              AND COALESCE(cyl,       0) = %(cyl)s
-              AND COALESCE(axis,      0) = %(ax)s
+              AND (
+                    COALESCE(cyl, 0) = %(cyl)s
+                    OR (%(add)s <> 0 AND COALESCE(cyl, 0) = 0)
+                  )
+              AND (
+                    COALESCE(axis, 0) = 0
+                    OR ABS(COALESCE(axis, 0) - %(ax)s) <= 1
+                  )
               AND COALESCE(add_power, 0) = %(add)s
+              AND (%(coat)s = '' OR LOWER(COALESCE(coating,'')) = ANY(%(coats)s))
               AND UPPER(eye_side) = ANY(%(eyes)s)
               AND COALESCE(is_active, TRUE) = TRUE
               AND batch_no IS NOT NULL
-              AND COALESCE(quantity, 0) > 0
+              AND GREATEST(0, COALESCE(quantity, 0) - COALESCE(allocated_qty, 0)) > 0
             ORDER BY expiry_date ASC NULLS LAST, updated_at ASC
         """, {**p, "eyes": eyes})
         return rows or []
@@ -369,7 +583,7 @@ def _get_fifo_batches(product_id: str, sph=None, cyl=None, axis=None,
     # Check if B eye should split into R+L
     r_batches = _fetch(["R", "RIGHT"])
     l_batches = _fetch(["L", "LEFT"])
-    b_batches = _fetch(["B", "BOTH"])
+    b_batches = _fetch(["B", "BOTH", "PAIR", "MAIN", ""])
 
     has_rl = bool(r_batches and l_batches)
 
@@ -406,9 +620,11 @@ def _get_fifo_batches(product_id: str, sph=None, cyl=None, axis=None,
         return paired
 
     elif eye_upper in ("R", "RIGHT"):
-        return [dict(b, is_rl_split=False) for b in r_batches]
+        rows = r_batches or b_batches
+        return [dict(b, is_rl_split=False) for b in rows]
     elif eye_upper in ("L", "LEFT"):
-        return [dict(b, is_rl_split=False) for b in l_batches]
+        rows = l_batches or b_batches
+        return [dict(b, is_rl_split=False) for b in rows]
     else:
         # B eye with single B stock rows (contact lenses)
         return [dict(b, is_rl_split=False) for b in b_batches]
@@ -650,6 +866,20 @@ def _render_cart_stage():
     party_type = st.session_state.bo_party_type
     party_name = st.session_state.bo_party_name
 
+    # ── Duplicate mode banner ─────────────────────────────────────────────
+    if st.session_state.get("_bo_duplicate_mode"):
+        _n = len(st.session_state.get("bo_cart",[]))
+        st.markdown(
+            f"<div style='background:#1a1a2e;border:2px solid #6366f1;"
+            f"border-radius:8px;padding:8px 14px;margin-bottom:8px'>"
+            f"<b style='color:#a5b4fc'>📄 Duplicate Mode</b>"
+            f"<span style='color:#64748b;font-size:0.75rem;margin-left:10px'>"
+            f"Cart loaded with {_n} line(s) from previous order. "
+            f"Edit quantities or remove items before placing.</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
     st.markdown(
         f"<div style='background:#0f172a;border:1px solid #1e293b;"
         f"border-radius:8px;padding:6px 14px;margin-bottom:10px'>"
@@ -677,11 +907,12 @@ def _render_cart_stage():
     scan_col, clear_col = st.columns([4, 1])
     with scan_col:
         scan_val = st.text_input(
-            "📷 Scan barcode or search product",
+            "📷 Scan Code / Item Code or search product",
             key="bo_scan",
-            placeholder="Scan barcode → auto-adds  |  Type name → select below  |  Enter to add",
+            placeholder="Scan Code / Item Code → auto-adds  |  Type name → select below",
             label_visibility="collapsed",
         )
+        st.caption("Scanning rule: stock scan codes are saved in inventory_stock.item_code. Batch No is not used for frame scanning.")
     with clear_col:
         if st.button("✕", key="bo_scan_clear", use_container_width=True):
             st.session_state.pop("bo_scan", None)
@@ -701,16 +932,17 @@ def _render_cart_stage():
                 COALESCE(s.eye_side,'B') AS eye_side,
                 COALESCE(s.mrp,0) AS mrp,
                 COALESCE(s.selling_price,0) AS selling_price,
-                COALESCE(s.quantity,0) AS available
+                GREATEST(0, COALESCE(s.quantity,0) - COALESCE(s.allocated_qty,0)) AS available
             FROM inventory_stock s
             JOIN products p ON p.id = s.product_id
-            WHERE (UPPER(TRIM(s.barcode)) = UPPER(TRIM(%s))
-                OR UPPER(TRIM(s.batch_no)) = UPPER(TRIM(%s)))
+            WHERE (UPPER(TRIM(COALESCE(s.barcode,''))) = UPPER(TRIM(%s))
+                OR UPPER(TRIM(COALESCE(s.product_barcode,''))) = UPPER(TRIM(%s))
+                OR UPPER(TRIM(COALESCE(s.item_code,''))) = UPPER(TRIM(%s)))
               AND COALESCE(s.is_active,TRUE)=TRUE
-              AND COALESCE(s.quantity,0) > 0
+              AND GREATEST(0, COALESCE(s.quantity,0) - COALESCE(s.allocated_qty,0)) > 0
             ORDER BY s.expiry_date ASC NULLS LAST
             LIMIT 1
-        """, (scan_val.strip(), scan_val.strip()))
+        """, (scan_val.strip(), scan_val.strip(), scan_val.strip()))
 
         if hit:
             h = hit[0]
@@ -744,6 +976,7 @@ def _render_cart_stage():
             SELECT DISTINCT p.id::text AS product_id, p.product_name,
                    COALESCE(p.brand,'') AS brand,
                    COALESCE(p.main_group,'') AS main_group,
+                   COALESCE(p.gst_percent,12) AS gst_pct
 
             FROM products p
 
@@ -783,19 +1016,25 @@ def _render_cart_stage():
 
             sph = cyl = axis = add_power = None
             if needs_power:
+                # ── Same power both eyes shortcut ─────────────────────────
+                # Bulk uses single power entry for both eyes (is_pair=True).
+                # Checkbox label reflects this — no separate L field to mirror.
+                st.checkbox(
+                    "↔ Same power both eyes",
+                    key="bo_copy_same_rl",
+                    value=True,
+                    disabled=True,
+                    help="Bulk order uses the same power entry for both eyes automatically.",
+                )
                 pc1, pc2, pc3, pc4 = st.columns(4)
-                sph_v = pc1.number_input("SPH", step=0.25, format="%.2f",
-                                          value=0.0, key="bo_sph")
-                cyl_v = pc2.number_input("CYL", step=0.25, format="%.2f",
-                                          value=0.0, key="bo_cyl")
-                ax_v  = pc3.number_input("AXIS", step=1, min_value=0,
-                                          max_value=180, value=0, key="bo_ax")
-                add_v = pc4.number_input("ADD", step=0.25, format="%.2f",
-                                          value=0.0, key="bo_add")
-                sph      = sph_v if sph_v != 0.0 else None
-                cyl      = cyl_v if cyl_v != 0.0 else None
-                axis     = ax_v  if ax_v  != 0   else None
-                add_power= add_v if add_v != 0.0 else None
+                sph_v = _rx_text_input(pc1, "SPH", "bo_sph", placeholder="")
+                cyl_v = _rx_text_input(pc2, "CYL", "bo_cyl", placeholder="")
+                ax_v  = _rx_text_input(pc3, "AXIS", "bo_ax", placeholder="")
+                add_v = _rx_text_input(pc4, "ADD", "bo_add", placeholder="")
+                sph       = _parse_rx_value(sph_v)
+                cyl       = _parse_rx_value(cyl_v)
+                axis      = _parse_rx_value(ax_v, is_axis=True)
+                add_power = _parse_rx_value(add_v)
 
             # ── Ophthalmic spec selector (index + coating) ────────────────────
             _bo_is_oph = (
@@ -811,13 +1050,16 @@ def _render_cart_stage():
                     product_name = str(sel_p.get("product_name","")),
                     rx_r         = {"sph": sph, "cyl": cyl, "axis": axis, "add": add_power},
                     rx_l         = {"sph": sph, "cyl": cyl, "axis": axis, "add": add_power},
-                    order_type   = "WHOLESALE",
+                    order_type   = party_type,
                     key_prefix   = f"bo_{str(sel_p.get('product_id',''))[:8]}",
                 )
+            _bo_oph_complete = bool(_bo_oph_spec and _bo_oph_spec.get("complete"))
+            _bo_oph_coating = (_bo_oph_spec or {}).get("coating") if _bo_oph_complete else None
+            _bo_lens_params = _oph_lens_params(_bo_oph_spec) if _bo_oph_complete else {}
 
             # ── Load product + delegate all price/qty to governor ──────
             prod_detail = _rq("""
-                SELECT unit, box_size, allow_loose,
+                SELECT id::text AS product_id, unit, box_size, allow_loose,
                        COALESCE(gst_percent,12) AS gst_pct
                 FROM products WHERE id=%s::uuid LIMIT 1
             """, (sel_p["product_id"],))
@@ -844,19 +1086,11 @@ def _render_cart_stage():
                         break
 
             # ── FIFO batch availability ───────────────────────────────
-            # Ophthalmic: stock checked via oph_spec; FIFO not applicable
-            if _bo_is_oph:
-                fifo_batches = []
-                if _bo_oph_spec and _bo_oph_spec.get("complete"):
-                    _stk = _bo_oph_spec.get("stock_r", {})
-                    avail = _stk.get("qty_r", 0) + _bo_oph_spec.get("stock_l",{}).get("qty_l",0)
-                else:
-                    avail = 0
-            else:
-                fifo_batches = _get_fifo_batches(
-                    sel_p["product_id"], sph, cyl, axis, add_power, eye_side or "B"
-                )
-                avail = sum(int(b.get("available_qty", 0)) for b in fifo_batches)
+            fifo_batches = _get_fifo_batches(
+                sel_p["product_id"], sph, cyl, axis, add_power, eye_side or "B",
+                coating=_bo_oph_coating if _bo_is_oph else None,
+            )
+            avail = sum(int(b.get("available_qty", 0)) for b in fifo_batches)
 
             # ── Stock indicator — DB stores pcs, display as boxes ────
             if avail == 0:
@@ -881,11 +1115,11 @@ def _render_cart_stage():
                 if _pi_panel:
                     try:
                         _pi_panel(
-                            sph=float(item.get("sph") or 0),
-                            cyl=float(item.get("cyl") or 0),
-                            axis=int(item.get("axis") or 0),
-                            add_power=float(item.get("add_power") or 0),
-                            selected_product=item.get("product_name", ""),
+                            sph=float(sph or 0),
+                            cyl=float(cyl or 0),
+                            axis=int(axis or 0),
+                            add_power=float(add_power or 0),
+                            selected_product=sel_p.get("product_name", ""),
                             eye="",
                             product_id=str(sel_p.get("product_id","") or ""),
                             is_colour=False,
@@ -920,6 +1154,10 @@ def _render_cart_stage():
             # Price — governor resolves correct field for order_type
             _price_row = fifo_batches[0] if fifo_batches else {}
             _raw_price = resolve_price(_price_row, party_type)
+            if _bo_is_oph and _bo_oph_complete:
+                _oph_ppc = _oph_spec_per_lens_price(_bo_oph_spec, party_type)
+                if _oph_ppc > 0:
+                    _raw_price = _raw_price or _oph_ppc
 
             # ── Price Governor: validate + dropdown if old-price stock ────────
             if _render_price and prod_dict.get('product_id'):
@@ -944,6 +1182,14 @@ def _render_cart_stage():
                 "mrp": float(_price_row.get("mrp") or 0),
                 "sp":  float(_price_row.get("selling_price") or 0),
             }
+            if _bo_is_oph and _bo_oph_complete:
+                _oph_ppc = _oph_spec_per_lens_price(_bo_oph_spec, party_type)
+                if _oph_ppc > 0:
+                    if party_type == "RETAIL":
+                        prices["mrp"] = prices["mrp"] or _oph_ppc
+                    else:
+                        prices["sp"] = prices["sp"] or _oph_ppc
+                    prices["raw"] = prices["raw"] or _oph_ppc
 
             # ── Price version selector ─────────────────────────────────────
             if _price_selector:
@@ -991,6 +1237,8 @@ def _render_cart_stage():
                     qc3.metric("Total", box_qty_label(box_qty_inp, loose_inp, _eff_bs))
                 elif _has_box:
                     qc1, qc2 = st.columns(2)
+                    if int(st.session_state.get("bo_box_qty", 0) or 0) <= 0:
+                        st.session_state["bo_box_qty"] = 1
                     box_qty_inp = qc1.number_input(
                         _box_lbl, min_value=1, value=1,
                         max_value=max(1, _max_boxes), key="bo_box_qty"
@@ -1000,6 +1248,8 @@ def _render_cart_stage():
                     qc2.metric("Total", box_qty_label(box_qty_inp, 0, _eff_bs))
                 else:
                     qc1, _ = st.columns(2)
+                    if int(st.session_state.get("bo_qty", 0) or 0) <= 0:
+                        st.session_state["bo_qty"] = 1
                     final_pcs = qc1.number_input(
                         "Qty (pcs)", min_value=1, max_value=max(1, avail),
                         value=1, key="bo_qty"
@@ -1079,7 +1329,11 @@ def _render_cart_stage():
                                 )
                                 _add_to_cart(
                                     product_id   = sel_p["product_id"],
-                                    product_name = sel_p["product_name"],
+                                    product_name = (
+                                        _oph_name(sel_p["product_name"], _bo_oph_spec)
+                                        if _bo_is_oph and _bo_oph_complete and _oph_name
+                                        else sel_p["product_name"]
+                                    ),
                                     brand        = sel_p["brand"],
                                     main_group   = sel_p["main_group"],
                                     sph=sph, cyl=cyl, axis=axis, add_power=add_power,
@@ -1097,13 +1351,478 @@ def _render_cart_stage():
                                     stock_id     = a.get("stock_id"),
                                     l_stock_id   = a.get("l_stock_id"),
                                     is_rl_split  = a.get("is_rl_split", False),
+                                    lens_params  = _bo_lens_params,
                                 )
                             st.rerun()
 
                             st.rerun()
 
+    # ── Service-only quick add ────────────────────────────────────────
+    _render_service_quick_add()
+
     # ── Cart display ──────────────────────────────────────────────────
     _render_cart()
+
+
+def _render_service_quick_add():
+    """Add fitting/colouring/courier/other service lines to bulk billing."""
+    services = _service_master_rows(
+        st.session_state.get("bo_party_type", "RETAIL"),
+        party_id=str(st.session_state.get("bo_party_id") or ""),
+    )
+    if not services:
+        return
+    with st.expander("🧾 Add Service — Fitting · Colouring · Courier", expanded=False):
+        labels = [
+            f"{s.get('service_group')} · {s.get('service_name')} · ₹{float(s.get('default_price') or 0):.0f}"
+            for s in services
+        ]
+        idx = st.selectbox("Service", range(len(services)), format_func=lambda i: labels[i], key="bo_svc_pick")
+        svc = services[int(idx)]
+        group = str(svc.get("service_group") or "OTHER").upper()
+        courier_provider_id = ""
+        courier_provider_name = ""
+        courier_rate_option_id = ""
+        courier_rate_option_label = ""
+        courier_parcel_size = ""
+        if group == "COURIER":
+            try:
+                from modules.backoffice.service_master import fetch_providers as _bulk_fetch_providers
+                from modules.backoffice.service_master import fetch_courier_rate_options as _bulk_fetch_courier_slabs
+                courier_rows = _bulk_fetch_providers("COURIER", active_only=True) or []
+            except Exception:
+                courier_rows = []
+                _bulk_fetch_courier_slabs = lambda *_a, **_k: []
+            provider_ids = [""] + [str(p.get("id") or "") for p in courier_rows]
+
+            def fmt_provider(pid):
+                if not pid:
+                    return "— Select Courier Provider —"
+                p = next((x for x in courier_rows if str(x.get("id") or "") == str(pid)), {})
+                return str(p.get("provider_name") or pid)
+
+            courier_provider_id = st.selectbox(
+                "Courier provider",
+                provider_ids,
+                format_func=fmt_provider,
+                key="bo_svc_courier_provider",
+            )
+            provider = next((x for x in courier_rows if str(x.get("id") or "") == str(courier_provider_id)), {})
+            courier_provider_name = str(provider.get("provider_name") or "")
+            slab_rows = _bulk_fetch_courier_slabs(courier_provider_id, active_only=True) if courier_provider_id else []
+            slab_ids = [""] + [str(s.get("id") or "") for s in slab_rows]
+            slab_idx = 0
+            if slab_rows:
+                lowest = min(slab_rows, key=lambda s: float(s.get("charge_base") or 0))
+                low_id = str(lowest.get("id") or "")
+                slab_idx = slab_ids.index(low_id) if low_id in slab_ids else 0
+
+            def fmt_slab(sid):
+                if not sid:
+                    return "Provider default / manual"
+                s = next((x for x in slab_rows if str(x.get("id") or "") == str(sid)), {})
+                code = str(s.get("parcel_size_code") or "")
+                return (
+                    f"{s.get('option_label') or ''}"
+                    + (f" · {code}" if code else "")
+                    + f" — ₹{float(s.get('charge_base') or 0):,.2f}"
+                )
+
+            courier_rate_option_id = st.selectbox(
+                "Courier charge slab / parcel size",
+                slab_ids,
+                index=slab_idx,
+                format_func=fmt_slab,
+                key="bo_svc_courier_slab",
+            )
+            slab = next((x for x in slab_rows if str(x.get("id") or "") == str(courier_rate_option_id)), {})
+            if slab:
+                svc["default_price"] = float(slab.get("charge_base") or 0)
+                svc["gst_percent"] = float(slab.get("gst_percent") or svc.get("gst_percent") or 18)
+                courier_rate_option_label = str(slab.get("option_label") or "")
+                courier_parcel_size = str(slab.get("parcel_size_code") or "")
+                st.caption("Lowest courier slab is auto-selected. Change dropdown if parcel is bigger.")
+        c1, c2, cq, c3 = st.columns([2, 1, 1, 1])
+        desc = c1.text_input("Description", value=str(svc.get("service_name") or ""), key="bo_svc_desc")
+        amt = c2.number_input("Rate / pair ₹", min_value=0.0, step=10.0,
+                              value=float(svc.get("default_price") or 0), key="bo_svc_amt")
+        # Auto-detect pair from bulk cart
+        _bo_cart_now = st.session_state.get("bulk_order_lines") or                        st.session_state.get("bulk_cart") or []
+        _bo_eyes = {str(l.get("eye_side","")).upper()[:1]
+                    for l in _bo_cart_now if not l.get("is_service_line")}
+        _bo_auto_qty = 1.0 if ("R" in _bo_eyes and "L" in _bo_eyes) else (
+                       0.5 if _bo_eyes else 1.0)
+        _bo_auto_idx = [0.5, 1.0, 1.5, 2.0, 3.0].index(_bo_auto_qty)                        if _bo_auto_qty in [0.5, 1.0, 1.5, 2.0, 3.0] else 1
+        qty_factor = cq.selectbox(
+            "Qty ⚠️",
+            [0.5, 1.0, 1.5, 2.0, 3.0],
+            index=_bo_auto_idx,
+            format_func=lambda v: (
+                f"{v:g} pair — 1 eye only" if v == 0.5 else
+                f"{v:g} pair — both eyes" if v == 1.0 else
+                f"{v:g} pair"
+            ),
+            key="bo_svc_qty_factor",
+            help="Auto-set from cart. 0.5 pair = 1 eye only. 1 pair = both eyes.",
+        )
+        gst = c3.number_input("GST %", min_value=0.0, max_value=28.0, step=0.5,
+                              value=float(svc.get("gst_percent") or 0), key="bo_svc_gst")
+        if st.button(f"➕ Add {qty_factor:g} pair to Cart", key="bo_svc_add", type="primary", use_container_width=True):
+            if amt <= 0:
+                st.error("Enter amount > 0")
+                return
+            code = str(svc.get("service_code") or group).upper()
+            prod_route = str(svc.get("production_route") or "").upper()
+            mfg_route = "INHOUSE" if prod_route == "COLOURING" else ("FITTING" if prod_route == "FITTING" else "STOCK")
+            base_amt = round(float(amt) * float(qty_factor), 2)
+            gst_amt = round(base_amt * float(gst) / 100, 2)
+            total = round(base_amt + gst_amt, 2)
+            pid = _ensure_service_product_id(group, svc.get("service_name") or desc or "Service")
+            st.session_state.bo_cart.append({
+                "id": str(uuid.uuid4()),
+                "product_id": pid,
+                "product_name": desc or svc.get("service_name") or "Service Charge",
+                "brand": "Service",
+                "main_group": "Services",
+                "sph": None, "cyl": None, "axis": None, "add_power": None,
+                "eye_side": "SERVICE", "eye_label": "SERVICE", "power_str": "",
+                "is_pair": False,
+                "batch_no": "", "stock_id": None, "l_stock_id": None, "is_rl_split": False,
+                "unit_price": base_amt,
+                "box_price": None, "box_size": 1, "box_qty": 0, "loose_pcs": 1,
+                "is_box_mode": False,
+                "lens_params": {
+                    "charge_type": group,
+                    "service_type": group,
+                    "service_group": group,
+                    "service_code": code,
+                    "service_description": desc or svc.get("service_name") or "",
+                    "service_origin": "bulk_order",
+                    "service_production_type": prod_route,
+                    "manufacturing_route": mfg_route,
+                    "batch_status": "PENDING" if prod_route else "READY",
+                    "service_qty_factor": float(qty_factor),
+                    "service_rate_per_pair": float(amt),
+                    "courier_provider_id": courier_provider_id,
+                    "courier_provider_name": courier_provider_name,
+                    "courier_rate_option_id": courier_rate_option_id,
+                    "courier_rate_option_label": courier_rate_option_label,
+                    "courier_parcel_size": courier_parcel_size,
+                },
+                "base_price": base_amt,
+                "gst_pct": float(gst),
+                "gst_amt": gst_amt,
+                "qty": 1, "final_pcs": 1, "billing_qty": 1,
+                "allocated_qty": 0 if prod_route else 1,
+                "line_total": total,
+                "billing_total": total,
+                "discount_percent": 0.0,
+                "discount_amount": 0.0,
+            })
+            st.rerun()
+
+
+def _quick_service_party_rows(mode: str) -> List[Dict]:
+    is_retail = str(mode or "").upper() == "RETAIL"
+    try:
+        rows = _rq("""
+            SELECT id::text AS id,
+                   party_name,
+                   COALESCE(party_type,'') AS party_type,
+                   COALESCE(mobile,'') AS mobile,
+                   COALESCE(doc_preference::text, '') AS doc_preference,
+                   COALESCE(billing_preference, '') AS billing_preference
+            FROM parties
+            WHERE COALESCE(is_active, TRUE)=TRUE
+            ORDER BY party_name
+        """) or []
+    except Exception:
+        rows = _rq("""
+            SELECT id::text AS id,
+                   party_name,
+                   COALESCE(party_type,'') AS party_type,
+                   COALESCE(mobile,'') AS mobile,
+                   '' AS doc_preference,
+                   '' AS billing_preference
+            FROM parties
+            WHERE COALESCE(is_active, TRUE)=TRUE
+            ORDER BY party_name
+        """) or []
+    supplier_types = {"SUPPLIER", "VENDOR", "LAB", "EXTERNAL_LAB"}
+    wholesale_types = {"WHOLESALE", "DISTRIBUTOR", "DEALER", "TRADER", "B2B"}
+    if is_retail:
+        return [r for r in rows if str(r.get("party_type") or "").upper() not in supplier_types | wholesale_types]
+    out = [r for r in rows if str(r.get("party_type") or "").upper() in wholesale_types]
+    return out or [r for r in rows if str(r.get("party_type") or "").upper() not in supplier_types]
+
+
+def _quick_service_doc_route(party: Dict) -> str:
+    ptype = str(party.get("party_type") or "").upper()
+    if ptype in ("PATIENT", "RETAIL", "CUSTOMER", "WALKIN", "WALK-IN"):
+        return "C"
+    doc_pref = str(party.get("doc_preference") or "").strip().upper()
+    legacy = str(party.get("billing_preference") or "").strip().upper()
+    if doc_pref == "C" or legacy == "CHALLAN":
+        return "C"
+    return "I"
+
+
+def _create_quick_service_order(
+    *,
+    party: Dict,
+    service: Dict,
+    desc: str,
+    base_amount: float,
+    gst_percent: float,
+    lens_params: Dict,
+) -> Dict:
+    party_id = str(party.get("id") or "")
+    party_name = str(party.get("party_name") or "")
+    party_type_raw = str(party.get("party_type") or "WHOLESALE").upper()
+    order_type = "RETAIL" if party_type_raw in ("PATIENT", "RETAIL", "CUSTOMER", "WALKIN", "WALK-IN") else "WHOLESALE"
+    order_id = str(uuid.uuid4())
+    order_no = _next_order_no(order_type)
+    group = str(service.get("service_group") or lens_params.get("charge_type") or "OTHER").upper()
+    code = str(service.get("service_code") or group).upper()
+    gst_amount = round(float(base_amount or 0) * float(gst_percent or 0) / 100.0, 2)
+    total_amount = round(float(base_amount or 0) + gst_amount, 2)
+    product_id = _ensure_service_product_id(group, desc or service.get("service_name") or "Service")
+    lp = {
+        "charge_type": group,
+        "service_type": group,
+        "service_group": group,
+        "service_code": code,
+        "service_description": desc,
+        "service_display_name": desc,
+        "display_product_name": desc,
+        "service_origin": "quick_service_billing",
+        "service_production_type": "",
+        "manufacturing_route": "STOCK",
+        "batch_status": "READY",
+    }
+    lp.update({k: v for k, v in (lens_params or {}).items() if v not in (None, "")})
+
+    ok = _rw("""
+        INSERT INTO orders
+          (id, order_no, order_type, order_source,
+           party_id, party_name, status, total_items, total_value,
+           created_at, updated_at)
+        VALUES
+          (%(id)s::uuid, %(ono)s, %(otype)s, 'QUICK_SERVICE',
+           %(pid)s::uuid, %(pname)s, 'CONFIRMED', 1, %(total)s,
+           NOW(), NOW())
+    """, {
+        "id": order_id,
+        "ono": order_no,
+        "otype": order_type,
+        "pid": party_id,
+        "pname": party_name,
+        "total": total_amount,
+    })
+    if not ok:
+        return {"ok": False, "error": "Failed to create quick service order."}
+
+    import json as _json_qs
+    ok = _rw("""
+        INSERT INTO order_lines
+          (id, order_id, product_id, eye_side,
+           quantity, unit_price, total_price,
+           gst_percent, gst_amount,
+           billing_total, status, lens_params, boxing_params,
+           allocated_qty, billed_qty, is_service_line)
+        VALUES
+          (%(lid)s::uuid, %(oid)s::uuid, %(pid)s::uuid, 'SERVICE',
+           1, %(base)s, %(total)s,
+           %(gstp)s, %(gsta)s,
+           %(total)s, 'PENDING', %(lp)s::jsonb, '{}',
+           1, 0, TRUE)
+    """, {
+        "lid": str(uuid.uuid4()),
+        "oid": order_id,
+        "pid": product_id,
+        "base": round(float(base_amount or 0), 2),
+        "total": total_amount,
+        "gstp": round(float(gst_percent or 0), 2),
+        "gsta": gst_amount,
+        "lp": _json_qs.dumps(lp),
+    })
+    if not ok:
+        return {"ok": False, "error": "Failed to create quick service line."}
+    return {
+        "ok": True,
+        "order_id": order_id,
+        "order_no": order_no,
+        "order_type": order_type,
+        "base": round(float(base_amount or 0), 2),
+        "gst": gst_amount,
+        "total": total_amount,
+    }
+
+
+def _render_quick_service_billing():
+    mode = st.session_state.get("bo_mode", "WHOLESALE")
+    with st.expander("⚡ Quick Service Billing — missed courier / fitting / colouring / other", expanded=False):
+        parties = _quick_service_party_rows(mode)
+        if not parties:
+            st.info("No party found for quick service billing.")
+            return
+        p_search = st.text_input("Search party", key=f"qsb_party_search_{mode}", placeholder="Name / mobile")
+        filtered = [
+            p for p in parties
+            if not p_search
+            or p_search.lower() in str(p.get("party_name") or "").lower()
+            or p_search in str(p.get("mobile") or "")
+        ]
+        if not filtered:
+            st.info("No matching party.")
+            return
+        pidx = st.selectbox(
+            "Party",
+            range(len(filtered)),
+            format_func=lambda i: (
+                f"{filtered[i].get('party_name')}"
+                + (f" · {filtered[i].get('mobile')}" if filtered[i].get("mobile") else "")
+                + f" · {filtered[i].get('party_type') or ''}"
+            ),
+            key=f"qsb_party_{mode}",
+        )
+        party = filtered[int(pidx)]
+        route = _quick_service_doc_route(party)
+        st.caption(
+            "DB route: "
+            + ("Challan first" if route == "C" else "Direct invoice")
+            + " · no staff choice"
+        )
+
+        services = _service_master_rows(
+            "RETAIL" if str(party.get("party_type") or "").upper() in ("PATIENT", "RETAIL", "CUSTOMER") else "WHOLESALE",
+            party_id=str(party.get("id") or ""),
+        )
+        services = [s for s in services if str(s.get("service_group") or "").upper() in ("COURIER", "FITTING", "COLOURING", "OTHER", "MISC")]
+        if not services:
+            st.info("No active services in Service Master.")
+            return
+        sidx = st.selectbox(
+            "Service",
+            range(len(services)),
+            format_func=lambda i: f"{services[i].get('service_group')} · {services[i].get('service_name')} · ₹{float(services[i].get('default_price') or 0):.0f}",
+            key="qsb_service",
+        )
+        svc = services[int(sidx)]
+        group = str(svc.get("service_group") or "OTHER").upper()
+
+        courier_meta = {
+            "courier_provider_id": "",
+            "courier_provider_name": "",
+            "courier_rate_option_id": "",
+            "courier_rate_option_label": "",
+            "courier_parcel_size": "",
+        }
+        if group == "COURIER":
+            try:
+                from modules.backoffice.service_master import fetch_providers, fetch_courier_rate_options
+                couriers = fetch_providers("COURIER", active_only=True) or []
+            except Exception:
+                couriers = []
+                fetch_courier_rate_options = lambda *_a, **_k: []
+            provider_ids = [""] + [str(c.get("id") or "") for c in couriers]
+
+            def fmt_courier(pid):
+                if not pid:
+                    return "— Select Courier Provider —"
+                c = next((x for x in couriers if str(x.get("id") or "") == str(pid)), {})
+                return str(c.get("provider_name") or pid)
+
+            cpick = st.selectbox("Courier provider", provider_ids, format_func=fmt_courier, key="qsb_courier_provider")
+            cprov = next((x for x in couriers if str(x.get("id") or "") == str(cpick)), {})
+            slabs = fetch_courier_rate_options(cpick, active_only=True) if cpick else []
+            slab_ids = [""] + [str(s.get("id") or "") for s in slabs]
+            slab_idx = 0
+            if slabs:
+                low = min(slabs, key=lambda s: float(s.get("charge_base") or 0))
+                low_id = str(low.get("id") or "")
+                slab_idx = slab_ids.index(low_id) if low_id in slab_ids else 0
+
+            def fmt_slab(sid):
+                if not sid:
+                    return "Provider default / manual"
+                s = next((x for x in slabs if str(x.get("id") or "") == str(sid)), {})
+                code = str(s.get("parcel_size_code") or "")
+                return f"{s.get('option_label') or ''}{' · ' + code if code else ''} — ₹{float(s.get('charge_base') or 0):,.2f}"
+
+            spick = st.selectbox("Courier charge slab / parcel size", slab_ids, index=slab_idx, format_func=fmt_slab, key="qsb_courier_slab")
+            slab = next((x for x in slabs if str(x.get("id") or "") == str(spick)), {})
+            courier_meta = {
+                "courier_provider_id": cpick,
+                "courier_provider_name": str(cprov.get("provider_name") or ""),
+                "courier_rate_option_id": spick,
+                "courier_rate_option_label": str(slab.get("option_label") or ""),
+                "courier_parcel_size": str(slab.get("parcel_size_code") or ""),
+            }
+            if slab:
+                svc["default_price"] = float(slab.get("charge_base") or 0)
+                svc["gst_percent"] = float(slab.get("gst_percent") or svc.get("gst_percent") or 18)
+                st.caption("Lowest courier slab is auto-selected. Change dropdown if parcel is bigger.")
+
+        c1, c2, c3 = st.columns([2.4, 1, 1])
+        desc = c1.text_input("Description", value=str(svc.get("service_name") or group.title()), key="qsb_desc")
+        amount = c2.number_input("Amount ₹", min_value=0.0, step=10.0, value=float(svc.get("default_price") or 0), key="qsb_amount")
+        gst = c3.number_input("GST %", min_value=0.0, max_value=28.0, step=0.5, value=float(svc.get("gst_percent") or 18), key="qsb_gst")
+        remarks = st.text_input("Remarks", key="qsb_remarks", placeholder="Reason / missed in billing / extra parcel...")
+
+        if st.button("⚡ Create Service Bill", type="primary", use_container_width=True, key="qsb_create"):
+            if not party.get("id"):
+                st.error("Select a valid party.")
+                return
+            if amount <= 0:
+                st.error("Enter service amount > 0.")
+                return
+            order_res = _create_quick_service_order(
+                party=party,
+                service=svc,
+                desc=desc,
+                base_amount=float(amount),
+                gst_percent=float(gst),
+                lens_params={
+                    **courier_meta,
+                    "quick_service_remarks": remarks,
+                },
+            )
+            if not order_res.get("ok"):
+                st.error(order_res.get("error") or "Quick service order failed.")
+                return
+            oid = order_res["order_id"]
+            try:
+                if route == "C":
+                    from modules.billing.challan_invoice_manager import create_challan
+                    ch_no = create_challan(
+                        party_id=str(party.get("id")),
+                        order_ids=[oid],
+                        total_amount=float(order_res["base"]),
+                        total_tax=float(order_res["gst"]),
+                        remarks=remarks or "Quick service billing",
+                    )
+                    st.success(f"✅ Service challan created: {ch_no} · Order {order_res['order_no']}")
+                    st.session_state.bo_challan_no = ch_no
+                else:
+                    from modules.billing.challan_invoice_manager import create_invoice
+                    inv_no = create_invoice(
+                        challan_id=None,
+                        party_id=str(party.get("id")),
+                        order_ids=[oid],
+                        total_amount=float(order_res["base"]),
+                        total_tax=float(order_res["gst"]),
+                        due_days=0,
+                        remarks=remarks or "Quick service billing",
+                        party_name=str(party.get("party_name") or ""),
+                    )
+                    if inv_no:
+                        st.success(f"✅ Service invoice created: {inv_no} · Order {order_res['order_no']}")
+                        st.session_state.bo_invoice_no = inv_no
+                    else:
+                        st.error("Invoice was blocked by billing rules. The service order was created; open Billing Summary to create challan.")
+            except Exception as exc:
+                st.error(f"Service billing failed after order creation: {exc}")
 
 
 def _add_to_cart(product_id, product_name, brand, main_group,
@@ -1112,7 +1831,7 @@ def _add_to_cart(product_id, product_name, brand, main_group,
                  qty=None, box_price=None, box_size=1, box_qty=0,
                  loose_pcs=0, final_pcs=None, is_box_mode=False,
                  batch_no=None, stock_id=None, l_stock_id=None,
-                 is_rl_split=False):
+                 is_rl_split=False, lens_params=None):
     """
     Add one FIFO batch line to cart.
     When FIFO splits across batches, this is called once per batch.
@@ -1183,6 +1902,7 @@ def _add_to_cart(product_id, product_name, brand, main_group,
         "box_qty":      box_qty,
         "loose_pcs":    loose_pcs,
         "is_box_mode":  is_box_mode,
+        "lens_params":  lens_params or {},
         "base_price":   base,
         "gst_pct":      gst_pct,
         "gst_amt":      gst_amt,
@@ -1220,6 +1940,34 @@ def _add_to_cart(product_id, product_name, brand, main_group,
     cart.append(_new_item)
 
 
+def _line_product_with_spec(line: dict) -> str:
+    """Product display name including ophthalmic index/coating/treatment."""
+    pname = str(line.get("product_name") or "")
+    lp = line.get("lens_params") or {}
+    if not isinstance(lp, dict):
+        lp = {}
+    spec_src = lp or line.get("oph_spec") or {}
+    if not isinstance(spec_src, dict):
+        spec_src = {}
+    suffix = str(spec_src.get("display_suffix") or "").strip()
+    if suffix and suffix.lower() not in pname.lower():
+        return f"{pname} {suffix}".strip()
+    idx = spec_src.get("lens_index") or spec_src.get("index") or spec_src.get("index_value") or ""
+    coating = spec_src.get("coating") or spec_src.get("coating_type") or ""
+    treatment = spec_src.get("treatment") or ""
+    spec = []
+    if idx:
+        spec.append(f"Index {idx}")
+    if coating:
+        spec.append(str(coating))
+    if treatment and str(treatment).strip().lower() != "clear":
+        spec.append(str(treatment))
+    spec_txt = " | ".join(spec)
+    if spec_txt and spec_txt.lower() not in pname.lower():
+        return f"{pname} | {spec_txt}"
+    return pname
+
+
 def _render_cart():
     cart = st.session_state.bo_cart
     if not cart:
@@ -1250,7 +1998,7 @@ def _render_cart():
     for item in cart:
         with st.container():
             c1, c2, c3, c4, c5 = st.columns([4, 1, 1, 1, 1])
-            pname = item["product_name"]
+            pname = _line_product_with_spec(item)
             power = item["power_str"]
             eye   = item["eye_label"]
             label = f"**{pname}**"
@@ -1336,6 +2084,8 @@ def _render_cart():
                 st.session_state.bo_cart = [
                     i for i in cart if i["id"] != item["id"]
                 ]
+                if not st.session_state.bo_cart:
+                    bulk_hard_reset(keep_mode=True)
                 st.rerun()
 
             # line_total is the authoritative total per line
@@ -1371,6 +2121,29 @@ def _render_cart():
     sc2.metric("GST",        f"₹{_display_gst:,.2f}")
     sc3.metric("Grand Total",f"₹{_display_total:,.2f}")
 
+    # ── Optional advance at order stage ──────────────────────────────────
+    _collect_adv = st.checkbox(
+        "💳 Collect advance now",
+        key="bo_collect_advance",
+        value=st.session_state.get("bo_collect_advance", False),
+        help="Record advance payment at order stage. Balance collected at invoice.",
+    )
+    if _collect_adv:
+        _adv_modes = ["Cash","UPI","Card","Cheque","NEFT/RTGS"]
+        _ac1, _ac2, _ac3 = st.columns(3)
+        _adv_mode   = _ac1.selectbox("Mode", _adv_modes, key="bo_advance_mode")
+        _adv_amount = _ac2.number_input(
+            "Advance ₹", min_value=0.0, max_value=float(_display_total),
+            value=0.0, step=0.50, key="bo_advance_amount",
+        )
+        _adv_ref = _ac3.text_input("Reference / UPI ID", key="bo_advance_ref",
+                                    placeholder="Optional")
+        if _adv_amount > 0:
+            st.caption(
+                f"Balance after advance: "
+                f"**₹{max(_display_total - _adv_amount, 0):,.2f}**"
+            )
+
     _enter_to_click()
     if st.button("🛍️ Place Order  [Enter]", type="primary",
                  use_container_width=True, key="bo_place_order"):
@@ -1393,6 +2166,7 @@ def _place_order():
         st.error("Cart is empty.")
         return
 
+    # Schema columns ensured by modules/db/migrations/0001_billing_columns.sql
     # NOTE: FULL_ADVANCE parties — order placement is allowed freely.
     # The confirm gate fires in backoffice (order_status_live.check_confirm_gate).
     # No gate here — operator can punch, review, edit before payment.
@@ -1400,38 +2174,7 @@ def _place_order():
     order_id = str(uuid.uuid4())
     order_no = _next_order_no(party_type)
 
-    # Create order
-    ok = _rw("""
-        INSERT INTO orders
-          (id, order_no, order_type, order_source,
-           party_id, party_name,
-           status, total_items, total_value,
-           created_at, updated_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
-        ON CONFLICT (id) DO NOTHING
-    """, (
-        order_id, order_no, party_type, "COUNTER_SALE",
-        party_id, party_name,
-        "CONFIRMED",   # COUNTER_SALE: stock verified at cart, skip backoffice confirm
-        len(cart),
-        sum(item["line_total"] for item in cart),
-    ))
-    if not ok:
-        st.error("Failed to create order.")
-        return
-
-    # Create order lines
-    # COUNTER_SALE lines: stock was verified + FIFO-allocated at cart build time.
-    # allocated_qty = quantity (fully allocated), lens_params marks route as STOCK
-    # so is_line_billing_ready() and _is_order_billing_ready() pass without
-    # needing a separate allocation step.
-    import json as _json
-    _cs_lens = _json.dumps({
-        "manufacturing_route": "STOCK",
-        "order_source":        "COUNTER_SALE",
-    })
-
-    # Deduplicate cart before inserting — guard against double-add
+    # ── Deduplicate cart (must happen before discount + INSERT) ───────────
     _seen_bulk = set()
     _deduped_bulk = []
     for _bi in cart:
@@ -1440,13 +2183,20 @@ def _place_order():
             str(_bi.get("eye_side","") or "").upper()[:1],
             str(_bi.get("sph","") or ""),
             str(_bi.get("cyl","") or ""),
+            str(_bi.get("add_power","") or ""),
+            str(_bi.get("axis","") or ""),
         )
         if _bk not in _seen_bulk:
             _seen_bulk.add(_bk)
             _deduped_bulk.append(_bi)
     cart = _deduped_bulk
 
-    # ── Apply discount rules before INSERT ────────────────────────────
+    # ── Apply discount rules BEFORE orders INSERT ─────────────────────────
+    # Earlier this ran AFTER the orders INSERT, so total_value = sum(line_total)
+    # which is gross. Moving it up lets us roll up the net header total and
+    # store it correctly in orders.total_value. Each cart item gets
+    # discount_amount stamped here; the loop below writes net to total_price
+    # and billing_total.
     try:
         _bo_party_id = str(order_data.get("party_id") or
                           st.session_state.get("bo_party_id") or "")
@@ -1458,7 +2208,69 @@ def _place_order():
     except Exception as _bde:
         pass  # zero-risk fallback
 
+    # ── Compute net header total_value ────────────────────────────────────
+    # For pair items the line_total already covers both eyes (we don't
+    # duplicate it when splitting into R+L below), so summing once is correct.
+    _bulk_net_total = 0.0
     for item in cart:
+        _gross = float(item.get("line_total") or 0)
+        _disc  = float(item.get("discount_amount") or 0)
+        _net   = round(_gross - _disc, 2)
+        if _net < 0:
+            _net = 0.0
+        item["billing_total"] = _net    # cache net on the item for the INSERT loop
+        _bulk_net_total += _net
+
+    # Create order header with NET total_value
+    ok = _rw("""
+        INSERT INTO orders
+          (id, order_no, order_type, order_source,
+           party_id, party_name,
+           status, total_items, total_value,
+           created_at, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+        ON CONFLICT (id) DO NOTHING
+    """, (
+        order_id, order_no, party_type, "BULK",
+        party_id, party_name,
+        "CONFIRMED",   # COUNTER_SALE: stock verified at cart, skip backoffice confirm
+        len(cart),
+        round(_bulk_net_total, 2),
+    ))
+    if not ok:
+        st.error("Failed to create order.")
+        return
+
+    # Create order lines
+    # COUNTER_SALE lines: stock was verified + FIFO-allocated at cart build time.
+    # allocated_qty = quantity (fully allocated), lens_params marks route as STOCK
+    # so is_line_billing_ready() and _is_order_billing_ready() pass without
+    # needing a separate allocation step.
+    import json as _json
+    _cs_base_lens = {
+        "manufacturing_route": "STOCK",
+        "order_source":        "BULK",
+    }
+
+    for item in cart:
+        _item_lens = dict(_cs_base_lens)
+        if isinstance(item.get("lens_params"), dict):
+            _item_lens.update({k: v for k, v in item["lens_params"].items()
+                               if v not in (None, "")})
+        _cs_lens = _json.dumps(_item_lens)
+
+        # Both total_price and billing_total now hold NET (post-discount).
+        # billing_total was pre-computed in the cart loop above as
+        # round(line_total - discount_amount, 2). Earlier total_price was
+        # written as item["line_total"] (gross), creating an inconsistency
+        # where reports reading total_price saw gross while reports reading
+        # billing_total saw net. Now both are net.
+        _net_for_insert = float(item.get("billing_total") or
+                                round(float(item["line_total"]) -
+                                      float(item.get("discount_amount", 0)), 2))
+        if _net_for_insert < 0:
+            _net_for_insert = 0.0
+
         # For a pair (B eye split) — create TWO lines: R + L
         if item["is_pair"]:
             for eye in ("R", "L"):
@@ -1469,11 +2281,11 @@ def _place_order():
                        quantity, unit_price, total_price,
                        gst_percent, gst_amount,
                        discount_percent, discount_amount,
-                       billing_total, applied_rule_ids,
+                       billing_total, discount_rule, applied_rule_ids,
                        status, lens_params, boxing_params,
                        allocated_qty, billed_qty)
                     VALUES (%s,%s::uuid,%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                            %s,%s,
+                            %s,%s,%s,
                             'PENDING',%s,'{}', %s, 0)
                     ON CONFLICT (id) DO NOTHING
                 """, (
@@ -1483,16 +2295,16 @@ def _place_order():
                     item.get("axis"), item.get("add_power"),
                     item["qty"],
                     item["unit_price"],
-                    item["line_total"],
+                    _net_for_insert,                             # total_price = NET
                     item["gst_pct"],
                     item["gst_amt"],
                     float(item.get("discount_percent", 0)),
                     float(item.get("discount_amount", 0)),
-                    float(item.get("billing_total") or
-                          item["line_total"] - float(item.get("discount_amount", 0))),
+                    _net_for_insert,                             # billing_total = NET
+                    str(item.get("discount_rule") or ""),
                     str(item.get("applied_rule_ids") or ""),
                     _cs_lens,
-                    item["qty"],
+                    int(item.get("allocated_qty", item["qty"]) or 0),
                 ))
         else:
             _rw("""
@@ -1502,11 +2314,11 @@ def _place_order():
                    quantity, unit_price, total_price,
                    gst_percent, gst_amount,
                    discount_percent, discount_amount,
-                   billing_total, applied_rule_ids,
+                   billing_total, discount_rule, applied_rule_ids,
                    status, lens_params, boxing_params,
                    allocated_qty, billed_qty)
                 VALUES (%s,%s::uuid,%s::uuid,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                        %s,%s,
+                        %s,%s,%s,
                         'PENDING',%s,'{}', %s, 0)
                 ON CONFLICT (id) DO NOTHING
             """, (
@@ -1515,22 +2327,80 @@ def _place_order():
                 item.get("sph"), item.get("cyl"),
                 item.get("axis"), item.get("add_power"),
                 item["qty"],
-                item["unit_price"],    # per-pcs billed price
-                item["line_total"],    # authoritative total
+                item["unit_price"],         # per-pcs billed price
+                _net_for_insert,            # total_price = NET (was gross)
                 item["gst_pct"],
                 item["gst_amt"],
                 float(item.get("discount_percent", 0)),
                 float(item.get("discount_amount", 0)),
-                float(item.get("billing_total") or
-                      item["line_total"] - float(item.get("discount_amount", 0))),
+                _net_for_insert,            # billing_total = NET
+                str(item.get("discount_rule") or ""),
                 str(item.get("applied_rule_ids") or ""),
-                _cs_lens,             # manufacturing_route = STOCK
-                item["qty"],          # allocated_qty = quantity (stock verified at cart)
+                _cs_lens,                   # manufacturing_route = STOCK
+                int(item.get("allocated_qty", item["qty"]) or 0),  # service production stays pending
             ))
 
     st.session_state.bo_order_id  = order_id
     st.session_state.bo_order_no  = order_no
-    st.session_state.bo_tab       = 2
+    try:
+        from modules.backoffice.backoffice_helpers import ensure_order_production_refs
+        ensure_order_production_refs(order_no=order_no, order_id=order_id)
+    except Exception as _prod_ref_bulk_err:
+        import logging as _prod_ref_bulk_log
+        _prod_ref_bulk_log.getLogger(__name__).warning(
+            "Bulk order production_ref fill failed for %s: %s",
+            order_no, _prod_ref_bulk_err,
+        )
+
+    # ── Record advance if collected at cart stage ─────────────────────────
+    _adv_amt  = float(st.session_state.get("bo_advance_amount") or 0)
+    _adv_mode = str(st.session_state.get("bo_advance_mode") or "Cash")
+    _adv_ref  = str(st.session_state.get("bo_advance_ref") or "").strip()
+    if st.session_state.get("bo_collect_advance") and _adv_amt > 0:
+        try:
+            try:
+                from modules.db.order_number_registry import alloc_doc_number as _adn_ba
+                _ba_pno = _adn_ba("PAYMENT")
+            except Exception:
+                import datetime as _badt
+                _ba_pno = f"PAY/{_badt.date.today().strftime('%y%m')}/{uuid.uuid4().hex[:5].upper()}"
+            _rw("""
+                INSERT INTO payments
+                  (id, payment_no, party_id, party_name,
+                   order_id, advance_for_order_id,
+                   payment_date, payment_mode, amount,
+                   reference_no, payment_type, created_at)
+                VALUES (%s,%s,%s::uuid,%s,
+                        %s::uuid,%s::uuid,
+                        NOW(),%s,%s,%s,'ADVANCE',NOW())
+            """, (
+                str(uuid.uuid4()), _ba_pno,
+                party_id,
+                st.session_state.get("bo_party_name","") or "",
+                order_id, order_id,
+                _adv_mode, _adv_amt,
+                _adv_ref or None,
+            ))
+        except Exception as _ae:
+            pass  # Advance failure must not block order save
+
+    # ── Audit trail for duplicate orders ──────────────────────────────────
+    _src_ono_bo = st.session_state.pop("_bo_source_order_no", "") or ""
+    if st.session_state.get("_bo_duplicate_mode") and _src_ono_bo:
+        try:
+            _rw("""
+                INSERT INTO order_status_history
+                    (order_id, from_status, to_status, changed_by_name, remarks)
+                VALUES (%s::uuid, 'PUNCHED_DUPLICATE', 'CONFIRMED', %s, %s)
+            """, (
+                order_id,
+                st.session_state.get("user_name","Staff"),
+                f"Duplicate of order {_src_ono_bo}",
+            ))
+        except Exception:
+            pass
+
+    st.session_state.bo_tab = 2
     st.rerun()
 
 
@@ -1573,7 +2443,7 @@ def _render_challan_stage():
         pair_note = " *(R+L split on stock)*" if item.get("is_pair") else ""
         batch_info = f" [{item['batch_no']}]" if item.get("batch_no") else ""
         st.markdown(
-            f"- **{item['product_name']}** {item.get('power_str','')}"
+            f"- **{_line_product_with_spec(item)}** {item.get('power_str','')}"
             f"{eye_badge} × {item.get('final_pcs') or item.get('qty',1)}"
             f" · ₹{item.get('line_total',0):,.2f}{pair_note}{batch_info}"
         )
@@ -1664,12 +2534,26 @@ def _render_challan_stage():
             """, (order_id,))
             _bo_block = []
             for _bo_il in (_bo_inhouse or []):
-                _bo_vbr = _rq_bo(
-                    "SELECT * FROM public.validate_billing_readiness(%s::uuid)",
-                    (_bo_il["line_id"],)
-                )
-                if _bo_vbr and not _bo_vbr[0].get("is_ready"):
-                    _bo_block.append(_bo_vbr[0].get("block_reason") or "Not ready")
+                try:
+                    _bo_vbr = _rq_bo(
+                        "SELECT * FROM public.validate_billing_readiness(%s::uuid)",
+                        (_bo_il["line_id"],)
+                    )
+                    if _bo_vbr and not _bo_vbr[0].get("is_ready"):
+                        _bo_block.append(_bo_vbr[0].get("block_reason") or "Not ready")
+                except Exception as _bo_vbr_e:
+                    # DB function absent (older deployment) — use Python fallback gate
+                    import logging as _bo_log
+                    _bo_log.getLogger(__name__).warning(
+                        f"[bulk_order] validate_billing_readiness missing; using Python fallback: {_bo_vbr_e}"
+                    )
+                    try:
+                        from modules.billing.challan_invoice_manager import is_line_billing_ready
+                        _ok_fb, _reason_fb = is_line_billing_ready(_bo_il["line_id"])
+                        if not _ok_fb:
+                            _bo_block.append(_reason_fb)
+                    except Exception as _fb_e:
+                        _bo_block.append(f"Readiness check failed: {_fb_e}")
             if _bo_block:
                 for _bm in _bo_block:
                     st.error(f"❌ {_bm}")
@@ -1856,7 +2740,7 @@ def _render_invoice_stage():
                 except Exception: pass
                 # ── WhatsApp — Invoice ────────────────────────────────
                 try:
-                    from modules.wa_hub import wa_panel, wa_invoice_made
+                    from modules.wa_hub import wa_document_attachment, wa_panel, wa_invoice_made
                     from modules.settings.shop_master import get_unit_info
                     _sh_i = get_unit_info("wholesale" if party_type == "WHOLESALE" else "retail")
                     _mob_i = _rq("SELECT COALESCE(mobile,'') AS m FROM parties WHERE id=%s::uuid LIMIT 1", (party_id,))
@@ -1874,6 +2758,10 @@ def _render_invoice_stage():
                         key     = f"wa_bo_inv_{inv_no}",
                         title   = "📲 WhatsApp — Invoice Generated",
                         expanded= True,
+                        party_name = party_name,
+                        attachments=[
+                            wa_document_attachment("invoice", inv_no)
+                        ],
                     )
                 except Exception:
                     pass
@@ -1923,15 +2811,25 @@ def _render_payment_collection(order_id, party_id, party_name,
         if pamount <= 0:
             st.error("Enter amount.")
             return
+        try:
+            from modules.db.order_number_registry import alloc_doc_number as _adn_bp
+            _bp_pno = _adn_bp("PAYMENT")
+        except Exception:
+            import datetime as _bpdt
+            _bp_pno = f"PAY/{_bpdt.date.today().strftime('%y%m')}/{uuid.uuid4().hex[:5].upper()}"
         ok = _rw("""
             INSERT INTO payments
-              (id, party_id, order_ids, advance_for_order_id,
+              (id, payment_no, party_id, party_name,
+               order_id, advance_for_order_id,
                payment_date, payment_mode, amount,
                reference_no, payment_type, created_at)
-            VALUES (%s,%s::uuid, ARRAY[%s::text],%s::uuid,
+            VALUES (%s,%s,%s::uuid,%s,
+                    %s::uuid,%s::uuid,
                     NOW(),%s,%s,%s,'PAYMENT',NOW())
         """, (
-            str(uuid.uuid4()), party_id,
+            str(uuid.uuid4()), _bp_pno,
+            party_id,
+            st.session_state.get("bo_party_name","") or pname or "",
             order_id, order_id,
             pmode, pamount,
             pref.strip() or None,
@@ -1942,33 +2840,128 @@ def _render_payment_collection(order_id, party_id, party_name,
 
 
 def _render_print_actions(invoice_no, challan_no):
-    """Print and WhatsApp actions after invoice."""
-    st.markdown("#### 🖨️ Print / Share")
-    col1, col2, col3 = st.columns(3)
+    """Post-invoice top bar: Duplicate/New, real WhatsApp, print actions."""
+
+    # ── Build post-save snapshot if not already done ──────────────────────
+    if not st.session_state.get("_bo_post_save_data"):
+        _tot = sum(float(i.get("line_total",0)) for i in st.session_state.get("bo_cart",[]))
+        st.session_state["_bo_post_save_data"] = {
+            "order_no":    st.session_state.get("bo_order_no",""),
+            "invoice_no":  invoice_no,
+            "challan_no":  challan_no,
+            "party_name":  st.session_state.get("bo_party_name",""),
+            "mobile":      _scalar(
+                "SELECT COALESCE(mobile,'') FROM parties WHERE id=%s::uuid LIMIT 1",
+                (st.session_state.get("bo_party_id",""),)
+            ) or "",
+            "total":       _tot,
+            "order_type":  st.session_state.get("bo_mode","RETAIL"),
+            # Duplicate snapshot
+            "_party_id":         st.session_state.get("bo_party_id",""),
+            "_party_name":       st.session_state.get("bo_party_name",""),
+            "_party_type":       st.session_state.get("bo_party_type","RETAIL"),
+            "_mode":             st.session_state.get("bo_mode","RETAIL"),
+            "_billing_category": st.session_state.get("bo_billing_category","ADVANCE_BALANCE"),
+            "_cart":             list(st.session_state.get("bo_cart",[])),
+        }
+
+    _psd = st.session_state.get("_bo_post_save_data") or {}
+
+    # ── What next? bar ────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='background:#0a1628;border:2px solid #22c55e;"
+        "border-radius:8px;padding:4px 8px;margin-bottom:8px'>"
+        "<div style='color:#4ade80;font-size:0.72rem;font-weight:700;"
+        "text-align:center;margin-bottom:4px'>Order done ✓ What next?</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    _na1, _na2 = st.columns(2)
+
+    with _na1:
+        if st.button("📄 Duplicate Order", key="bo_dup_top",
+                     use_container_width=True,
+                     help="Same party + cart — new order/invoice"):
+            _src = _psd.get("order_no","")
+            duplicate_current_bulk_order()
+            if _src:
+                st.session_state["_bo_source_order_no"] = _src
+            st.session_state.pop("_bo_post_save_data", None)
+            st.rerun()
+
+    with _na2:
+        if st.button("🔄 New Order", key="bo_new_top",
+                     type="primary", use_container_width=True):
+            bulk_hard_reset(keep_mode=True)
+            st.rerun()
+
+    st.markdown("---")
+
+    # ── Real WhatsApp via post_save_actions ───────────────────────────────
+    _party_name = _psd.get("party_name","")
+    _mobile     = _psd.get("mobile","")
+    _total      = float(_psd.get("total",0))
+    _ono        = _psd.get("order_no","")
+    _otype      = _psd.get("order_type","RETAIL")
+    _lines      = _psd.get("_cart",[])
+
+    if _mobile:
+        try:
+            from modules.post_save_actions import render_post_save_actions
+            render_post_save_actions(
+                order_no    = _ono,
+                party_name  = _party_name,
+                mobile      = _mobile,
+                total       = _total,
+                order_type  = _otype,
+                advance     = 0.0,
+                delivery_date="",
+                on_account  = (_otype == "WHOLESALE"),
+                lines       = _lines,
+                status_label= "CONFIRMED",
+            )
+        except Exception as _wae:
+            st.caption(f"WhatsApp: {_wae}")
+    else:
+        st.caption("📱 No mobile on file for this party — WhatsApp not available.")
+
+    st.markdown("---")
+
+    # ── Print actions ─────────────────────────────────────────────────────
+    st.markdown("#### 🖨️ Print")
+    col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("🖨️ Print Invoice", use_container_width=True,
-                     key="bo_print_invoice"):
+        _inv_print_key = f"_bo_print_inv_{invoice_no}"
+        _inv_open = st.session_state.get(_inv_print_key, False)
+        if st.button(
+            "✕ Close Invoice" if _inv_open else "🖨️ Print Invoice",
+            use_container_width=True, key="bo_print_invoice"
+        ):
+            st.session_state[_inv_print_key] = not _inv_open
+            st.rerun()
+        if st.session_state.get(_inv_print_key):
             try:
-                from modules.billing.smart_print import render_invoice_print
-                render_invoice_print(invoice_no)
-            except Exception as e:
+                from modules.billing.smart_print import render_smart_invoice
+                render_smart_invoice(invoice_no)
+            except Exception as _pe:
                 st.info(f"Open print from Billing → Invoices → {invoice_no}")
 
     with col2:
-        if st.button("📋 Print Challan", use_container_width=True,
-                     key="bo_print_challan"):
-            st.info(f"Open print from Billing → Challans → {challan_no}")
-
-    with col3:
-        if st.button("📱 WhatsApp", use_container_width=True,
-                     key="bo_whatsapp"):
-            st.info("WhatsApp sharing — configure via Settings → WhatsApp")
-
-    st.markdown("---")
-    if st.button("🔄 New Order", type="primary",
-                 use_container_width=True, key="bo_new_order"):
-        _reset()
+        _ch_print_key = f"_bo_print_ch_{challan_no}"
+        _ch_open = st.session_state.get(_ch_print_key, False)
+        if st.button(
+            "✕ Close Challan" if _ch_open else "📋 Print Challan",
+            use_container_width=True, key="bo_print_challan"
+        ):
+            st.session_state[_ch_print_key] = not _ch_open
+            st.rerun()
+        if st.session_state.get(_ch_print_key):
+            try:
+                from modules.billing.smart_print import render_smart_challan
+                render_smart_challan(challan_no)
+            except Exception as _pe:
+                st.info(f"Open print from Billing → Challans → {challan_no}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2073,7 +3066,10 @@ def render_bulk_order():
     with hc2:
         st.write("")
         if st.button("🔄 New", use_container_width=True, key="bo_reset_top"):
-            _reset()
+            bulk_hard_reset(keep_mode=True)
+            st.rerun()
+
+    _render_quick_service_billing()
 
     tab = st.session_state.get("bo_tab", 0)
 

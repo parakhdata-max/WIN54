@@ -127,20 +127,22 @@ def _load_leakage_data(period_days: int) -> Tuple:
                 o.order_no,
                 o.patient_name,
                 p.product_name,
-                p.mrp                                              AS catalogue_price,
+                COALESCE(NULLIF(oi.original_price, 0), oi.unit_price) AS catalogue_price,
                 oi.unit_price                                      AS actual_price,
                 ROUND(
-                    ABS(oi.unit_price - p.mrp) / NULLIF(p.mrp, 0) * 100, 1
+                    ABS(oi.unit_price - COALESCE(NULLIF(oi.original_price, 0), oi.unit_price))
+                    / NULLIF(COALESCE(NULLIF(oi.original_price, 0), oi.unit_price), 0) * 100, 1
                 )                                                  AS deviation_pct,
                 o.created_by                                       AS changed_by,
                 o.created_at::date                                 AS created_at
-            FROM order_items oi
+            FROM order_lines oi
             JOIN orders o ON o.id = oi.order_id
-            JOIN products p ON p.product_id = oi.product_id
+            JOIN products p ON p.id = oi.product_id
             WHERE o.created_at >= NOW() - INTERVAL '{period_days} days'
               AND o.status NOT IN ('CANCELLED')
-              AND p.mrp > 0
-              AND ABS(oi.unit_price - p.mrp) / p.mrp * 100 > {OVERRIDE_DEVIATION_PCT}
+              AND COALESCE(NULLIF(oi.original_price, 0), oi.unit_price) > 0
+              AND ABS(oi.unit_price - COALESCE(NULLIF(oi.original_price, 0), oi.unit_price))
+                  / COALESCE(NULLIF(oi.original_price, 0), oi.unit_price) * 100 > {OVERRIDE_DEVIATION_PCT}
             ORDER BY deviation_pct DESC
             LIMIT 100
         """)
@@ -155,10 +157,10 @@ def _load_leakage_data(period_days: int) -> Tuple:
                 oi.discount_percent,
                 oi.discount_amount,
                 oi.billing_total,
-                o.approved_by
-            FROM order_items oi
+                COALESCE(oi.discount_by, o.updated_by, o.created_by) AS approved_by
+            FROM order_lines oi
             JOIN orders o ON o.id = oi.order_id
-            JOIN products p ON p.product_id = oi.product_id
+            JOIN products p ON p.id = oi.product_id
             WHERE o.created_at >= NOW() - INTERVAL '{period_days} days'
               AND o.status NOT IN ('CANCELLED')
               AND COALESCE(oi.discount_percent, 0) > {HIGH_DISCOUNT_PCT}
@@ -172,14 +174,14 @@ def _load_leakage_data(period_days: int) -> Tuple:
             SELECT
                 p.main_group,
                 SUM(oi.billing_total)::float                       AS revenue,
-                SUM(oi.quantity * COALESCE(p.avg_cost, 0))::float  AS cost,
+                SUM(oi.quantity * COALESCE(oi.cost_price, 0))::float AS cost,
                 ROUND(
-                    (1 - SUM(oi.quantity * COALESCE(p.avg_cost, 0))
+                    (1 - SUM(oi.quantity * COALESCE(oi.cost_price, 0))
                            / NULLIF(SUM(oi.billing_total), 0)) * 100, 1
                 )::float                                           AS gross_margin_pct
-            FROM order_items oi
+            FROM order_lines oi
             JOIN orders o ON o.id = oi.order_id
-            JOIN products p ON p.product_id = oi.product_id
+            JOIN products p ON p.id = oi.product_id
             WHERE o.created_at >= NOW() - INTERVAL '{period_days} days'
               AND o.status NOT IN ('CANCELLED')
             GROUP BY p.main_group

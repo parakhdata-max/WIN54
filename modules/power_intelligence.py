@@ -46,7 +46,7 @@ def find_instock_products(sph: float, cyl: float = 0.0, axis: int = 0,
         if is_toric:
             rows = run_query("""
                 SELECT
-                    p.product_name, p.brand, p.wear_schedule, p.type,
+                    p.product_name, p.brand, p.wear_schedule, p.category AS type,
                     s.batch_no, s.expiry_date, s.quantity, s.mrp,
                     s.id as stock_id
                 FROM inventory_stock s
@@ -62,7 +62,7 @@ def find_instock_products(sph: float, cyl: float = 0.0, axis: int = 0,
         elif is_multifocal:
             rows = run_query("""
                 SELECT
-                    p.product_name, p.brand, p.wear_schedule, p.type,
+                    p.product_name, p.brand, p.wear_schedule, p.category AS type,
                     s.batch_no, s.expiry_date, s.quantity, s.mrp,
                     s.id as stock_id
                 FROM inventory_stock s
@@ -77,7 +77,7 @@ def find_instock_products(sph: float, cyl: float = 0.0, axis: int = 0,
         else:
             rows = run_query("""
                 SELECT
-                    p.product_name, p.brand, p.wear_schedule, p.type,
+                    p.product_name, p.brand, p.wear_schedule, p.category AS type,
                     s.batch_no, s.expiry_date, s.quantity, s.mrp,
                     s.id as stock_id
                 FROM inventory_stock s

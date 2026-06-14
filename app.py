@@ -11,26 +11,65 @@ import traceback
 import sys
 import logging
 import time
+from logging.handlers import RotatingFileHandler
 
 # Load ENV
 load_dotenv()
 
-# ENV SWITCH (UI based)
-mode = st.sidebar.selectbox("Mode", ["TEST", "PROD"])
+# ==================================================
+# PAGE CONFIG — must be the FIRST Streamlit command
+# ==================================================
 
-if mode == "TEST":
-    DB_URL = os.getenv("DATABASE_TEST")
+st.set_page_config(
+    page_title="DV ERP",
+    page_icon="👓",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# ENV SWITCH (environment based)
+from modules.core.environment import app_env as _app_env, db_label as _db_label, db_url as _db_url, is_prod as _is_prod_env
+
+_env = _app_env()
+DB_URL = _db_url()
+st.session_state["DB_URL"] = DB_URL
+st.session_state["APP_ENV"] = _env
+if _is_prod_env():
+    st.sidebar.markdown(
+        f"""
+        <div style="background:#7f1d1d;color:#fff;border:2px solid #ef4444;
+                    padding:10px 12px;border-radius:8px;text-align:center;
+                    font-weight:900;font-size:1.05rem;margin-bottom:8px">
+            LIVE / PRODUCTION<br>
+            <span style="font-size:.78rem;font-weight:700">{_db_label(DB_URL)}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 else:
-    DB_URL = os.getenv("DATABASE_PROD")
+    st.sidebar.markdown(
+        f"""
+        <div style="background:#facc15;color:#111827;border:3px solid #dc2626;
+                    padding:12px;border-radius:8px;text-align:center;
+                    font-weight:1000;font-size:1.45rem;margin-bottom:8px">
+            BIG TEST<br>
+            <span style="font-size:.82rem;font-weight:800">Database: {_db_label(DB_URL)}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-st.sidebar.success(f"Connected to: {mode}")
-
-# SAFETY WARNING
-if mode == "PROD":
-    st.sidebar.warning("⚠️ PRODUCTION MODE")
-
-    # ✅ ADD THIS LINE HERE
-    st.session_state["DB_URL"] = DB_URL
+# Run idempotent schema migrations after the selected DB URL is known.
+try:
+    if not st.session_state.get("_migrations_done"):
+        from modules.db.migrations.runner import run_pending_migrations
+        _applied_migrations = run_pending_migrations()
+        st.session_state["_migrations_done"] = True
+        if _applied_migrations:
+            st.sidebar.caption(f"DB migrations: {len(_applied_migrations)} applied")
+except Exception as _mig_err:
+    st.error(f"Database migration failed: {_mig_err}")
+    st.stop()
 
 # Base path setup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -44,8 +83,13 @@ os.makedirs(_LOG_DIR, exist_ok=True)
 _LOG_FILE = os.path.join(_LOG_DIR, "app.log")
 
 _log_formatter   = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-_file_handler    = logging.FileHandler(_LOG_FILE, encoding="utf-8")
-_file_handler.setLevel(logging.INFO)
+_file_handler = RotatingFileHandler(
+    _LOG_FILE,
+    encoding="utf-8",
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5,
+)
+_file_handler.setLevel(logging.WARNING)
 _file_handler.setFormatter(_log_formatter)
 _console_handler = logging.StreamHandler()
 _console_handler.setLevel(logging.INFO)
@@ -74,12 +118,7 @@ log_time("Paths configured")
 # Must happen BEFORE any module that reads SYSTEM_FLAGS
 # ==================================================
 
-try:
-    from modules.flags.feature_flags import sync_system_flags
-    sync_system_flags()
-    log_time("Feature flags synced")
-except Exception as _flag_err:
-    logging.warning(f"[FLAGS] sync skipped: {_flag_err}")
+log_time("Feature flag sync deferred until after login")
 
 # ==================================================
 # PAYMENT PAGE ROUTE — no auth required
@@ -99,15 +138,29 @@ if _pay_token:
     st.stop()
 
 # ==================================================
-# PAGE CONFIG
+# RETAILER PORTAL ROUTE — no ERP login required
+# Retailers open ?portal=retailer from their link.
+# Has its own OTP-based login system.
 # ==================================================
 
-st.set_page_config(
-    page_title="DV ERP",
-    page_icon="👓",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+_portal_param = st.query_params.get("portal", "")
+if _portal_param == "retailer":
+    try:
+        from modules.retailer.retailer_portal import render_retailer_portal
+        render_retailer_portal()
+    except Exception as _rpe:
+        st.error(f"Retailer Portal error: {_rpe}")
+        import traceback; st.code(traceback.format_exc())
+    st.stop()
+
+if _portal_param == "online":
+    try:
+        from modules.online_store.store_app import render_online_store
+        render_online_store()
+    except Exception as _ose:
+        st.error(f"Online Store error: {_ose}")
+        import traceback; st.code(traceback.format_exc())
+    st.stop()
 
 log_time("Page config loaded")
 
@@ -122,47 +175,6 @@ try:
     _first_run = ensure_default_admin()
 except Exception:
     pass
-
-# ── Order number registry: sync counters from existing data (once per boot) ──
-# Runs in its own transaction, isolated from order saves.
-# Safe to run on every startup — GREATEST() means counters never go backward.
-if not st.session_state.get("_registry_synced"):
-    try:
-        from modules.db.order_number_registry import sync_registry_from_existing_orders
-        sync_registry_from_existing_orders()
-        st.session_state["_registry_synced"] = True
-    except Exception:
-        pass  # non-fatal — registry will self-create on first order save
-
-# ── Stock allocation drift check — once per session on startup ────────
-# Detect only (fix=False). Any drift is logged; operator sees it in
-# System Health Check. Nightly fix=True can be scheduled separately.
-if not st.session_state.get("_stock_recon_done"):
-    try:
-        from modules.backoffice.audit_logger import reconcile_stock_allocations
-        _recon_result = reconcile_stock_allocations(fix=False)
-        if not _recon_result.get("ok"):
-            import logging as _recon_log
-            _recon_log.warning(
-                "[Startup] Stock drift detected — %d line(s). "
-                "Run reconcile_stock_allocations(fix=True) to patch.",
-                len(_recon_result.get("drifted", []))
-            )
-    except Exception:
-        pass  # startup check never blocks the app
-    st.session_state["_stock_recon_done"] = True
-
-# Sync order statuses on startup (runs once per session)
-if not st.session_state.get("_status_sync_done"):
-    try:
-        from modules.backoffice.order_status_live import sync_all_open_orders
-        _synced = sync_all_open_orders()
-        if _synced:
-            import logging as _sl
-            _sl.info(f"[Startup] Synced status for {_synced} order(s)")
-    except Exception:
-        pass
-    st.session_state["_status_sync_done"] = True
 
 # ==================================================
 # LOGIN GATE — blocks everything until authenticated
@@ -189,6 +201,64 @@ _username = current_user_name()
 
 log_time("Auth OK")
 
+# Restore keyboard page scrolling in Streamlit layouts. Some widgets/iframes keep
+# focus away from the real page scroller, so Arrow/Page keys can stop moving.
+# ── Keyboard scroll + dropdown arrow-key fix ─────────────────────────────────
+try:
+    from keyboard_fix import install_keyboard_fix
+    install_keyboard_fix()
+except Exception:
+    pass
+
+# ==================================================
+# POST-LOGIN STARTUP MAINTENANCE
+# Keep this behind the login gate so the login page renders quickly.
+# ==================================================
+
+if not st.session_state.get("_feature_flags_synced"):
+    try:
+        from modules.flags.feature_flags import sync_system_flags
+        sync_system_flags()
+        log_time("Feature flags synced")
+    except Exception as _flag_err:
+        logging.warning(f"[FLAGS] sync skipped: {_flag_err}")
+    st.session_state["_feature_flags_synced"] = True
+
+# ── Order number registry: sync counters from existing data (once per session) ──
+# Runs in its own transaction, isolated from order saves.
+# Safe to run on startup — GREATEST() means counters never go backward.
+if not st.session_state.get("_registry_synced"):
+    try:
+        from modules.db.order_number_registry import sync_registry_from_existing_orders
+        sync_registry_from_existing_orders()
+        st.session_state["_registry_synced"] = True
+        log_time("Order registry synced")
+    except Exception:
+        pass  # non-fatal — registry will self-create on first order save
+
+# ── Stock allocation drift check — once per session after login ────────
+# Detect only (fix=False). Any drift is logged; operator sees it in
+# System Health Check. Nightly fix=True can be scheduled separately.
+if not st.session_state.get("_stock_recon_done"):
+    try:
+        from modules.backoffice.audit_logger import reconcile_stock_allocations
+        _recon_result = reconcile_stock_allocations(fix=False)
+        if not _recon_result.get("ok"):
+            import logging as _recon_log
+            _recon_log.warning(
+                "[Startup] Stock drift detected - %d line(s). "
+                "Run reconcile_stock_allocations(fix=True) to patch.",
+                len(_recon_result.get("drifted", []))
+            )
+        log_time("Stock allocation reconcile checked")
+    except Exception:
+        pass  # startup check never blocks the app
+    st.session_state["_stock_recon_done"] = True
+
+# Sync order statuses only when explicitly requested from a maintenance page.
+# Running this over hundreds of orders before the UI renders can delay startup
+# by 40-60 seconds on real data.
+
 # ==================================================
 # ROLE COLOURS — used in sidebar logo
 # ==================================================
@@ -208,8 +278,8 @@ log_time("Header rendered")
 if _first_run:
     st.warning(
         "⚠️ **First run detected** — default admin created. "
-        "**Username:** `admin` | **Password:** `admin123`  \n"
-        "Go to **Admin → User Management** and change this password immediately."
+        "Use the secured bootstrap credential from your deployment notes, then go to "
+        "**Admin → User Management** and change it immediately."
     )
 
 # ==================================================
@@ -335,10 +405,16 @@ render_retail_punching,       retail_ok        = lazy_import("Retail",          
 render_wholesale_punching,    wholesale_ok     = lazy_import("Wholesale",         "modules.wholesale_punching",           "render_wholesale_punching")
 render_backoffice_management, backoffice_ok    = lazy_import("Backoffice",        "modules.backoffice.backoffice",        "render_backoffice_management")
 render_production_page,       production_ok    = lazy_import("Production",        "modules.backoffice.production_page",   "render_production_page")
-render_fitter_management,     fitter_ok        = lazy_import("Fitter Manager",     "modules.backoffice.fitter_manager",    "render_fitter_management")
+render_fitter_management,     fitter_ok        = lazy_import("Service Management", "modules.backoffice.fitter_manager",    "render_fitter_management")
 render_purchase_ui,           procurement_ok   = lazy_import("Procurement",       "modules.procurement.purchase_ui",      "render_purchase_ui")
+render_direct_purchase,       direct_pur_ok    = lazy_import("Direct Purchase",    "modules.procurement.direct_purchase_ui","render_direct_purchase_ui")
 render_product_inventory_mgr, prod_inv_ok      = lazy_import("Product Inventory", "modules.procurement.product_inventory_manager", "render_product_inventory_manager")
 render_bulk_order,            bulk_order_ok    = lazy_import("Bulk Order",        "modules.billing.bulk_order",                    "render_bulk_order")
+render_wa_queue,              wa_queue_ok      = lazy_import("WA Queue",         "modules.wa_queue_sender",                       "render_wa_queue")
+render_wa_bulk_sender,        wa_bulk_ok       = lazy_import("Bulk WhatsApp",     "modules.wa_bulk_sender",                        "render_wa_bulk_sender")
+render_billing_hub,           billing_hub_ok   = lazy_import("Billing Hub",       "modules.billing.billing_hub",                   "render_billing_hub")
+render_discount_audit,        disc_audit_ok    = lazy_import("Discount Audit",    "modules.pricing.discount_audit",                "render_discount_audit")
+render_invoice_edit_admin,    inv_edit_ok      = lazy_import("Invoice Edit",      "modules.billing.invoice_edit_admin",            "render_invoice_edit_admin")
 render_pricing_admin,         pricing_ok       = lazy_import("Pricing Admin",     "modules.ui.pricing_admin.admin_ui",    "render_pricing_admin")
 render_import_dashboard,      analytics_ok     = lazy_import("Import Analytics",  "modules.analytics.import_dashboard",   "render_import_dashboard")
 render_discount_dashboard,    disc_dash_ok     = lazy_import("Discount Analytics","modules.analytics.discount_dashboard", "render_discount_dashboard")
@@ -352,6 +428,10 @@ render_control_dashboard,     founder_ok       = lazy_import("Control Tower",   
 render_owner_dashboard,       owner_dash_ok    = lazy_import("Owner Dashboard",   "modules.founder.owner_dashboard",      "render_owner_dashboard")
 render_crm_module,            crm_ok           = lazy_import("CRM",               "modules.crm.crm",                      "render_crm_module")
 render_system_health,         system_health_ok = lazy_import("System Health",     "modules.admin.system_health",          "render_system_health")
+render_backoffice_orders,     ret_orders_ok    = lazy_import("Retailer Orders",   "modules.retailer.backoffice_orders",   "render_backoffice_orders")
+render_dispatch_queue,        dispatch_ok      = lazy_import("Dispatch",          "modules.backoffice.dispatch_panel",    "render_dispatch_queue_tab")
+render_online_store,          online_store_ok  = lazy_import("Online Store",      "modules.online_store.store_app",       "render_online_store")
+render_online_store_admin,    online_admin_ok  = lazy_import("Online Admin",      "modules.online_store.store_admin",     "render_online_store_admin")
 
 log_time("All modules registered (lazy)")
 
@@ -371,19 +451,19 @@ log_time("Rendering sidebar")
 # ── Global layout: kill Streamlit's default top padding so pages start at top ──
 st.markdown("""
 <style>
-/* Main content starts at top — no wasted space */
+/* Main content gets the full working canvas when sidebar is collapsed */
 .block-container {
-    padding-top: 0rem !important;
+    max-width: 98vw !important;
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+    padding-top: 1.35rem !important;
     padding-bottom: 1rem !important;
 }
-/* Remove the default Streamlit header gap */
+/* Keep Streamlit's native header/sidebar toggle stable. */
 header[data-testid="stHeader"] {
-    height: 0 !important;
-    min-height: 0 !important;
-    display: none !important;
+    background: transparent !important;
 }
 div[data-testid="stDecoration"] { display: none !important; }
-div[data-testid="stToolbar"]    { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -395,6 +475,7 @@ section[data-testid="stSidebar"] {
     background: #ffffff !important;
     border-right: 1px solid #e5e7eb !important;
     min-width: 220px !important;
+    max-width: 260px !important;
 }
 /* Kill any dark overrides from page modules */
 section[data-testid="stSidebar"] > div {
@@ -453,6 +534,105 @@ section[data-testid="stSidebar"] .stRadio input[type="radio"] {
 </style>
 """, unsafe_allow_html=True)
 
+# App-wide readability pass: keep muted text/dividers visible on light panels.
+st.markdown("""
+<style>
+:root {
+    --dv-muted-readable: #374151;
+    --dv-muted-readable-strong: #1f2937;
+    --dv-line-readable: #6b7280;
+}
+
+[data-testid="stCaptionContainer"],
+[data-testid="stMarkdownContainer"] small,
+[data-testid="stMarkdownContainer"] .caption,
+[data-testid="stMarkdownContainer"] [style*="color:#94a3b8"],
+[data-testid="stMarkdownContainer"] [style*="color: #94a3b8"],
+[data-testid="stMarkdownContainer"] [style*="color:#9ca3af"],
+[data-testid="stMarkdownContainer"] [style*="color: #9ca3af"],
+[data-testid="stMarkdownContainer"] [style*="color:#cbd5e1"],
+[data-testid="stMarkdownContainer"] [style*="color: #cbd5e1"],
+[data-testid="stMarkdownContainer"] [style*="color:gray"],
+[data-testid="stMarkdownContainer"] [style*="color: gray"],
+[data-testid="stMarkdownContainer"] [style*="color:grey"],
+[data-testid="stMarkdownContainer"] [style*="color: grey"] {
+    color: var(--dv-muted-readable) !important;
+}
+
+[data-testid="stAppViewContainer"] [style*="color:#94a3b8"],
+[data-testid="stAppViewContainer"] [style*="color: #94a3b8"],
+[data-testid="stAppViewContainer"] [style*="color:#9ca3af"],
+[data-testid="stAppViewContainer"] [style*="color: #9ca3af"],
+[data-testid="stAppViewContainer"] [style*="color:#cbd5e1"],
+[data-testid="stAppViewContainer"] [style*="color: #cbd5e1"],
+[data-testid="stAppViewContainer"] [style*="color:#64748b"],
+[data-testid="stAppViewContainer"] [style*="color: #64748b"],
+[data-testid="stAppViewContainer"] [style*="color:#6b7280"],
+[data-testid="stAppViewContainer"] [style*="color: #6b7280"],
+[data-testid="stAppViewContainer"] [style*="color:gray"],
+[data-testid="stAppViewContainer"] [style*="color: gray"],
+[data-testid="stAppViewContainer"] [style*="color:grey"],
+[data-testid="stAppViewContainer"] [style*="color: grey"] {
+    color: var(--dv-muted-readable) !important;
+}
+
+[data-testid="stMarkdownContainer"] [style*="border-color:#e2e8f0"],
+[data-testid="stMarkdownContainer"] [style*="border-color: #e2e8f0"],
+[data-testid="stMarkdownContainer"] [style*="border-color:#cbd5e1"],
+[data-testid="stMarkdownContainer"] [style*="border-color: #cbd5e1"],
+[data-testid="stMarkdownContainer"] [style*="border-color:#e5e7eb"],
+[data-testid="stMarkdownContainer"] [style*="border-color: #e5e7eb"],
+[data-testid="stMarkdownContainer"] [style*="border:1px solid #e5e7eb"],
+[data-testid="stMarkdownContainer"] [style*="border: 1px solid #e5e7eb"],
+[data-testid="stMarkdownContainer"] [style*="border-bottom:1px solid #f3f4f6"],
+[data-testid="stMarkdownContainer"] [style*="border-bottom: 1px solid #f3f4f6"],
+[data-testid="stMarkdownContainer"] [style*="border-top:1px solid #f3f4f6"],
+[data-testid="stMarkdownContainer"] [style*="border-top: 1px solid #f3f4f6"],
+hr {
+    border-color: var(--dv-line-readable) !important;
+}
+
+[data-testid="stAppViewContainer"] [style*="border-color:#e2e8f0"],
+[data-testid="stAppViewContainer"] [style*="border-color: #e2e8f0"],
+[data-testid="stAppViewContainer"] [style*="border-color:#cbd5e1"],
+[data-testid="stAppViewContainer"] [style*="border-color: #cbd5e1"],
+[data-testid="stAppViewContainer"] [style*="border-color:#e5e7eb"],
+[data-testid="stAppViewContainer"] [style*="border-color: #e5e7eb"],
+[data-testid="stAppViewContainer"] [style*="border:1px solid #e5e7eb"],
+[data-testid="stAppViewContainer"] [style*="border: 1px solid #e5e7eb"],
+[data-testid="stAppViewContainer"] [style*="border-bottom:1px solid #f3f4f6"],
+[data-testid="stAppViewContainer"] [style*="border-bottom: 1px solid #f3f4f6"],
+[data-testid="stAppViewContainer"] [style*="border-top:1px solid #f3f4f6"],
+[data-testid="stAppViewContainer"] [style*="border-top: 1px solid #f3f4f6"] {
+    border-color: var(--dv-line-readable) !important;
+}
+
+div[data-testid="stCheckbox"],
+div[data-testid="stCheckbox"] *,
+[data-testid="stWidgetLabel"],
+[data-testid="stWidgetLabel"] * {
+    opacity: 1 !important;
+}
+
+div[data-testid="stCheckbox"] label,
+div[data-testid="stCheckbox"] label *,
+div[data-testid="stCheckbox"] p,
+div[data-testid="stCheckbox"] span,
+[data-testid="stWidgetLabel"],
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] span {
+    color: var(--dv-muted-readable-strong) !important;
+}
+
+div[data-testid="stCheckbox"] [aria-disabled="true"],
+div[data-testid="stCheckbox"] [disabled],
+div[data-testid="stCheckbox"] [data-disabled="true"] {
+    opacity: 1 !important;
+    color: var(--dv-muted-readable-strong) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ── Sidebar: DV ERP logo + user pill ──────────────────────────────────────
 st.sidebar.markdown(
     f"""<div style='padding:14px 12px 10px;border-bottom:1px solid #e5e7eb;margin-bottom:8px'>
@@ -476,47 +656,102 @@ st.sidebar.markdown(
 # ── Build page list ───────────────────────────────────────────────────────
 pages = []
 
+def _sidebar_pending_count(table: str, status_col: str = "status") -> int:
+    """Small live badge for external order queues; never blocks sidebar."""
+    try:
+        import time as _time
+        _cache_key = f"_sidebar_pending_{table}"
+        _ts_key = f"{_cache_key}_ts"
+        _now = _time.time()
+        if (_now - float(st.session_state.get(_ts_key, 0) or 0)) < 60:
+            return int(st.session_state.get(_cache_key, 0) or 0)
+        from modules.sql_adapter import run_query
+        if table not in ("online_orders", "retailer_orders"):
+            return 0
+        rows = run_query(f"""
+            SELECT COUNT(*) AS n
+            FROM {table}
+            WHERE UPPER(COALESCE({status_col},'')) NOT IN
+                  ('DELIVERED','DISPATCHED','CANCELLED','VOID','CLOSED','COMPLETED')
+        """) or []
+        n = int((rows[0].get("n") if rows else 0) or 0)
+        st.session_state[_cache_key] = n
+        st.session_state[_ts_key] = _now
+        return n
+    except Exception:
+        return 0
+
+_online_pending = _sidebar_pending_count("online_orders") if online_admin_ok else 0
+_retailer_pending = _sidebar_pending_count("retailer_orders") if ret_orders_ok else 0
+_online_label = (
+    f"🟢  Online Orders ({_online_pending})"
+    if _online_pending > 0 else "🌐  Online Orders"
+)
+_retailer_label = (
+    f"🟢  Retailer Orders ({_retailer_pending})"
+    if _retailer_pending > 0 else "🛒  Retailer Orders"
+)
+
 if has_role(BILLING, MANAGER, ADMIN):
-    pages.append("── BILLING ──")
-    if retail_ok:    pages.append("🛍️  Retail Order")
-    if wholesale_ok: pages.append("📦  Wholesale Order")
+    pages.append("── PUNCHINGS ──")
+    if retail_ok:     pages.append("🛍️  Retail Punching")
+    if wholesale_ok:  pages.append("📦  Wholesale Punching")
+    if bulk_order_ok: pages.append("⚡  Bulk Order")
+    if online_admin_ok: pages.append(_online_label)
+    if ret_orders_ok: pages.append(_retailer_label)
+
+if has_role(BILLING, LAB, MANAGER, ADMIN):
+    pages.append("── ORDER MANAGEMENT ──")
     pages.append("📋  Orders")
-    pages.append("👁️  CL Advisor")
-    pages.append("💳  Collect Payment")
-    pages.append("🧾  Challan & Invoice")
-    pages.append("📄  Credit & Debit Notes")
-    pages.append("📊  Reports")
-    pages.append("📚  Registers")
-    pages.append("📒  Accounts")
-    pages.append("👥  HR & Attendance")
+    if backoffice_ok: pages.append("⚙️  Back Office Management")
 
 if has_role(LAB, MANAGER, ADMIN):
     pages.append("── PRODUCTION ──")
-    if backoffice_ok: pages.append("⚙️  Backoffice")
     if production_ok: pages.append("🔬  Production")
-    if fitter_ok:     pages.append("🔧  Fitter Manager")
+    if fitter_ok:     pages.append("🔧  Service Management")
 
-if has_role(ADMIN, MANAGER):
-    pages.append("📋  Rejection Report")
+if has_role(BILLING, MANAGER, ADMIN):
+    pages.append("── ACCOUNT MANAGEMENT ──")
+    pages.append("🧾  Challan & Invoice")
+    pages.append("📄  Credit & Debit Notes")
+    pages.append("💳  Collect Payment")
+    pages.append("📚  Registers")
+    pages.append("📊  Reports")
+    pages.append("🧾  GST Portal")
+    # Keep Accounts available for legacy accounting utilities/JV screens.
+    pages.append("📒  Accounts")
+
+if has_role(LAB, BILLING, INVENTORY, MANAGER, ADMIN):
+    pages.append("── UTILITIES ──")
+    pages.append("🔍  Inventory Search")
+    pages.append("📋  Inventory Audit")
+    pages.append("🖨️  Printer Settings")
+    pages.append("👁️  Contact Lens Advisor")
+    if wa_queue_ok: pages.append("📬  W/A Queue")
+    if wa_bulk_ok: pages.append("📲  Bulk WhatsApp")
+    pages.append("📷  Scanner")
 
 if has_role(BILLING, INVENTORY, MANAGER, ADMIN):
-    pages.append("── MASTERS & STOCK ──")
+    pages.append("── LOADERS ──")
     pages.append("➕  Quick Add")
-    pages.append("🕶️  Scan & Add Frame")
-    pages.append("📥  Data Loader")
     pages.append("🕶️  Frame Stock")
-    pages.append("🔍  Inventory Search")
-    pages.append("🏷️  Label Preview")
-    pages.append("📷  Scanner")
+    pages.append("🕶️  Scan & Add Frame")
+    pages.append("📥  Data Loaders")
     if crm_ok: pages.append("🤝  CRM / Parties")
+    if prod_inv_ok: pages.append("🔬  Product & Inventory")
 
-if has_role(INVENTORY, MANAGER, ADMIN):
+if has_role(LAB, BILLING, MANAGER, ADMIN):
+    if dispatch_ok:   pages.append("🚚  Dispatch & Logistics")
+
+if has_role(BILLING, INVENTORY, MANAGER, ADMIN):
     if procurement_ok: pages.append("🛒  Procurement")
-    if prod_inv_ok:    pages.append("🔬  Product & Inventory")
-    if bulk_order_ok:  pages.append("⚡  Bulk Order")
 
 if has_role(ADMIN, MANAGER):
     pages.append("── ADMIN ──")
+    pages.append("🔍  Discount Audit")
+    pages.append("👥  HR & Attendance")
+    pages.append("📋  Rejection Report")
+    pages.append("🏷️  Label Preview")
     pages.append("🏪  Shop Master")
     if pricing_ok:       pages.append("💲  Pricing Admin")
     if disc_dash_ok:     pages.append("📊  Discount Analytics")
@@ -547,6 +782,38 @@ if has_role(ADMIN):
 
 if has_role(VIEWER) and not has_role(BILLING, LAB, INVENTORY, MANAGER, ADMIN):
     if analytics_ok: pages.append("📊  Import Analytics")
+
+def _sidebar_sort_key(label: str) -> str:
+    txt = str(label or "")
+    txt = __import__("re").sub(r"^[^\wA-Za-z]+", "", txt).strip()
+    txt = __import__("re").sub(r"^\(\d+\)\s*", "", txt).strip()
+    return txt.lower()
+
+
+def _sort_sidebar_sections(raw_pages):
+    sorted_pages = []
+    section = None
+    items = []
+
+    def _flush():
+        if section:
+            sorted_pages.append(section)
+        sorted_pages.extend(sorted(items, key=_sidebar_sort_key))
+
+    for item in raw_pages:
+        if str(item).startswith("──"):
+            if section is not None or items:
+                _flush()
+            section = item
+            items = []
+        else:
+            items.append(item)
+    if section is not None or items:
+        _flush()
+    return sorted_pages
+
+
+pages = _sort_sidebar_sections(pages)
 
 if not pages:
     st.sidebar.warning("No modules available for your role.")
@@ -625,27 +892,78 @@ for _sec_name, _sec_pages in _sections:
                 st.session_state["_retail_entry_count"] = _prev + 1
             st.rerun()
 
+# ── Default landing page ──────────────────────────────────────────
+# On first load _sidebar_page is not set.
+# Priority: Backoffice → Production → Retail → first real page (never a section header)
+if "_sidebar_page" not in st.session_state:
+    def _first_matching(keywords):
+        for _kw in keywords:
+            _match = next((p for p in _all_pages_flat if _kw in p.lower()), None)
+            if _match:
+                return _match
+        return None
+
+    _bo_default = (
+        _first_matching(["back office management", "backoffice"])
+        or _first_matching(["production", "orders", "retail", "wholesale"])
+        or (_all_pages_flat[0] if _all_pages_flat else "")
+    )
+    st.session_state["_sidebar_page"] = _bo_default
+
 selected_page = st.session_state.get("_sidebar_page", _all_pages_flat[0] if _all_pages_flat else "")
+
+# ── Handle jump navigation from CRM / other modules ──────────────────────────
+# Modules like CRM set global_nav_target + party filter keys, then rerun.
+# We consume the target here before rendering so the right page opens.
+_nav_target = st.session_state.pop("global_nav_target", None)
+if _nav_target:
+    def _find_page(*keywords):
+        for kw in keywords:
+            m = next((p for p in _all_pages_flat if kw.lower() in p.lower()), None)
+            if m:
+                return m
+        return None
+    if _nav_target == "backoffice":
+        _dest = _find_page("back office management", "backoffice", "back office")
+    elif _nav_target == "billing":
+        _dest = _find_page("challan & invoice", "billing hub", "billing")
+    elif _nav_target == "crm":
+        _dest = _find_page("crm", "parties")
+    elif _nav_target == "production":
+        _dest = _find_page("production")
+    else:
+        _dest = _find_page(_nav_target)
+    if _dest:
+        st.session_state["_sidebar_page"] = _dest
+        selected_page = _dest
 
 # ── Strip emoji prefix to get router key ─────────────────────────────────
 _PAGE_MAP = {
     "🛍️  Retail Order":        "Retail Order",
+    "🛍️  Retail Punching":     "Retail Order",
     "📦  Wholesale Order":      "Wholesale Order",
+    "📦  Wholesale Punching":   "Wholesale Order",
     "📋  Orders":               "📋 Orders",
     "⚙️  Backoffice":           "Backoffice",
+    "⚙️  Back Office Management": "Backoffice",
     "🔬  Production":           "Production",
-    "🔧  Fitter Manager":       "Fitter Manager",
+    "🚚  Dispatch & Logistics":  "Dispatch",
+    "🔧  Service Management":   "Service Management",
     "📝  Edit Log":             "Edit Log",
     "🤝  CRM / Parties":        "CRM",
     "🛒  Procurement":          "Procurement",
     "🔬  Product & Inventory":  "Product & Inventory",
     "⚡  Bulk Order":            "Bulk Order",
+    "📬  WA Queue":             "WhatsApp Queue",
+    "📬  W/A Queue":            "WhatsApp Queue",
+    "📲  Bulk WhatsApp":         "Bulk WhatsApp",
     "🧾  Challan & Invoice":    "Challan & Invoice Dashboard",
     "📄  Credit & Debit Notes": "Credit & Debit Notes",
     "💲  Pricing Admin":        "Pricing Admin",
     "📊  Discount Analytics":   "Discount Analytics",
     "🤖  AI Price Suggestions": "AI Price Suggestions",
     "📥  Data Loader":          "Data Loader",
+    "📥  Data Loaders":         "Data Loader",
     "🏪  Shop Master":          "Shop Master",
     "👥  User Management":      "User Management",
     "🔀  Patient Merge":        "Patient Merge",
@@ -657,6 +975,8 @@ _PAGE_MAP = {
     "🏰  Control Tower":        "Control Tower",
     "👑  Owner Dashboard":      "Owner Dashboard",
     "🔍  Inventory Search":     "Inventory Search",
+    "📋  Inventory Audit":      "Inventory Audit",
+    "🖨️  Printer Settings":     "Printer Settings",
     "➕  Quick Add":            "Quick Add",
     "🕶️  Scan & Add Frame":     "Scan Frame",
     "📷  Scanner":              "Scanner",
@@ -664,12 +984,19 @@ _PAGE_MAP = {
     "🕶️  Frame Stock":          "Frame Loader",
     "📊  Reports":              "Reports",
     "📚  Registers":            "Registers",
+    "🧾  GST Portal":           "GST Portal",
+    "🔍  Discount Audit":       "Discount Audit",
     "📒  Accounts":             "Accounts",
     "👥  HR & Attendance":      "HR",
     "💳  Collect Payment":      "Collect Payment",
     "👁️  CL Advisor":           "👁️  CL Advisor",
+    "👁️  Contact Lens Advisor": "👁️  CL Advisor",
     "🔢  Order Numbers":         "🔢  Order Numbers",
     "📋  Rejection Report":       "📋  Rejection Report",
+    "🌐  Online Orders":         "Online Orders",
+    "🛒  Retailer Orders":       "Retailer Orders",
+    _online_label:               "Online Orders",
+    _retailer_label:             "Retailer Orders",
 }
 selected_page = _PAGE_MAP.get(selected_page, selected_page)
 
@@ -778,7 +1105,8 @@ with st.sidebar.expander("ℹ️ System Info"):
         ("Wholesale",        wholesale_ok),
         ("Backoffice",       backoffice_ok),
         ("Production",       production_ok),
-        ("Fitter Manager",   fitter_ok),
+        ("Service Management", fitter_ok),
+        ("Dispatch",          dispatch_ok),
         ("Procurement",      procurement_ok),
         ("Product Inventory",prod_inv_ok),
         ("CRM",              crm_ok),
@@ -787,6 +1115,9 @@ with st.sidebar.expander("ℹ️ System Info"):
         ("Import Health",    health_ok),
         ("Control Tower",    founder_ok),
         ("System Health",    system_health_ok),
+        ("Retailer Orders",  ret_orders_ok),
+        ("Online Store",     online_store_ok),
+        ("Online Admin",     online_admin_ok),
     ]:
         st.write(f"- {name}: {'✅' if ok else '❌'}")
     try:
@@ -806,6 +1137,22 @@ with st.sidebar.expander("ℹ️ System Info"):
         st.write(f"- Advisory: {'✅' if advisory_on else '⛔'}")
     except Exception:
         st.write("- Advisory: ⚠️")
+    try:
+        from modules.core.system_observer import get_observer_summary
+        _obs_sum = get_observer_summary()
+        _slow_n = sum((_obs_sum.get("slow_pages") or {}).values())
+        _err_n = sum((_obs_sum.get("error_pages") or {}).values())
+        st.write(f"- Observer: 🧠 {_slow_n} slow · {_err_n} error")
+        if _slow_n or _err_n:
+            with st.expander("Observer Notes", expanded=False):
+                for _ev in (_obs_sum.get("events") or [])[-8:]:
+                    _lbl = _ev.get("event_type", "")
+                    _pg = _ev.get("page", "")
+                    _sec = _ev.get("elapsed_sec", 0)
+                    _msg = _ev.get("relief_action") or _ev.get("message") or ""
+                    st.caption(f"{_ev.get('at')} · {_lbl} · {_pg} · {_sec}s {_msg}")
+    except Exception:
+        st.write("- Observer: ⚠️")
     st.caption("Full health → Import Health dashboard")
 
 # ==================================================
@@ -901,6 +1248,11 @@ def handle_page_switch(new_page: str):
         # Clear tracking vars that might block operations
         st.session_state.pop("_retail_finalized_eyes", None)
         st.session_state.pop("retail_pending_eyes", None)
+        # Retail restores cart from these private snapshots on render. When
+        # switching modules, they must be cleared or old retail lines return
+        # without a selected patient.
+        st.session_state.pop("_persistent_cart", None)
+        st.session_state.pop("_crash_snapshot", None)
         # Also clear post-save / receipt / edit state so new page starts fresh
         for _clr in (
             "_receipt_snapshot", "_last_receipt_key",
@@ -960,7 +1312,9 @@ if _erp_mode and selected_page in ("Retail Order","Wholesale Order"):
         try:
             f = float(v or 0)
             return None if (_em.isnan(f) or _em.isinf(f)) else f
-        except: return None
+        except Exception as _e:
+            logging.getLogger(__name__).warning("Suppressed error: %s", _e)
+            return None
     _rx_r_clean = {k: _clean_rx(v) for k,v in _erp_rx_r.items()}
     _rx_l_clean = {k: _clean_rx(v) for k,v in _erp_rx_l.items()}
     st.session_state["retail_old_rx_r"] = _rx_r_clean
@@ -973,12 +1327,32 @@ if _erp_mode and selected_page in ("Retail Order","Wholesale Order"):
         st.session_state["_visit_mode_default"]        = 1   # Consultation Only
         st.session_state["_erp_visit_id"]              = _erp_vid   # kept for _do_save
         st.session_state["retail_order_lines"]         = []
+        st.session_state["_force_consultation_tab"]    = True
+        st.session_state.pop("_force_full_billing_mode", None)
+        st.session_state.pop("retail_visit_mode", None)
+        st.session_state.pop("last_confirmed_order", None)
+        if not _erp_pid:
+            _erp_pmob = ""
+            st.session_state["retail_patient_mobile"] = ""
+            st.session_state["_erp_patient_mob"] = ""
+            st.session_state.pop("consult_wa_mobile_display", None)
+        elif _erp_pmob:
+            st.session_state["consult_wa_mobile_display"] = _erp_pmob
+        else:
+            st.session_state.pop("consult_wa_mobile_display", None)
+        # Older consultation rows can have no linked party_id. Still open the
+        # consultation editor with the saved name/mobile instead of falling into
+        # a blank Retail Punching screen.
+        if not _erp_pid and _erp_pname:
+            import uuid as _erp_temp_uuid
+            st.session_state["retail_patient_id"] = f"TEMP-{str(_erp_temp_uuid.uuid4())[:8].upper()}"
         # Mark as edit so _do_save in consultation.py uses UPDATE
         st.session_state["_editing_consult_order_id"]  = _erp_oid
 
     elif _erp_mode == "BILL_NEW":
         # Open Full Billing tab, new order, consultation fee pre-loaded
         st.session_state["_visit_mode_default"]         = 0   # Full Billing
+        st.session_state["_force_full_billing_mode"]    = True
         st.session_state["retail_order_lines"]          = _erp_cart
         _consult_oid_erp = st.session_state.get("_erp_consult_oid","")
         if _consult_oid_erp:
@@ -994,6 +1368,7 @@ if _erp_mode and selected_page in ("Retail Order","Wholesale Order"):
     elif _erp_mode == "BILL_EDIT":
         # Open Full Billing tab, edit existing order
         st.session_state["_visit_mode_default"] = 0   # Full Billing
+        st.session_state["_force_full_billing_mode"] = True
         # _order_edit_prefill already set by order_edit_view — will be picked up below
 
     # Clean up all _erp_* keys
@@ -1084,8 +1459,20 @@ if _ep and selected_page in ("Retail Order", "Wholesale Order"):
             "add":  float(_rx_l_ep.get("add") or 0.0),
         } if _rx_l_ep else {}
     else:
-        st.session_state["retail_new_rx_r"] = {"sph":_ep_rx.get("sph_r",0),"cyl":_ep_rx.get("cyl_r",0),"axis":_ep_rx.get("ax_r",0),"add":_ep_rx.get("add_r",0)}
-        st.session_state["retail_new_rx_l"] = {"sph":_ep_rx.get("sph_l",0),"cyl":_ep_rx.get("cyl_l",0),"axis":_ep_rx.get("ax_l",0),"add":_ep_rx.get("add_l",0)}
+        _rx_r_ep = _ep.get("rx_r", {}) or {}
+        _rx_l_ep = _ep.get("rx_l", {}) or {}
+        st.session_state["retail_new_rx_r"] = {
+            "sph":  _rx_r_ep.get("sph", _ep_rx.get("sph_r", 0)),
+            "cyl":  _rx_r_ep.get("cyl", _ep_rx.get("cyl_r", 0)),
+            "axis": _rx_r_ep.get("axis", _ep_rx.get("ax_r", 0)),
+            "add":  _rx_r_ep.get("add", _ep_rx.get("add_r", 0)),
+        }
+        st.session_state["retail_new_rx_l"] = {
+            "sph":  _rx_l_ep.get("sph", _ep_rx.get("sph_l", 0)),
+            "cyl":  _rx_l_ep.get("cyl", _ep_rx.get("cyl_l", 0)),
+            "axis": _rx_l_ep.get("axis", _ep_rx.get("ax_l", 0)),
+            "add":  _rx_l_ep.get("add", _ep_rx.get("add_l", 0)),
+        }
     st.session_state["retail_order_lines"]           = _ep.get("cart",[])
     st.session_state["_visit_mode_default"]          = 0
     st.session_state["_editing_order_id"]            = _ep.get("order_id","")
@@ -1109,6 +1496,7 @@ if _ep and selected_page in ("Retail Order", "Wholesale Order"):
 
     # ── Apply patient ─────────────────────────────────────────────────────
 if _cp and selected_page == "Retail Order":
+    _cp_include_fee = bool(_cp.get("include_consult_fee"))
     # ── Apply patient ─────────────────────────────────────────────────────
     _cp_name = _cp.get("patient_name", "")
     st.session_state["retail_patient_name"]   = _cp_name
@@ -1139,12 +1527,13 @@ if _cp and selected_page == "Retail Order":
     st.session_state["retail_new_rx_l"] = _rx_l
 
     # ── Apply cart lines ───────────────────────────────────────────────────
-    if _cp.get("order_lines"):
+    if _cp_include_fee and _cp.get("order_lines"):
         st.session_state["retail_order_lines"] = _cp["order_lines"]
     else:
         st.session_state["retail_order_lines"] = []
 
     st.session_state["_visit_mode_default"] = 0  # Full Billing
+    st.session_state["_force_full_billing_mode"] = True
     # Delete widget key so radio re-renders fresh with index=0 (Full Billing).
     # Without this the widget keeps its previous value (Consultation Only).
     st.session_state.pop("retail_visit_mode", None)
@@ -1160,10 +1549,21 @@ if _cp and selected_page == "Retail Order":
         # can wipe it. The cart rendering reads this and shows an "Add Fee" button.
         _fee_lines = _cp.get("order_lines") or []
         _fee_amt = float(_cp.get("consult_fee") or 0)
+        _consult_paid_amt = float(_cp.get("consult_paid_amount") or 0)
+        _consult_is_paid = bool(_cp.get("consult_paid")) or _consult_paid_amt > 0
+        if not _cp_include_fee:
+            st.session_state.pop("_consult_fee_lines", None)
+            st.session_state.pop("_consult_paid_advance_amount", None)
+            st.session_state.pop("_consult_paid_advance_mode", None)
+            st.session_state.pop("_consult_paid_advance_ref", None)
+        elif _consult_is_paid:
+            st.session_state["_consult_paid_advance_amount"] = _consult_paid_amt or _fee_amt
+            st.session_state["_consult_paid_advance_mode"] = _cp.get("payment_mode", "CASH")
+            st.session_state.pop("_consult_fee_lines", None)
         if not _fee_amt and _fee_lines:
             _fee_amt = sum(float(l.get("total_price",0)) for l in _fee_lines
                           if str(l.get("eye_side","")).upper() in ("SERVICE","S"))
-        if _fee_amt > 0 or _fee_lines:
+        if _cp_include_fee and not _consult_is_paid and (_fee_amt > 0 or _fee_lines):
             import uuid as _uuid_cfe_app, datetime as _dt_cfe_app
             if not _fee_lines:
                 # Build fee line from scratch if not in order_lines
@@ -1189,6 +1589,7 @@ if _cp and selected_page == "Retail Order":
                     "display_qty": "1 SERVICE", "batch_allocation": [],
                     "unit_price": _fee_amt, "total_price": _fee_amt,
                     "gst_percent": 0.0, "gst_amount": 0.0,
+                    "is_gst_exempt": True,
                     "is_service_line": True, "status": "Complete",
                     "created_at": _dt_cfe_app.datetime.now().isoformat(),
                 }]
@@ -1220,9 +1621,10 @@ if _cp and selected_page == "Retail Order":
     # retail_order_lines will be wiped by product selection resets.
     # _consult_fee_lines survives until the order is saved.
     _cp_svc = [l for l in (_cp.get("order_lines") or [])
-               if str(l.get("eye_side","")).upper() in ("SERVICE","S")
-               or bool(l.get("is_service_line"))]
-    if _cp_svc:
+               if _cp_include_fee
+               and (str(l.get("eye_side","")).upper() in ("SERVICE","S")
+                    or bool(l.get("is_service_line")))]
+    if _cp_svc and not bool(_cp.get("consult_paid")):
         st.session_state["_consult_fee_lines"] = _cp_svc
 
     # Pop _consult_prefill so it doesn't re-apply on every render
@@ -1234,13 +1636,72 @@ if _cp and selected_page == "Retail Order":
 # ==================================================
 
 def safe_render(fn, name: str):
+    import time as _safe_time
+    _t0 = _safe_time.perf_counter()
     try:
+        from modules.core.system_observer import start_perf_trace
+        start_perf_trace(name)
+    except Exception:
+        pass
+    try:
+        try:
+            _db_block = st.session_state.get("_last_db_write_failure")
+            if _db_block:
+                _age = _safe_time.time() - float(_db_block.get("at") or 0)
+                if _age < 120:
+                    _healed = _db_block.get("healed") or []
+                    st.error(
+                        "**Database save blocked / rolled back**\n\n"
+                        f"Page: {name}\n\n"
+                        "The last button write did not commit. The internal auditor saved the cause."
+                    )
+                    if _healed:
+                        st.info(f"Self-heal applied: {', '.join(_healed)}")
+                    if _db_block.get("issue_note"):
+                        st.caption(f"Issue note: {_db_block.get('issue_note')}")
+                else:
+                    st.session_state.pop("_last_db_write_failure", None)
+        except Exception:
+            pass
         fn()
     except Exception as e:
         tb = traceback.format_exc()
         logging.error(f"[{name}] Render failed: {e}\n{tb}")
-        st.error(f"❌ {name} error: {e}")
-        st.code(tb)
+        try:
+            from modules.core.system_observer import record_page_error
+            _obs_err = record_page_error(name, e)
+            if _obs_err.get("relief_action"):
+                st.info(f"Observer relief: {_obs_err['relief_action']}")
+        except Exception:
+            pass
+        try:
+            from modules.core.error_logger import log_error
+            log_error(e, context=f"render:{name}", payload={"page": name})
+        except Exception:
+            pass
+        try:
+            from modules.core.operator_alerts import render_operator_alert
+            render_operator_alert(e, context=name, show_traceback=True)
+        except Exception:
+            st.error(f"❌ {name} error: {e}")
+            st.code(tb)
+    finally:
+        try:
+            _elapsed = _safe_time.perf_counter() - _t0
+            _threshold = float(st.session_state.get("_slow_render_threshold_sec", 8.0))
+            from modules.core.system_observer import finish_perf_trace, record_page_render
+            _perf = finish_perf_trace(_elapsed)
+            _obs = record_page_render(name, _elapsed, _threshold, perf=_perf)
+            if _obs.get("slow"):
+                _relief = f" {str(_obs.get('relief_action'))}" if _obs.get("relief_action") else ""
+                _repeat = " Repeated slowness detected." if _obs.get("repeated") else ""
+                _cause = f" Probable cause: {_obs.get('probable_cause')}." if _obs.get("probable_cause") else ""
+                st.warning(
+                    f"⚠️ {name} was slow to load ({_elapsed:.1f}s)."
+                    f"{_cause}{_repeat}{_relief} Diagnostic note saved: {_obs.get('note_path') or 'issue_notes'}"
+                )
+        except Exception:
+            pass
 
 # ==================================================
 # PAGE ROUTER — RBAC DOUBLE-GUARD
@@ -1268,6 +1729,8 @@ elif selected_page == "Wholesale Order":
     else: st.error("Wholesale unavailable")
 
 elif selected_page == "📋  Rejection Report":
+    from modules.security.roles import require_role, MANAGER, ADMIN
+    require_role(MANAGER, ADMIN)
     try:
         from modules.backoffice.rejection_report import render_rejection_report
         render_rejection_report()
@@ -1335,21 +1798,63 @@ elif selected_page == "Production":
     if production_ok: safe_render(render_production_page, "Production")
     else: st.error("Production unavailable")
 
-elif selected_page == "Fitter Manager":
+elif selected_page == "Service Management":
     from modules.security.roles import require_role
     require_role(LAB, MANAGER, ADMIN)
-    log_time("Open Fitter Manager")
-    if fitter_ok: safe_render(render_fitter_management, "Fitter Manager")
-    else: st.error("Fitter Manager unavailable")
+    log_time("Open Service Management")
+    if fitter_ok: safe_render(render_fitter_management, "Service Management")
+    else: st.error("Service Management unavailable")
 
-# ── Procurement ────────────────────────────────────────────────────────────
+elif selected_page == "Dispatch":
+    from modules.security.roles import require_role
+    require_role(LAB, BILLING, MANAGER, ADMIN)
+    log_time("Open Dispatch & Logistics")
+    if dispatch_ok:
+        safe_render(render_dispatch_queue, "Dispatch & Logistics")
+    else:
+        st.error("Dispatch module unavailable")
+
+# ── Procurement Hub ─────────────────────────────────────────────────────────
 
 elif selected_page == "Procurement":
     from modules.security.roles import require_role
-    require_role(INVENTORY, MANAGER, ADMIN)
-    log_time("Open Procurement")
-    if procurement_ok: safe_render(render_purchase_ui, "Procurement")
-    else: st.error("Procurement unavailable")
+    require_role(BILLING, INVENTORY, MANAGER, ADMIN)
+    log_time("Open Procurement Hub")
+    _proc_tab = st.radio(
+        "Procurement section",
+        ["📥 Queue", "📄 Invoice Match", "🧾 Direct Purchase", "📋 Purchase Register", "📊 Intelligence"],
+        horizontal=True, key="proc_hub_tab", label_visibility="collapsed",
+    )
+    if _proc_tab == "📥 Queue":
+        try:
+            from modules.backoffice.procurement_queue import render_procurement_queue
+            safe_render(render_procurement_queue, "Procurement Queue")
+        except Exception as _e:
+            st.error(f"Procurement Queue: {_e}")
+    elif _proc_tab == "📄 Invoice Match":
+        try:
+            from modules.procurement.invoice_match_ui import render_invoice_match_ui
+            safe_render(render_invoice_match_ui, "Invoice Match")
+        except Exception as _e:
+            st.error(f"Invoice Match: {_e}")
+            import traceback; st.code(traceback.format_exc())
+    elif _proc_tab == "🧾 Direct Purchase":
+        try:
+            from modules.procurement.direct_purchase_ui import render_direct_purchase_ui
+            safe_render(render_direct_purchase_ui, "Direct Purchase")
+        except Exception as _e:
+            st.error(f"Direct Purchase: {_e}")
+    elif _proc_tab == "📋 Purchase Register":
+        try:
+            from modules.backoffice.purchase_register import render_purchase_register
+            safe_render(render_purchase_register, "Purchase Register")
+        except Exception as _e:
+            st.error(f"Purchase Register: {_e}")
+    elif _proc_tab == "📊 Intelligence":
+        if procurement_ok:
+            safe_render(render_purchase_ui, "Procurement Intelligence")
+        else:
+            st.error("Procurement Intelligence unavailable")
 
 elif selected_page == "Product & Inventory":
     from modules.security.roles import require_role
@@ -1365,6 +1870,20 @@ elif selected_page == "Bulk Order":
     if bulk_order_ok: safe_render(render_bulk_order, "Bulk Order")
     else: st.error("Bulk Order unavailable")
 
+elif selected_page == "WhatsApp Queue":
+    from modules.security.roles import require_role
+    require_role(MANAGER, ADMIN, BILLING)
+    log_time("Open WA Queue")
+    if wa_queue_ok: safe_render(render_wa_queue, "WA Queue")
+    else: st.error("WA Queue unavailable")
+
+elif selected_page == "Bulk WhatsApp":
+    from modules.security.roles import require_role
+    require_role(MANAGER, ADMIN, BILLING)
+    log_time("Open Bulk WhatsApp")
+    if wa_bulk_ok: safe_render(render_wa_bulk_sender, "Bulk WhatsApp")
+    else: st.error("Bulk WhatsApp unavailable")
+
 # ── CRM ────────────────────────────────────────────────────────────────────
 
 elif selected_page == "CRM":
@@ -1374,6 +1893,20 @@ elif selected_page == "CRM":
     if crm_ok: safe_render(render_crm_module, "CRM")
     else: st.error("CRM unavailable")
 
+
+elif selected_page == "Retailer Orders":
+    from modules.security.roles import require_role
+    require_role(BILLING, MANAGER, ADMIN)
+    log_time("Open Retailer Orders")
+    if ret_orders_ok: safe_render(render_backoffice_orders, "Retailer Orders")
+    else: st.error("Retailer Orders unavailable — deploy modules/retailer/backoffice_orders.py")
+
+elif selected_page == "Online Orders":
+    from modules.security.roles import require_role
+    require_role(BILLING, MANAGER, ADMIN)
+    log_time("Open Online Orders")
+    if online_admin_ok: safe_render(render_online_store_admin, "Online Orders")
+    else: st.error("Online Orders unavailable — deploy modules/online_store/store_admin.py")
 
 # ── Payment Collection ──────────────────────────────────────────
 
@@ -1388,18 +1921,39 @@ elif selected_page == "Collect Payment":
         st.error(f"Payment Collection error: {_pce}")
         import traceback; st.code(traceback.format_exc())
 
-# ── Billing Dashboard ──────────────────────────────────────────────────────
+# ── Challan & Invoice / Billing Hub ──────────────────────────────────────────
 
 elif selected_page == "Challan & Invoice Dashboard":
     from modules.security.roles import require_role
     require_role(BILLING, MANAGER, ADMIN)
     log_time("Open Billing Dashboard")
-    try:
-        from modules.billing.challan_preview import render_challan_invoice_dashboard
-        safe_render(render_challan_invoice_dashboard, "Billing Dashboard")
-    except Exception as e:
-        st.error(f"❌ Billing Dashboard failed: {e}")
-        st.code(traceback.format_exc())
+    _bill_tab = st.radio(
+        "Billing section",
+        ["🧾 Billing Hub", "📋 Challan & Invoice Dashboard", "🔏 Admin Edit"],
+        horizontal=True, key="bill_hub_tab", label_visibility="collapsed",
+    )
+    if _bill_tab == "🧾 Billing Hub":
+        if billing_hub_ok:
+            safe_render(render_billing_hub, "Billing Hub")
+        else:
+            try:
+                from modules.billing.billing_hub import render_billing_hub as _rbh
+                safe_render(_rbh, "Billing Hub")
+            except Exception as _bhe:
+                st.error(f"Billing Hub: {_bhe}")
+    elif _bill_tab == "🔏 Admin Edit":
+        try:
+            from modules.billing.invoice_edit_admin import render_invoice_edit_admin
+            safe_render(render_invoice_edit_admin, "Admin Edit")
+        except Exception as _iee:
+            st.error(f"Admin Edit: {_iee}")
+    else:
+        try:
+            from modules.billing.challan_preview import render_challan_invoice_dashboard
+            safe_render(render_challan_invoice_dashboard, "Billing Dashboard")
+        except Exception as e:
+            st.error(f"❌ Billing Dashboard failed: {e}")
+            st.code(traceback.format_exc())
 
 # ── Credit & Debit Notes ──────────────────────────────────────────────────
 
@@ -1490,6 +2044,26 @@ elif selected_page == "Registers":
         st.error(f"Registers error: {e}")
         st.code(traceback.format_exc())
 
+elif selected_page == "GST Portal":
+    try:
+        from modules.gst.gst_portal_ui import render_gst_portal
+        render_gst_portal()
+    except Exception as e:
+        import traceback
+        st.error(f"GST Portal error: {e}")
+        st.code(traceback.format_exc())
+
+elif selected_page == "Discount Audit":
+    from modules.security.roles import require_role
+    require_role(BILLING, MANAGER, ADMIN)
+    log_time("Open Discount Audit")
+    try:
+        from modules.pricing.discount_audit import render_discount_audit
+        safe_render(render_discount_audit, "Discount Audit")
+    except Exception as _dae:
+        st.error(f"Discount Audit: {_dae}")
+        st.code(traceback.format_exc())
+
 elif selected_page == "Accounts":
     try:
         from modules.accounting.accounts_ui import render_accounts
@@ -1533,6 +2107,28 @@ elif selected_page == "Inventory Search":
         safe_render(render_inventory_search, "Inventory Search")
     except Exception as e:
         st.error(f"❌ Inventory Search failed: {e}")
+        import traceback; st.code(traceback.format_exc())
+
+elif selected_page == "Inventory Audit":
+    from modules.security.roles import require_role
+    require_role(INVENTORY, MANAGER, ADMIN)
+    log_time("Open Inventory Audit")
+    try:
+        from modules.ui.inventory_audit_manager import render_inventory_audit_manager
+        safe_render(render_inventory_audit_manager, "Inventory Audit")
+    except Exception as e:
+        st.error(f"❌ Inventory Audit failed: {e}")
+        import traceback; st.code(traceback.format_exc())
+
+elif selected_page == "Printer Settings":
+    from modules.security.roles import require_role
+    require_role(INVENTORY, MANAGER, ADMIN, LAB)
+    log_time("Open Printer Settings")
+    try:
+        from modules.printing.printer_settings_ui import render_printer_settings
+        safe_render(render_printer_settings, "Printer Settings")
+    except Exception as e:
+        st.error(f"❌ Printer Settings failed: {e}")
         import traceback; st.code(traceback.format_exc())
 
 elif selected_page == "Frame Loader":
@@ -1616,6 +2212,17 @@ elif selected_page == "Owner Dashboard":
         safe_render(render_owner_dashboard, "Owner Dashboard")
     else:
         st.error("Owner Dashboard unavailable — deploy modules/founder/owner_dashboard.py")
+
+else:
+    # ── Fallback: unknown/blank selected_page ─────────────────────────────
+    # Happens on first load if default page detection failed, or if
+    # session state has a stale page label from an old session.
+    if selected_page and not selected_page.startswith("──"):
+        st.warning(f"Page **{selected_page}** not found. Select a page from the sidebar.")
+    # Auto-redirect to first available real page
+    if _all_pages_flat:
+        st.session_state["_sidebar_page"] = _all_pages_flat[0]
+        st.rerun()
 
 # ==================================================
 # FOOTER

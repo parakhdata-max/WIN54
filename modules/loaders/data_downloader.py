@@ -675,7 +675,7 @@ _KEY_COLS = {
     # get merged into one diff key → wrong row compared → price diff shows UNCHANGED.
     "CLENS":   ["Product", "BatchNo", "SPH", "CYL", "AXIS", "EyeSide"],
     "SOL":     ["Product", "BatchNo"],
-    "BLANK":   ["brand", "Category", "Material", "COLOUR", "Add"],
+    "BLANK":   ["brand", "Category", "Material", "COLOUR", "Add", "Recomended Base"],
 }
 
 

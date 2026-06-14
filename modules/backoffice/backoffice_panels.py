@@ -31,6 +31,99 @@ from .backoffice_logic import (
     refresh_line_state,
 )
 
+# ---------------------------------------------------------------------------
+# Power availability bridge for backoffice edits
+# ---------------------------------------------------------------------------
+try:
+    from modules.batch_manager import check_stock_availability as _bo_check_stock_availability
+except Exception:
+    _bo_check_stock_availability = None
+
+try:
+    from modules.power_intelligence_ui import render_range_check as _bo_render_range_check
+    from modules.power_intelligence import is_colour_product as _bo_is_colour_product
+except Exception:
+    _bo_render_range_check = None
+    def _bo_is_colour_product(_name):
+        return False
+
+
+def _bo_power_availability_check(line: Dict, *, sph, cyl, axis, add_power) -> bool:
+    """Validate edited power against Product + Power Range and stock availability.
+
+    Returns True when save may continue. Out-of-range powers block save;
+    out-of-stock powers only warn because backoffice may still route the line
+    to supplier / RX production.
+    """
+    pid = str(line.get("product_id") or "").strip()
+    pname = str(line.get("product_name") or "")
+    eye = str(line.get("eye_side") or "").upper()[:1] or "R"
+    if not pid:
+        return True
+
+    # 1) Product power range check — this uses the same Product + Power Range
+    # manager logic already visible in retail/wholesale punching.
+    # render_range_check signature: (product_id, product_name, sph, cyl, axis,
+    # is_colour, eye). It does NOT accept add_power — the engine derives ADD
+    # eligibility from the product master separately.
+    in_range = True
+    if _bo_render_range_check is not None:
+        try:
+            in_range = bool(_bo_render_range_check(
+                product_id=pid,
+                product_name=pname,
+                sph=float(sph or 0),
+                cyl=float(cyl or 0),
+                axis=int(axis or 0),
+                is_colour=_bo_is_colour_product(pname),
+                eye={"R": "RIGHT", "L": "LEFT"}.get(eye, eye),
+            ))
+        except Exception:
+            in_range = True
+
+    if not in_range:
+        st.error(
+            "⛔ Edited power is outside the product power range configured "
+            "in Product / Inventory Manager. Save blocked."
+        )
+        return False
+
+    # 2) Stock availability check — warn only. Backoffice correction should not
+    # be blocked just because the item needs supplier/RX procurement.
+    if _bo_check_stock_availability is not None:
+        try:
+            lp = line.get("lens_params") or {}
+            if isinstance(lp, str):
+                import json as _json
+                try:
+                    lp = _json.loads(lp) or {}
+                except Exception:
+                    lp = {}
+            coating = lp.get("coating") or line.get("coating")
+            qty = int(line.get("billing_qty") or line.get("quantity") or 1)
+            av = _bo_check_stock_availability(
+                pid,
+                sph=sph,
+                cyl=cyl,
+                axis=axis,
+                add_power=add_power,
+                eye_side=eye,
+                required_qty=qty,
+                coating=coating if coating else None,
+            ) or {}
+            avail_qty = int(av.get("available_qty") or av.get("qty") or 0)
+            if avail_qty >= qty:
+                st.success(f"✅ Power available in stock: {avail_qty} pcs")
+            else:
+                st.warning(
+                    f"⚠️ Power is valid but stock is short: {avail_qty} available, "
+                    f"{qty} required. Route to supplier/RX/procurement after saving."
+                )
+        except Exception:
+            pass
+
+    return True
+
 
 def render_power_edit_ui(line: Dict, line_idx: int, order: Dict):
     """
@@ -44,34 +137,58 @@ def render_power_edit_ui(line: Dict, line_idx: int, order: Dict):
         except: _lp = {}
     _surf = line.get("surfacing_data") or (_lp.get("surfacing_data") if isinstance(_lp, dict) else None)
     if _surf:
-        # Check stage — show appropriate message
-        _stage_msg = ""
+        # Check job_master stage before locking.
+        # If the job card is CANCELLED (rolled back from production), the lock
+        # must NOT apply — surfacing_data in lens_params is stale and the order
+        # is back in backoffice for re-editing. Clear the stale key and continue.
+        _stage_msg   = ""
+        _job_stage   = None
+        _lid_bp      = (line.get("line_id") or line.get("id") or "").strip()
         try:
             from modules.sql_adapter import run_query as _rqbp
-            _lid_bp = (line.get("line_id") or line.get("id") or "").strip()
             if _lid_bp:
                 _rows_bp = _rqbp(
-                    "SELECT current_stage FROM job_master WHERE order_line_id=%(l)s::uuid LIMIT 1",
+                    "SELECT current_stage FROM job_master "
+                    "WHERE order_line_id=%(l)s::uuid "
+                    "ORDER BY updated_at DESC NULLS LAST LIMIT 1",
                     {"l": _lid_bp}
                 )
                 if _rows_bp:
-                    _stage_msg = f" (Stage: {_rows_bp[0].get('current_stage', '?')})"
+                    _job_stage  = str(_rows_bp[0].get("current_stage") or "")
+                    _stage_msg  = f" (Stage: {_job_stage})"
         except Exception:
             pass
-        st.markdown(
-            f"<div style='background:#1a0a00;border:2px solid #f97316;"
-            f"border-radius:8px;padding:10px 16px;margin:8px 0'>"
-            f"<div style='color:#fb923c;font-weight:700'>🔒 Power editing locked</div>"
-            f"<div style='color:#fed7aa;font-size:0.82rem;margin-top:4px'>"
-            f"A blank has been allocated and job card saved{_stage_msg}.<br>"
-            f"Go to <b>Documents → Job Cards</b> to cancel the job card first.</div>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-        # Clear the editing state so next render shows read-only again
-        import streamlit as _stbp
-        _stbp.session_state.pop("bo_editing_line", None)
-        return
+
+        # CANCELLED job or no job rows at all — clear stale surfacing_data so power edit opens normally
+        if not _job_stage or _job_stage in ("CANCELLED", "VOID", ""):
+            try:
+                import json as _jbp2
+                from modules.sql_adapter import run_write as _rwbp
+                if isinstance(_lp, dict) and _lid_bp:
+                    _lp.pop("surfacing_data", None)
+                    _lp.pop("blank_id", None)
+                    _rwbp(
+                        "UPDATE order_lines SET lens_params=%(lp)s::jsonb "
+                        "WHERE id=%(lid)s::uuid",
+                        {"lp": _jbp2.dumps(_lp), "lid": _lid_bp},
+                    )
+            except Exception:
+                pass
+            # Fall through — do NOT return, allow power edit to render below
+        else:
+            st.markdown(
+                f"<div style='background:#1a0a00;border:2px solid #f97316;"
+                f"border-radius:8px;padding:10px 16px;margin:8px 0'>"
+                f"<div style='color:#fb923c;font-weight:700'>🔒 Power editing locked</div>"
+                f"<div style='color:#fed7aa;font-size:0.82rem;margin-top:4px'>"
+                f"A blank has been allocated and job card saved{_stage_msg}.<br>"
+                f"Go to <b>Documents → Job Cards</b> to cancel the job card first.</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+            import streamlit as _stbp
+            _stbp.session_state.pop("bo_editing_line", None)
+            return
 
     st.markdown(f"#### Edit Power - Line #{line_idx + 1}")
 
@@ -93,8 +210,8 @@ def render_power_edit_ui(line: Dict, line_idx: int, order: Dict):
     original_axis = line.get('axis')
     original_add = line.get('add_power')
 
-    # ── Row 1: SPH + CYL ──────────────────────────────────────────
-    col1, col2 = st.columns(2)
+    # ── Compact RX row: SPH + CYL + AXIS + ADD ────────────────────
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         new_sph = st.number_input(
             "SPH",
@@ -115,8 +232,6 @@ def render_power_edit_ui(line: Dict, line_idx: int, order: Dict):
             st.warning("Invalid CYL value")
             new_cyl = None
 
-    # ── Row 2: AXIS + ADD ─────────────────────────────────────────
-    col3, col4 = st.columns(2)
     with col3:
         raw_axis = st.text_input(
             "AXIS",
@@ -140,127 +255,9 @@ def render_power_edit_ui(line: Dict, line_idx: int, order: Dict):
         except ValueError:
             st.warning("Invalid ADD value")
             new_add = None
-    
-    # =====================================================
-    # Manufacturing Power Control (MOVED UP)
-    # =====================================================
-
-    st.markdown("##### Manufacturing Power Control")
-
-    # Vertex option (only for contact lenses)
-    if is_contact:
-        # Track previous state
-        old_use_effective = line.get("use_effective_power", False)
-        
-        use_effective = st.checkbox(
-            "Use Effective (Vertex) Power",
-            value=old_use_effective,
-            key=f"eff_power_{line_idx}"
-        )
-
-        #  FIX: If effective power toggle changed, recalculate and UPDATE sph_out fields
-        if use_effective != old_use_effective:
-
-            # DO NOT touch session_state for widget key
-            line["use_effective_power"] = use_effective
-            line["effectivity_applied"] = use_effective
-            
-            # Clear manual override to allow recalculation
-            line["manual_power_override"] = False
-            
-            #  CRITICAL: Update the actual sph_out values (not preview)
-            # This makes the values appear in the editable SPH OUT fields
-            update_manufacturing_power(line)
-
-            
-            # Clear any old preview values
-            line.pop("_preview_sph_out", None)
-            line.pop("_preview_cyl_out", None)
-            line.pop("_preview_axis_out", None)
-            
-            st.success(f" Effective power calculated: SPH OUT = {fmt_signed(line['sph_out'])}")
-            st.rerun()
-        else:
-            line["use_effective_power"] = use_effective
-        
-        #  NEW: Show "Calculate Effective Power" button
-        if use_effective:
-            if st.button(" Calculate Effective Power", key=f"calc_eff_{line_idx}", use_container_width=True):
-                # Clear manual override
-                line["manual_power_override"] = False
-                
-                #  CRITICAL: Update the actual sph_out values (not preview)
-                update_manufacturing_power(line)
-
-                
-                st.success(f" Effective power calculated: SPH OUT = {fmt_signed(line['sph_out'])}")
-                st.rerun()
-
-    # =====================================================
-    # Recalculate Option (Only for Contact Lenses)
-    # =====================================================
-    
-    #  Show indicator if effective power was applied
-    if line.get("effectivity_applied"):
-        st.info(" These values are calculated using vertex distance correction (effective power). You can edit them manually if needed.")
-    elif line.get("manual_power_override"):
-        st.success(" **MANUAL OVERRIDE ACTIVE**: These manually entered values will be used for batch allocation and manufacturing.")
-
-    # =====================================================
-    # Manufacturing Power Inputs (FINAL FIX)
-    # =====================================================
-
-    # ── Manufacturing OUT: SPH + CYL row, then AXIS ──────────────────
-    sph_key = power_key(order, line_idx, "sph_out")
-    cyl_key = power_key(order, line_idx, "cyl_out")
-    axis_key = power_key(order, line_idx, "axis_out")
-    col_a, col_b = st.columns(2)
-    col_c, _ = st.columns(2)
-
-    #  ALWAYS sync UI from line BEFORE rendering widgets
-    st.session_state[sph_key] = float(line.get("sph_out") or 0)
-    st.session_state[cyl_key] = float(line.get("cyl_out") or 0)
-
-    axis = line.get("axis_out")
-    st.session_state[axis_key] = int(axis) if axis is not None else 0
-
-    # Render widgets WITHOUT value=
-    with col_a:
-        sph_out = st.number_input(
-            "SPH OUT",
-            step=0.25,
-            format="%.2f",
-            key=sph_key
-        )
-
-    with col_b:
-        cyl_out = st.number_input(
-            "CYL OUT",
-            step=0.25,
-            format="%.2f",
-            key=cyl_key
-        )
-
-    with col_c:
-        axis_out = st.number_input(
-            "AXIS OUT",
-            min_value=0,
-            max_value=180,
-            step=1,
-            key=axis_key
-        )
-
-    # Save old values for comparison
-    old_sph_out = float(line.get("sph_out") or 0)
-    old_cyl_out = float(line.get("cyl_out") or 0)
-    old_axis_out = int(line.get("axis_out") or 0)
-
-    # Detect manual override (but DON'T save values yet - wait for Apply Changes)
-    manual_edit_detected = (
-        sph_out != old_sph_out or
-        cyl_out != old_cyl_out or
-        axis_out != old_axis_out
-    )
+    # Manufacturing power is job-card logic. Backoffice only edits RX here;
+    # sph_out/cyl_out/axis_out are restamped internally during save.
+    manual_edit_detected = False
 
     # Action buttons
     col_save, col_cancel = st.columns(2)
@@ -285,6 +282,29 @@ def render_power_edit_ui(line: Dict, line_idx: int, order: Dict):
                 st.info("No changes detected")
                 return
 
+            # F1: hard range check (SPH ±30, CYL ±10, AXIS 1-180, ADD 0.5-4.0)
+            # before any product-range or stock check.  This mirrors the validator
+            # in retail_punching_rx but applied to the backoffice edit path.
+            if power_changed:
+                from modules.backoffice.backoffice_helpers import validate_backoffice_power
+                _pw_range_errs = validate_backoffice_power(new_sph, new_cyl, new_axis, new_add)
+                for _pw_range_err in _pw_range_errs:
+                    st.error(_pw_range_err)
+                if _pw_range_errs:
+                    return  # block save — user must correct values first
+
+            # Backoffice power edits must be checked against the same Product +
+            # Power Range / Inventory availability feature used while punching.
+            if power_changed:
+                if not _bo_power_availability_check(
+                    line,
+                    sph=new_sph,
+                    cyl=new_cyl,
+                    axis=new_axis,
+                    add_power=new_add,
+                ):
+                    return
+
             # =====================================================
             # 1 Update RX (if changed)
             # =====================================================
@@ -300,43 +320,19 @@ def render_power_edit_ui(line: Dict, line_idx: int, order: Dict):
                 line["manual_power_override"] = False
 
             # =====================================================
-            # 2 Manufacturing Power Update (FINAL STABLE)
+            # 2 Hidden manufacturing-power restamp
             # =====================================================
-            # PRIORITY ORDER:
-            # 1. Manual Override (user edited SPH OUT/CYL OUT/AXIS OUT) - HIGHEST PRIORITY
-            # 2. Contact lens with effective power calculation
-            # 3. Ophthalmic lens (copy from RX)
-
-            use_eff = line.get("use_effective_power", False)
-
-
-            # A) Manual override (user typed in SPH OUT) - TAKES PRECEDENCE OVER EVERYTHING
-            if manual_edit_detected:
-
-                line["sph_out"] = float(sph_out)
-                line["cyl_out"] = float(cyl_out)
-                line["axis_out"] = int(axis_out)
-
-                line["manual_power_override"] = True
-                line["effectivity_applied"] = False
-                
-                #  Manual values will be used for batch allocation
-
-
-            # B) Contact lens  use engine (with/without effectivity)
-            elif is_contact:
-
+            # Backoffice is the final RX correction surface. Manufacturing
+            # powers remain downstream/job-card data, so we do not expose
+            # editable SPH OUT/CYL OUT/AXIS OUT here. Still restamp them so
+            # job cards, allocation and production receive the corrected RX.
+            if is_contact:
                 line["manual_power_override"] = False
                 update_manufacturing_power(line)
-
-
-            # C) Ophthalmic  copy RX
             else:
-
                 line["sph_out"] = float(line["sph"])
                 line["cyl_out"] = float(line["cyl"] or 0)
                 line["axis_out"] = int(line["axis"]) if line["axis"] is not None else None
-
                 line["manual_power_override"] = False
                 line["effectivity_applied"] = False
 
@@ -358,6 +354,214 @@ def render_power_edit_ui(line: Dict, line_idx: int, order: Dict):
             #  FIX 2  Recalculate order totals for BOTH eyes (R + L sync)
             if order:
                 recalculate_order_totals(order)
+
+            # =====================================================
+            # 5 Persist to DB (the missing piece — without this,
+            #   reload pulls old powers back from order_lines)
+            # =====================================================
+
+            _persist_power_change(line, order)
+
+            # F2: write to audit_log so power corrections appear in History tab.
+            # original_sph/cyl/axis/add captured above before in-memory update.
+            try:
+                from modules.backoffice.audit_logger import audit, AuditAction
+                audit(
+                    AuditAction.PRICE_OVERRIDE,
+                    entity="order_lines",
+                    entity_id=str(line.get("line_id") or line.get("id") or ""),
+                    order_id=str(order.get("id") or ""),
+                    payload={
+                        "action":    "power_edit",
+                        "old_value": (
+                            f"SPH {original_sph} CYL {original_cyl} "
+                            f"AXIS {original_axis} ADD {original_add}"
+                        ),
+                        "new_value": (
+                            f"SPH {new_sph} CYL {new_cyl} "
+                            f"AXIS {new_axis} ADD {new_add}"
+                        ),
+                        "order_no":  str(order.get("order_no") or ""),
+                    },
+                )
+            except Exception as _f2_err:
+                import logging as _f2log
+                _f2log.getLogger(__name__).debug(
+                    "Power edit audit write failed (non-fatal): %s", _f2_err
+                )
+
+            # =====================================================
+            # 6 Exit edit mode + rerun so user sees the saved values
+            # =====================================================
+
+            try:
+                st.session_state.pop("bo_editing_line", None)
+            except Exception:
+                pass
+            st.success(" Power saved.")
+            st.rerun()
+
+        with col_cancel:
+            if st.button(
+                " Cancel",
+                use_container_width=True,
+                key=f"cancel_power_{line_idx}"
+            ):
+                try:
+                    st.session_state.pop("bo_editing_line", None)
+                except Exception:
+                    pass
+                st.rerun()
+
+
+def _persist_power_change(line: Dict, order: Dict) -> None:
+    """Write power edit to order_lines and bust loader caches.
+
+    Mirrors the contract used by order_edit_view.py — writes RX (sph/cyl/
+    axis/add) plus manufacturing OUT values into lens_params so reload sees
+    them. Also resets allocation since changing power invalidates the
+    previously chosen blank.
+
+    Soft-fail: any DB error surfaces a Streamlit warning but does not raise.
+    """
+    line_id = str(line.get("line_id") or line.get("id") or "").strip()
+    if not line_id or len(line_id) < 10:
+        st.warning(" Power changed on screen but line has no DB id  skipping persist.")
+        return
+
+    # ── PRICE INTEGRITY PRE-CONDITION (power change) ──────────────────────
+    # The power UPDATE itself does not write unit_price, but if the line is
+    # ALREADY in a unit_price=0 state on screen (from an earlier broken edit
+    # or stale session) the power save will quietly leave that broken row
+    # in place. Run the shared write guard so a sibling line with the same
+    # product mirrors its price into this line FIRST, then proceed.
+    try:
+        from modules.backoffice.backoffice_ui import _guard_line_price_before_write
+        _g_ok, _g_msg, _, _ = _guard_line_price_before_write(
+            line, order, all_lines=None, context="power-change",
+        )
+        if not _g_ok:
+            # Error already shown to user. Do NOT persist power on a line
+            # whose price is invalid — that would compound the corruption.
+            return
+    except Exception as _ge:
+        # Guard import failure must not silently disable the gate. Log
+        # and continue (the power UPDATE itself is unchanged), but make
+        # the failure visible.
+        import logging
+        logging.getLogger(__name__).warning(
+            "[power-change] price guard unavailable, save proceeding: %s", _ge
+        )
+
+    try:
+        import json as _json
+        from modules.sql_adapter import run_write as _rw, run_query as _rq
+
+        # Merge in-memory lens_params over current DB copy
+        _row = _rq(
+            "SELECT COALESCE(lens_params,'{}')::text AS lp "
+            "FROM order_lines WHERE id=%(lid)s::uuid LIMIT 1",
+            {"lid": line_id}
+        ) or []
+        if _row:
+            try:
+                _lp_db = _json.loads(_row[0].get("lp") or "{}") or {}
+            except Exception:
+                _lp_db = {}
+        else:
+            _lp_db = {}
+
+        _lp_mem = line.get("lens_params") or {}
+        if isinstance(_lp_mem, str):
+            try: _lp_mem = _json.loads(_lp_mem) or {}
+            except Exception: _lp_mem = {}
+        _lp_merged = {**_lp_db, **_lp_mem}
+
+        # Stamp manufacturing OUT into lens_params so workflows downstream
+        # (job card surfacing, blank picker) see the corrected powers.
+        _lp_merged["sph_out"]                = line.get("sph_out")
+        _lp_merged["cyl_out"]                = line.get("cyl_out")
+        _lp_merged["axis_out"]               = line.get("axis_out")
+        _lp_merged["manual_power_override"]  = bool(line.get("manual_power_override"))
+        _lp_merged["effectivity_applied"]    = bool(line.get("effectivity_applied"))
+        _lp_merged["use_effective_power"]    = bool(line.get("use_effective_power"))
+        # Power changed  any prior batch allocation/surfacing is stale
+        _lp_merged["batch_allocation"]       = []
+        _lp_merged["batch_status"]           = "PENDING"
+        _lp_merged.pop("surfacing_data", None)
+
+        _sph  = line.get("sph")
+        _cyl  = line.get("cyl")
+        _axis = line.get("axis")
+        _add  = line.get("add_power")
+
+        _rw("""
+            UPDATE order_lines
+            SET sph              = %(sph)s,
+                cyl              = %(cyl)s,
+                axis             = %(axis)s,
+                add_power        = %(add)s,
+                lens_params      = %(lp)s::jsonb,
+                allocated_qty    = 0,
+                batch_status     = 'PENDING',
+                suggested_allocation = NULL
+            WHERE id = %(lid)s::uuid
+        """, {
+            "sph":  float(_sph) if _sph is not None else None,
+            "cyl":  float(_cyl) if _cyl is not None else None,
+            "axis": int(_axis)  if _axis is not None else None,
+            "add":  float(_add) if _add is not None else None,
+            "lp":   _json.dumps(_lp_merged),
+            "lid":  line_id,
+        })
+
+        # ── Bust loader caches so dashboard + reopen show new powers ────
+        _clear_order_loader_caches_for_panels()
+
+        # ── FIX (Order-not-found after power change) ─────────────────────
+        # Same id-type bug as product-change: after the cache clear the next
+        # render falls to load_single_order(order_id), which casts to ::uuid
+        # and returns nothing if order_id is the DISPLAY number, not the UUID.
+        # Stash the real DB UUID of this order so the fallback path in
+        # backoffice_ui.render_order_detail can resolve by UUID. Pure safety
+        # — no existing logic changed.
+        try:
+            _real_db_id = (
+                order.get("id")
+                or order.get("order_id")
+                or order.get("order_uuid")
+            )
+            if _real_db_id:
+                st.session_state["bo_reload_db_id"] = str(_real_db_id)
+        except Exception:
+            pass
+
+    except Exception as _e:
+        import logging, traceback
+        logging.getLogger(__name__).warning(
+            "[power_change] DB write failed: " + str(_e) + "\n" + traceback.format_exc()
+        )
+        st.warning(f" Power changed on screen but DB write failed: {_e}")
+
+
+def _clear_order_loader_caches_for_panels() -> None:
+    """Same cache-clear pattern used everywhere else after order_lines writes."""
+    try:
+        from . import order_loader as _ol
+        for _fn_name in ("load_single_order", "load_orders_from_database", "load_orders_summary"):
+            _fn = getattr(_ol, _fn_name, None)
+            if _fn is not None and hasattr(_fn, "clear"):
+                try:
+                    _fn.clear()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        st.session_state["bo_orders_loaded"] = False
+    except Exception:
+        pass
+
 
 # ============================================================================
 # LENS PARAMETERS & BOXING EDIT UI
@@ -891,6 +1095,10 @@ def render_allocation_window(line: Dict, line_idx: int, order: Dict):
             with guarded_submit(_alloc_key) as _allowed:
                 if not _allowed:
                     st.stop()
+                # F4: capture old allocation BEFORE overwriting so we can
+                # transfer allocated_qty on inventory_stock after the DB write.
+                _old_alloc_f4 = list(line.get("batch_allocation") or [])
+
                 # Do NOT call refresh_line_state — it wipes manual allocation
                 line["batch_allocation"] = temp_alloc.copy()
                 line["allocated_qty"]    = total_alloc
@@ -912,7 +1120,18 @@ def render_allocation_window(line: Dict, line_idx: int, order: Dict):
                 update_line_billing(line, reprice_from_batch=True)
                 recalculate_order_totals(order)
 
-                from .backoffice_helpers import categorize_order_lines
+                from .backoffice_helpers import categorize_order_lines, apply_schemes_to_order_lines, apply_cart_schemes_to_order_lines
+                try:
+                    apply_schemes_to_order_lines(
+                        order,
+                        party_id=str(order.get("party_id") or order.get("customer_id") or "")
+                    )
+                    apply_cart_schemes_to_order_lines(
+                        order,
+                        party_id=str(order.get("party_id") or order.get("customer_id") or "")
+                    )
+                except Exception:
+                    pass
                 categorize_order_lines(order)
 
                 # ── Write allocation to DB immediately ─────────────────────────
@@ -977,6 +1196,82 @@ def render_allocation_window(line: Dict, line_idx: int, order: Dict):
                             + str(_aw_err) + "\n" + _awtb.format_exc()
                         )
                         st.warning(f"⚠️ Allocation saved to screen but DB write failed: {_aw_err}")
+                    else:
+                        # F4: Transfer allocated_qty on inventory_stock for changed batches.
+                        # Release old allocations, claim new ones — by batch_no + product_id.
+                        # Phase-3: use allocated_qty consistently because dispatch
+                        # decrements allocated_qty, while old reserved_qty values
+                        # were never released.
+                        # Batch number + product_id are what the allocation dict carries.
+                        try:
+                            from modules.sql_adapter import run_write as _rw_rsv
+                            _pid_rsv = str(line.get("product_id") or "")
+                            for _oa in _old_alloc_f4:
+                                _obn  = str(_oa.get("batch_no") or "")
+                                _oqty = int(_oa.get("allocated_qty") or 0)
+                                if _obn and _oqty > 0 and _pid_rsv:
+                                    _rw_rsv(
+                                        """
+                                        UPDATE inventory_stock
+                                        SET allocated_qty = GREATEST(
+                                                COALESCE(allocated_qty, 0) - %(qty)s, 0),
+                                            updated_at    = NOW()
+                                        WHERE batch_no   = %(bn)s
+                                          AND product_id = %(pid)s::uuid
+                                        """,
+                                        {"qty": _oqty, "bn": _obn, "pid": _pid_rsv},
+                                    )
+                            for _na in temp_alloc:
+                                _nbn  = str(_na.get("batch_no") or "")
+                                _nqty = int(_na.get("allocated_qty") or 0)
+                                if _nbn and _nqty > 0 and _pid_rsv:
+                                    _rw_rsv(
+                                        """
+                                        UPDATE inventory_stock
+                                        SET allocated_qty = COALESCE(allocated_qty, 0) + %(qty)s,
+                                            updated_at    = NOW()
+                                        WHERE batch_no   = %(bn)s
+                                          AND product_id = %(pid)s::uuid
+                                        """,
+                                        {"qty": _nqty, "bn": _nbn, "pid": _pid_rsv},
+                                    )
+                        except Exception as _rsv_err:
+                            import logging as _rsvlog
+                            _rsvlog.getLogger(__name__).warning(
+                                "[alloc_window] allocated_qty update failed (non-fatal): %s",
+                                _rsv_err,
+                            )
+                            st.warning(
+                                "⚠️ Batch allocated_qty update failed — stock counts may drift. "
+                                "Run stock reconciliation from System Health."
+                            )
+
+                        # F4 audit: log batch change so it appears in History tab
+                        try:
+                            from modules.backoffice.audit_logger import audit, AuditAction
+                            _old_bns = ", ".join(
+                                str(a.get("batch_no") or "") for a in _old_alloc_f4
+                            ) or "none"
+                            _new_bns = ", ".join(
+                                str(a.get("batch_no") or "") for a in temp_alloc
+                            ) or "none"
+                            audit(
+                                AuditAction.PRICE_OVERRIDE,
+                                entity="order_lines",
+                                entity_id=_line_id_aw,
+                                order_id=str(order.get("id") or ""),
+                                payload={
+                                    "action":    "batch_change",
+                                    "old_value": _old_bns,
+                                    "new_value": _new_bns,
+                                    "order_no":  str(order.get("order_no") or ""),
+                                },
+                            )
+                        except Exception as _f4a_err:
+                            import logging as _f4alog
+                            _f4alog.getLogger(__name__).debug(
+                                "Batch change audit write failed (non-fatal): %s", _f4a_err
+                            )
 
                 # ── Sync bo_assignments so Confirm All sees the new allocation ──
                 # Without this, assignment panel still has empty batch_allocation
@@ -1006,4 +1301,3 @@ def render_allocation_window(line: Dict, line_idx: int, order: Dict):
 # ============================================================================
 # SUPPLIER ORDER INTEGRATION - ENHANCED WITH DIAGNOSTICS
 # ============================================================================
-

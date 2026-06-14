@@ -141,6 +141,26 @@ DB_SCHEMA: Dict[str, List[Col]] = {
         # ^ auto-added by schema_sync on startup
         Col("Modulus Mpa", "modulus_mpa", "numeric", description="Auto-synced from DB", download=True),
         # ^ auto-added by schema_sync on startup
+        Col("Online Price", "online_price", "numeric", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Online Active", "online_active", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Online Sort", "online_sort", "integer", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Online Tags", "online_tags", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Online Desc", "online_desc", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Online Badge", "online_badge", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Normal Procurement Discount Pct", "normal_procurement_discount_pct", "numeric", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Scheme Procurement Discount Pct", "scheme_procurement_discount_pct", "numeric", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Discount Percent", "discount_percent", "numeric", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Is Gst Exempt", "is_gst_exempt", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
         # System cols — not writable via import
         Col("",  "id",            "uuid",      writable=False, download=False),
         Col("",  "product_code",  "text",      writable=False, download=False, notes="Auto-generated UUID"),
@@ -279,6 +299,18 @@ DB_SCHEMA: Dict[str, List[Col]] = {
         # ^ auto-added by schema_sync on startup
         Col("Price Tier", "price_tier", "text", description="Auto-synced from DB", download=True),
         # ^ auto-added by schema_sync on startup
+        Col("Portal Password", "portal_password", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Doc Preference", "doc_preference", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Requires Payment Before Invoice", "requires_payment_before_invoice", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Preferred Courier Provider Id", "preferred_courier_provider_id", "uuid", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Preferred Courier Name", "preferred_courier_name", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Whatsapp", "whatsapp", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
         # System — not writable via import
         Col("", "id",         "uuid",      writable=False, download=False),
         Col("", "status",     "boolean",   writable=False, download=False,
@@ -303,6 +335,40 @@ DB_SCHEMA: Dict[str, List[Col]] = {
         # Additional patient fields
         Col("Barcode",         "barcode",       "text",    description="Patient card barcode",    example="PAT-001"),
         Col("Visit Name",      "visit_name",    "text",    description="Visit label/tag",         example="Annual Check"),
+        Col("Is Deleted", "is_deleted", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Dob", "dob", "date", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Anniversary Date", "anniversary_date", "date", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Occupation", "occupation", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Merge Primary Id", "merge_primary_id", "uuid", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Diabetes", "diabetes", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Hypertension", "hypertension", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Thyroid", "thyroid", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Cardiac History", "cardiac_history", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Asthma", "asthma", "boolean", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Drug Allergy", "drug_allergy", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Current Medication", "current_medication", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Surgery History", "surgery_history", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Family History", "family_history", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Systemic Notes", "systemic_notes", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Ref Mobile", "ref_mobile", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Relation", "relation", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
         # System (download only, not writable)
         Col("", "id",              "uuid",      writable=False, download=False),
         Col("", "patient_id",      "uuid",      writable=False, download=False),
@@ -366,6 +432,14 @@ DB_SCHEMA: Dict[str, List[Col]] = {
         # ^ auto-added by schema_sync on startup
         Col("Lens Side", "lens_side", "text", description="Auto-synced from DB", download=True),
         # ^ auto-added by schema_sync on startup
+        Col("Allocated Qty", "allocated_qty", "numeric", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Reserved Qty", "reserved_qty", "numeric", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Batch Id", "batch_id", "uuid", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
+        Col("Bin No", "bin_no", "text", description="Auto-synced from DB", download=True),
+        # ^ auto-added by schema_sync on startup
         # System
         Col("", "id",          "uuid",      writable=False, download=False),
         Col("", "product_id",  "uuid",      writable=False, download=False, notes="Resolved from product_name by loader"),
@@ -425,7 +499,7 @@ DB_SCHEMA: Dict[str, List[Col]] = {
     "OPH_SPEC": [
         Col("Brand",        "brand",         "text",    required=True,  download=True,
             description="Essilor / Hoya / Shamir / Zeiss", example="Essilor"),
-        Col("Product",      "product",       "text",    required=True,  download=True,
+        Col("Product",      "product_name",  "text",    required=True,  download=True,
             description="Base product name (must exist in products table)",
             example="Varilux X Series"),
         Col("LensCategory", "lens_category", "text",    required=False, download=True,
@@ -557,7 +631,7 @@ DB_SCHEMA: Dict[str, List[Col]] = {
             description="Supplier's own name for this product on their invoice (used for OCR bill matching). "
                         "E.g. 'CR KT WT 1.50' or 'V2 PG GREY 2.00'. Stored as alias for auto-purchase matching.",
             example="CR KT WT ADD 2.00"),
-        Col("Recomended Base",  "base_recommended", "numeric", description="Recommended base curve", example="6.0"),
+        Col("Recomended Base",  "base_recommended", "numeric", required=True, description="Recommended base curve; part of blank inventory identity", example="6.0"),
         Col("Base 1 P",         "base_1",           "numeric", description="Base curve option 1",   example="4.0"),
         Col("Base 2 P",         "base_2",           "numeric", description="Base curve option 2",   example="6.0"),
         Col("Base 3P",          "base_3",           "numeric", description="Base curve option 3",   example="8.0"),

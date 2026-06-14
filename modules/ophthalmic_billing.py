@@ -52,6 +52,16 @@ def _write(prefix: str, field: str, value) -> None:
     st.session_state[_k(prefix, field)] = value
 
 
+def _has_rx_power(rx: dict) -> bool:
+    if not rx:
+        return False
+    for key in ("sph", "cyl", "add", "add_power"):
+        val = rx.get(key)
+        if val not in (None, "", 0, 0.0, "0", "0.0", "0.00"):
+            return True
+    return False
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # AVAILABILITY GRID — expandable matrix of all index × coating combinations
 # ══════════════════════════════════════════════════════════════════════════════
@@ -72,6 +82,9 @@ def render_availability_grid(
     """
     if not product_id:
         return
+
+    has_rx_r = _has_rx_power(rx_r)
+    has_rx_l = _has_rx_power(rx_l) or (not rx_l and has_rx_r)
 
     sph_r  = float((rx_r or {}).get("sph") or 0)
     cyl_r  = float((rx_r or {}).get("cyl") or 0)
@@ -136,9 +149,15 @@ def render_availability_grid(
             cst   = float(spec.get("purchase_rate") or 0)
 
             # Stock check only when toggle is on
-            if _show_stock:
+            if _show_stock and has_rx_r:
                 stk_r = check_stock(product_id, sph_r, cyl_r, axis_r, add_r, idx, coat, "R")
+            else:
+                stk_r = {"status": "RX_ORDER", "qty_r": 0, "qty_l": 0, "batch_no": "", "message": ""}
+            if _show_stock and has_rx_l:
                 stk_l = check_stock(product_id, sph_l, cyl_l, axis_l, add_l, idx, coat, "L")
+            else:
+                stk_l = {"status": "RX_ORDER", "qty_r": 0, "qty_l": 0, "batch_no": "", "message": ""}
+            if _show_stock:
                 r_icon = f"🟢 {stk_r['qty_r']}" if stk_r["status"] == "STOCK" else "📋"
                 l_icon = f"🟢 {stk_l['qty_l']}" if stk_l["status"] == "STOCK" else "📋"
                 in_stock = stk_r["status"] == "STOCK" or stk_l["status"] == "STOCK"
@@ -210,6 +229,7 @@ def render_ophthalmic_selector(
     """
     if not product_id:
         return {"complete": False}
+    order_type = "WHOLESALE" if str(order_type or "").upper() == "WHOLESALE" else "RETAIL"
 
     st.markdown("---")
     st.markdown("#### 🔬 Lens Specification")
@@ -232,24 +252,21 @@ def render_ophthalmic_selector(
             return {"complete": False}
         idx_list = ["Select..."] + idx_opts
         idx_default = idx_list.index(pre_idx) if pre_idx in idx_list else 0
-        sel_idx = st.selectbox(
-            "🔢 Index",
-            idx_list,
-            index=idx_default,
-            key=_k(key_prefix, "index"),
-        )
+        _idx_key = _k(key_prefix, "index")
+        _idx_kwargs = {"key": _idx_key}
+        if _idx_key not in st.session_state:
+            _idx_kwargs["index"] = idx_default
+        sel_idx = st.selectbox("🔢 Index", idx_list, **_idx_kwargs)
 
     with col2:
         coat_opts = get_coating_options(product_id, sel_idx) if sel_idx != "Select..." else []
         coat_list = ["Select..."] + coat_opts
         coat_default = coat_list.index(pre_coat) if pre_coat in coat_list else 0
-        sel_coat = st.selectbox(
-            "🛡️ Coating",
-            coat_list,
-            index=coat_default,
-            key=_k(key_prefix, "coating"),
-            disabled=not coat_opts,
-        )
+        _coat_key = _k(key_prefix, "coating")
+        _coat_kwargs = {"key": _coat_key, "disabled": not coat_opts}
+        if _coat_key not in st.session_state:
+            _coat_kwargs["index"] = coat_default
+        sel_coat = st.selectbox("🛡️ Coating", coat_list, **_coat_kwargs)
 
     with col3:
         treat_opts = (
@@ -257,17 +274,15 @@ def render_ophthalmic_selector(
             if sel_idx != "Select..." and sel_coat != "Select..." else ["Clear"]
         )
         treat_default = treat_opts.index(pre_treat) if pre_treat in treat_opts else 0
+        _treat_key = _k(key_prefix, "treatment")
         if len(treat_opts) > 1:
-            sel_treat = st.selectbox(
-                "🌿 Add-on (Photochromic/Tinted)",
-                treat_opts,
-                index=treat_default,
-                key=_k(key_prefix, "treatment"),
-            )
+            _treat_kwargs = {"key": _treat_key}
+            if _treat_key not in st.session_state:
+                _treat_kwargs["index"] = treat_default
+            sel_treat = st.selectbox("🌿 Add-on (Photochromic/Tinted)", treat_opts, **_treat_kwargs)
         else:
             sel_treat = treat_opts[0]
-            st.selectbox("✨ Treatment", [sel_treat],
-                         key=_k(key_prefix, "treatment"), disabled=True)
+            st.selectbox("✨ Treatment", [sel_treat], key=_treat_key, disabled=True)
 
     # ── Availability grid (always shown, collapsed by default) ───────────────
     render_availability_grid(
@@ -286,6 +301,9 @@ def render_ophthalmic_selector(
     price = get_spec_price(product_id, sel_idx, sel_coat, sel_treat, order_type)
 
     # ── Stock for R and L ─────────────────────────────────────────────────────
+    has_rx_r = _has_rx_power(rx_r)
+    has_rx_l = _has_rx_power(rx_l) or (not rx_l and has_rx_r)
+
     sph_r  = float((rx_r or {}).get("sph") or 0)
     cyl_r  = float((rx_r or {}).get("cyl") or 0)
     axis_r = int((rx_r or {}).get("axis") or 0)
@@ -295,8 +313,16 @@ def render_ophthalmic_selector(
     axis_l = int((rx_l or {}).get("axis") or axis_r)
     add_l  = float((rx_l or {}).get("add") or add_r)
 
-    stk_r = check_stock(product_id, sph_r, cyl_r, axis_r, add_r, sel_idx, sel_coat, "R")
-    stk_l = check_stock(product_id, sph_l, cyl_l, axis_l, add_l, sel_idx, sel_coat, "L")
+    stk_r = (
+        check_stock(product_id, sph_r, cyl_r, axis_r, add_r, sel_idx, sel_coat, "R")
+        if has_rx_r else
+        {"status": "RX_ORDER", "qty_r": 0, "qty_l": 0, "batch_no": "", "message": "Enter power"}
+    )
+    stk_l = (
+        check_stock(product_id, sph_l, cyl_l, axis_l, add_l, sel_idx, sel_coat, "L")
+        if has_rx_l else
+        {"status": "RX_ORDER", "qty_r": 0, "qty_l": 0, "batch_no": "", "message": "Enter power"}
+    )
 
     # ── Price + Stock dashboard ───────────────────────────────────────────────
     st.markdown("---")

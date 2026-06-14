@@ -304,6 +304,11 @@ def update_line_billing(line: Dict, reprice_from_batch: bool = False) -> Dict:
 
     # Qty safety guard
     billing_qty = int(line.get('billing_qty', 0))
+    allocated_qty_now = int(line.get("allocated_qty") or 0)
+    if allocated_qty_now > billing_qty:
+        billing_qty = allocated_qty_now
+        line["billing_qty"] = billing_qty
+        line["quantity"] = billing_qty
     if billing_qty <= 0:
         line["unit_price"] = 0
         line["billing_total"] = 0
@@ -317,8 +322,10 @@ def update_line_billing(line: Dict, reprice_from_batch: bool = False) -> Dict:
             _ot_v  = str(line.get("order_type") or "RETAIL").upper()
             _gst_v = float(line.get("gst_percent") or 0)
             _gst_r = compute_line_gst(existing_up, billing_qty, _gst_v, _ot_v)
-            line['billing_total'] = _gst_r["grand_total"]
-            line['total_price']   = _gst_r["grand_total"]
+            _line_total = _gst_r["grand_total"] if _gst_r.get("inclusive") else _gst_r["subtotal"]
+            line['billing_total'] = _line_total
+            line['total_price']   = _line_total
+            line['gst_amount']    = _gst_r["gst_amount"]
         elif not line.get("pricing_applied_at"):
             line['unit_price']    = 0
             line['billing_total'] = 0
@@ -336,6 +343,11 @@ def update_line_billing(line: Dict, reprice_from_batch: bool = False) -> Dict:
     try:
         #  CRITICAL FIX: Ensure batch allocations have product metadata
         line = update_batch_allocation(line, line['batch_allocation'])
+        allocated_qty = int(line.get('allocated_qty') or 0)
+        if allocated_qty > billing_qty:
+            billing_qty = allocated_qty
+            line["billing_qty"] = billing_qty
+            line["quantity"] = billing_qty
 
         # Clear old pricing to allow re-pricing
         line.pop('pricing_applied_at', None)
@@ -350,12 +362,53 @@ def update_line_billing(line: Dict, reprice_from_batch: bool = False) -> Dict:
         # ─────────────────────────────────────────────────────────────────
         existing_unit_price = float(line.get('unit_price') or 0)
 
+        # Wholesale prices live in inventory_stock.selling_price. Older
+        # wholesale rows could carry retail/MRP per-piece values, and a plain
+        # quantity change would otherwise preserve that wrong unit_price. Refresh
+        # from the preferred stock/price row unless this line is explicitly a
+        # manual override.
+        try:
+            _ot_existing = str(line.get("order_type") or "RETAIL").upper()
+            _src_existing = str(line.get("price_source") or "").lower()
+            _lp_existing = line.get("lens_params") or {}
+            if isinstance(_lp_existing, str):
+                import json as _json_lp
+                try:
+                    _lp_existing = _json_lp.loads(_lp_existing)
+                except Exception:
+                    _lp_existing = {}
+            _manual_price = (
+                "manual" in _src_existing
+                or bool(line.get("manual_price_override"))
+                or bool((_lp_existing or {}).get("manual_price_override"))
+                or bool((_lp_existing or {}).get("price_locked"))
+            )
+            if _ot_existing == "WHOLESALE" and not _manual_price:
+                from modules.core.price_source_resolver import resolve_db_price
+                _pid_ws = str(line.get("product_id") or "")
+                if _pid_ws:
+                    _resolved_ws = resolve_db_price(
+                        _pid_ws,
+                        "WHOLESALE",
+                        product=line,
+                        prefer_batch=True,
+                    )
+                    _pcs_ws = float(_resolved_ws.get("pcs_price") or 0)
+                    if _pcs_ws > 0 and (existing_unit_price <= 0 or abs(existing_unit_price - _pcs_ws) > 0.5):
+                        existing_unit_price = _pcs_ws
+                        line["unit_price"] = _pcs_ws
+                        line["price_source"] = str(_resolved_ws.get("source") or "inventory_selling_price")
+        except Exception:
+            pass
+
         if existing_unit_price > 0 and not reprice_from_batch:
             _ot_fast  = str(line.get("order_type") or "RETAIL").upper()
             _gst_fast = float(line.get("gst_percent") or 0)
             _gst_r    = compute_line_gst(existing_unit_price, billing_qty, _gst_fast, _ot_fast)
-            line['billing_total'] = _gst_r["grand_total"]
-            line['total_price']   = _gst_r["grand_total"]
+            _line_total = _gst_r["grand_total"] if _gst_r.get("inclusive") else _gst_r["subtotal"]
+            line['billing_total'] = _line_total
+            line['total_price']   = _line_total
+            line['gst_amount']    = _gst_r["gst_amount"]
             line.setdefault('price_source', 'retail_punching')
             return line
 
@@ -443,8 +496,10 @@ def update_line_billing(line: Dict, reprice_from_batch: bool = False) -> Dict:
             _gst_fin = float(line.get("gst_percent") or 0)
             _gst_r   = compute_line_gst(final_unit_price, final_qty, _gst_fin, _ot_fin)
             line['unit_price']    = final_unit_price
-            line['billing_total'] = _gst_r["grand_total"]
-            line['total_price']   = _gst_r["grand_total"]  # keep in sync
+            _line_total = _gst_r["grand_total"] if _gst_r.get("inclusive") else _gst_r["subtotal"]
+            line['billing_total'] = _line_total
+            line['total_price']   = _line_total  # keep in sync
+            line['gst_amount']    = _gst_r["gst_amount"]
         
     except Exception as e:
         import traceback

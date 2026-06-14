@@ -76,7 +76,7 @@ def render_import_health():
                 SELECT COUNT(*) AS cnt
                 FROM loader_import_log
                 WHERE imported_at >= NOW() - INTERVAL '24 hours'
-                  AND mode != 'DRY'
+                  AND COALESCE(import_mode, '') != 'DRY'
                 """
             )
             today_count = recent[0]["cnt"] if recent else 0
@@ -112,17 +112,17 @@ def render_import_health():
         history = run_query(
             """
             SELECT
-                import_id,
+                id AS import_id,
                 file_type,
-                mode,
+                import_mode AS mode,
                 stock_mode,
                 status,
                 rows_total,
                 rows_ok,
-                rows_skipped,
+                skipped_rows AS rows_skipped,
                 error_count,
                 ROUND(duration_s::numeric, 2)   AS duration_s,
-                "user",
+                user_name AS "user",
                 imported_at
             FROM loader_import_log
             ORDER BY imported_at DESC
@@ -175,7 +175,7 @@ def render_import_health():
                 SUM(CASE WHEN status = 'PARTIAL' THEN 1 ELSE 0 END) AS partial_count,
                 MAX(imported_at)                AS last_import
             FROM loader_import_log
-            WHERE mode != 'DRY'
+            WHERE COALESCE(import_mode, '') != 'DRY'
             GROUP BY file_type
             ORDER BY total_imports DESC
             """

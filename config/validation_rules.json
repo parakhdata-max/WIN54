@@ -20,12 +20,11 @@
   },
   "tax": {
     "strict_gst_required": true,
+    "block_zero_gst_unless_exempt": true,
     "valid_gst_slabs": [
       0,
       5,
-      12,
-      18,
-      28
+      18
     ]
   }
 }

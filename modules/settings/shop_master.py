@@ -26,9 +26,11 @@ _FIELDS = [
     ("bank_account",        "Account Number",          "00000000000",             "Bank"),
     ("bank_ifsc",           "IFSC Code",               "SBIN0000000",             "Bank"),
     ("bank_branch",         "Branch",                  "Nagpur Main",             "Bank"),
-    ("shop_upi_id",         "UPI ID",                  "dvoptical@upi",           "Bank"),
+    ("shop_upi_id",         "UPI ID",                  "Q29827914@ybl",           "Bank"),
     ("upi_qr_image",        "UPI QR Code Image",       "",                        "Bank"),
-    ("print_footer",        "Print Footer Line",       "Thank you for visiting DV Optical", "Prints"),
+    ("print_footer",        "Print Footer Line",       "", "Prints"),
+    ("frame_barcode_print_name", "Frame Barcode Print Name", "Parakh",            "Prints"),
+    ("document_print_mode", "Document Print Mode",     "DIRECT_THEN_HTML",        "Prints"),
     ("consult_fee_default", "Default Consult Fee",     "200",                     "Prints"),
     ("invoice_prefix",      "Invoice Prefix",          "INV",                     "Prints"),
     ("challan_prefix",      "Challan Prefix",          "CHL",                     "Prints"),
@@ -39,7 +41,19 @@ _FIELDS = [
     ("unit_wholesale_tagline","Wholesale Tagline",     "Wholesale Division",       "Business Units"),
     ("unit_online_name",    "Online Brand Name",       "Ultrasight",              "Business Units"),
     ("unit_online_tagline", "Online Tagline",          "Shop Online",             "Business Units"),
+    # Consultation — stored as JSON, not rendered by the generic _FIELDS loop
+    # (rendered separately in render_shop_master via render_consultation_settings)
+    ("consultation_types",  "",                        "",                        "_internal"),
 ]
+
+ORDER_PIPELINE_STATUSES = [
+    "PENDING", "PROVISIONAL", "UNDER_REVIEW", "CONFIRMED", "IN_PRODUCTION",
+    "READY", "READY_FOR_BILLING", "PARTIALLY_BILLED", "BILLED", "DISPATCHED",
+    "DELIVERED", "CLOSED", "CANCELLED",
+]
+
+DEFAULT_EDIT_STATUSES = ["PENDING", "PROVISIONAL", "UNDER_REVIEW"]
+DEFAULT_CANCEL_STATUSES = ["PENDING", "PROVISIONAL", "UNDER_REVIEW", "HOLD", "CREDIT_HOLD", "PENDING_PAYMENT"]
 
 
 import streamlit as st
@@ -67,17 +81,72 @@ def _invalidate_shop_cache():
 
 
 def _set(key, value):
+    conn = None
+    cursor = None
     try:
-        from modules.sql_adapter import run_write
-        run_write("""
+        from modules.sql_adapter import get_transaction_connection
+        conn = get_transaction_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
             INSERT INTO system_flags (key, value)
             VALUES (%s, %s)
             ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
-        """, (key, value))
+        """, (str(key), "" if value is None else str(value)))
+        conn.commit()
         return True
     except Exception as ex:
+        if conn:
+            conn.rollback()
         st.error(f"Save failed ({key}): {ex}")
         return False
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def _csv_to_list(value: str) -> list[str]:
+    return [
+        x.strip()
+        for x in str(value or "").replace(";", ",").split(",")
+        if x and x.strip()
+    ]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_product_brands() -> list[str]:
+    """Distinct product brands for production-routing setup."""
+    try:
+        from modules.sql_adapter import run_query
+        rows = run_query("""
+            SELECT DISTINCT TRIM(brand) AS brand
+            FROM products
+            WHERE COALESCE(is_active, TRUE) = TRUE
+              AND COALESCE(TRIM(brand), '') <> ''
+            ORDER BY TRIM(brand)
+        """, {}) or []
+        return [str(r.get("brand") or "").strip() for r in rows if r.get("brand")]
+    except Exception:
+        return []
+
+
+def get_inhouse_lab_brands() -> set[str]:
+    """Brands that default to in-house production routing."""
+    return {b.lower() for b in _csv_to_list(_get("inhouse_lab_brands", ""))}
+
+
+def get_order_action_statuses(action: str) -> set[str]:
+    """Admin-configured status gates for edit/cancel controls."""
+    action = str(action or "").lower().strip()
+    if action == "cancel":
+        raw = _get("order_cancel_allowed_statuses", ",".join(DEFAULT_CANCEL_STATUSES))
+        fallback = DEFAULT_CANCEL_STATUSES
+    else:
+        raw = _get("order_edit_allowed_statuses", ",".join(DEFAULT_EDIT_STATUSES))
+        fallback = DEFAULT_EDIT_STATUSES
+    values = _csv_to_list(raw) or list(fallback)
+    return {v.upper() for v in values}
 
 
 def get_shop_info() -> dict:
@@ -119,15 +188,17 @@ def render_shop_master():
         "</div>", unsafe_allow_html=True
     )
 
-    # Group by section
+    # Group by section — skip _internal (rendered separately below)
     sections = {}
     for f in _FIELDS:
-        sections.setdefault(f[3], []).append(f)
+        if f[3] != "_internal":
+            sections.setdefault(f[3], []).append(f)
 
     # Load current values
     current = {f[0]: _get(f[0], "") for f in _FIELDS}
 
     edited = {}
+    _refresh = int(st.session_state.get("shop_master_refresh", 0))
     for sec, fields in sections.items():
         st.markdown(f"**{sec}**")
         rows = [fields[i:i+2] for i in range(0, len(fields), 2)]
@@ -138,7 +209,7 @@ def render_shop_master():
                     label,
                     value=current.get(key, ""),
                     placeholder=placeholder,
-                    key=f"sm_{key}"
+                    key=f"sm_{key}_{_refresh}"
                 )
         st.markdown("---")
 
@@ -164,7 +235,7 @@ def render_shop_master():
         _uploaded_qr = st.file_uploader(
             "Upload UPI QR code image (PNG/JPG)",
             type=["png","jpg","jpeg"],
-            key="sm_upi_qr_upload",
+        key="sm_upi_qr_upload",
             help="Scan-to-pay QR shown on receipts and post-save panel"
         )
         if _uploaded_qr:
@@ -177,6 +248,60 @@ def render_shop_master():
                    "Shown in post-save panel after order confirmation.")
     st.markdown("---")
 
+    # ── Production Routing ─────────────────────────────────────────────────
+    st.markdown("**Production Routing**")
+    _brand_options = _load_product_brands()
+    _current_inhouse = _csv_to_list(_get("inhouse_lab_brands", ""))
+    _current_known = [b for b in _current_inhouse if b in _brand_options]
+    _custom_current = [b for b in _current_inhouse if b not in _brand_options]
+    edited["inhouse_lab_brands"] = ",".join(st.multiselect(
+        "In-house lab brand(s)",
+        options=_brand_options,
+        default=_current_known,
+        key=f"sm_inhouse_lab_brands_{_refresh}",
+        help="Ophthalmic products from these brands default to In-house Lab. Staff can switch them only to External Lab.",
+    ) + _custom_current)
+    if _custom_current:
+        st.caption("Existing saved brand(s) not found in active product list: " + ", ".join(_custom_current))
+    st.caption("Stock allocation still takes priority. RX orders from all other brands go to Supplier assignment.")
+    st.markdown("---")
+
+    # ── Order Edit / Cancellation Governance ────────────────────────────────
+    st.markdown("**Order Edit / Cancellation Governance**")
+    _cur_edit_statuses = [
+        s for s in _csv_to_list(_get("order_edit_allowed_statuses", ",".join(DEFAULT_EDIT_STATUSES)))
+        if s in ORDER_PIPELINE_STATUSES
+    ]
+    _cur_cancel_statuses = [
+        s for s in _csv_to_list(_get("order_cancel_allowed_statuses", ",".join(DEFAULT_CANCEL_STATUSES)))
+        if s in ORDER_PIPELINE_STATUSES
+    ]
+    gc1, gc2 = st.columns(2)
+    with gc1:
+        edited["order_edit_allowed_statuses"] = ",".join(st.multiselect(
+            "Allow punching/edit at statuses",
+            ORDER_PIPELINE_STATUSES,
+            default=_cur_edit_statuses or DEFAULT_EDIT_STATUSES,
+            key=f"sm_order_edit_statuses_{_refresh}",
+        ))
+    with gc2:
+        edited["order_cancel_allowed_statuses"] = ",".join(st.multiselect(
+            "Allow order cancel at statuses",
+            ORDER_PIPELINE_STATUSES,
+            default=_cur_cancel_statuses or DEFAULT_CANCEL_STATUSES,
+            key=f"sm_order_cancel_statuses_{_refresh}",
+        ))
+    st.caption("Default: edit/cancel allowed only before Backoffice confirmation.")
+    st.markdown("---")
+
+    # ── Consultation Types ─────────────────────────────────────────────────
+    try:
+        from modules.settings.consultation_settings import render_consultation_settings
+        render_consultation_settings()
+    except Exception as _cse:
+        st.warning(f"Consultation settings panel unavailable: {_cse}")
+    st.markdown("---")
+
     # Preview
     with st.expander("👁️ Preview print header", expanded=True):
         _preview_header(edited)
@@ -186,17 +311,12 @@ def render_shop_master():
     with c1:
         if st.button("💾 Save", type="primary", use_container_width=True):
             saved = 0
-            skipped = 0
             for k, v in edited.items():
-                if v and str(v).strip():          # only save non-empty values
-                    if _set(k, str(v).strip()):
-                        saved += 1
-                else:
-                    skipped += 1                  # silently skip empty fields
+                if _set(k, str(v or "").strip()):
+                    saved += 1
             _invalidate_shop_cache()
+            st.session_state.shop_master_refresh = _refresh + 1
             st.success(f"✅ Saved {saved} settings — will reflect in all prints")
-            if skipped:
-                st.caption(f"{skipped} empty fields skipped")
             st.rerun()
 
 

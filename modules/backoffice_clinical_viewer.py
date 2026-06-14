@@ -6,9 +6,12 @@
 
 import streamlit as st
 import pandas as pd
+import logging
 from datetime import datetime, timedelta
 from modules.sql_adapter import run_query, execute_query
 from modules.clinical_print import generate_clinical_pdf
+
+logger = logging.getLogger(__name__)
 
 
 # ==========================================================
@@ -150,19 +153,6 @@ def render_dashboard():
                                     st.error(f"Convert error: {_r['error']}")
                             else:
                                 _rxd = _r.get("rx",{})
-                                _fee = float(_r.get("consult_fee",0) or 0)
-                                _lines_dash = []
-                                if _fee > 0 and _r.get("prod_id"):
-                                    _lines_dash = [{
-                                        "line_id": str(uuid.uuid4()), "provisional_order_id": None,
-                                        "product_id": _r["prod_id"], "product_name": _r.get("prod_name","Consultation Fee"),
-                                        "brand":"Service","main_group":"Services","batch_no":"",
-                                        "eye_side":"SERVICE","sph":None,"cyl":None,"axis":None,"add_power":None,
-                                        "lens_params":{},"boxing_params":{},"requested_qty":1,"billing_qty":1,
-                                        "order_qty":0,"display_qty":"1 SERVICE","batch_allocation":[],
-                                        "unit_price":_fee,"total_price":_fee,"gst_percent":0.0,"gst_amount":0.0,
-                                        "status":"Complete","created_at":_dt.datetime.now().isoformat(),
-                                    }]
                                 # ✅ FIX: Use _consult_prefill (not retail_* directly) so
                                 # handle_page_switch doesn't wipe the data before it lands.
                                 st.session_state["_consult_prefill"] = {
@@ -172,7 +162,8 @@ def render_dashboard():
                                     "consult_order_id": _aid,   # ← UUID for re-billing check
                                     "rx_r": {"sph":_rxd.get("sph_r",0),"cyl":_rxd.get("cyl_r",0),"axis":_rxd.get("ax_r",0),"add":_rxd.get("add_r",0)},
                                     "rx_l": {"sph":_rxd.get("sph_l",0),"cyl":_rxd.get("cyl_l",0),"axis":_rxd.get("ax_l",0),"add":_rxd.get("add_l",0)},
-                                    "order_lines": _lines_dash,
+                                    "order_lines": [],
+                                    "include_consult_fee": False,
                                 }
                                 st.session_state["_sidebar_page"] = "🛍️  Retail Order"
                                 st.toast(f"Opening Retail Order for {_r['patient_name']}...")
@@ -314,11 +305,15 @@ def _render_record_detail(record):
         if not v or str(v).strip() in ("","None","nan","0.0","0","NaN"): return "\u2014"
         try:
             f=float(v); return f"+{f:.2f}" if f>0 else f"{f:.2f}"
-        except: return str(v)
+        except Exception as _e:
+            logger.warning("Suppressed error: %s", _e)
+            return str(v)
     def _fa(v):
         if not v or str(v).strip() in ("","None","nan","0","NaN"): return "\u2014"
         try: return str(int(float(v)))
-        except: return str(v)
+        except Exception as _e:
+            logger.warning("Suppressed error: %s", _e)
+            return str(v)
 
     rs=_fv(record.get("sph_r")); rc=_fv(record.get("cyl_r"))
     ra=_fa(record.get("axis_r")); rad=_fv(record.get("add_r"))
@@ -352,7 +347,12 @@ def _render_record_detail(record):
                 """, (_visit_id,)) or []
 
             # SECONDARY: patient UUID + exact date
-            if not _vrx and _pid_uuid and len(_pid_uuid) > 10:
+            _pid_is_real_uuid = (
+                _pid_uuid and len(_pid_uuid) > 10
+                and not _pid_uuid.upper().startswith("TEMP-")
+                and "-" in _pid_uuid
+            )
+            if not _vrx and _pid_is_real_uuid:
                 _vrx = _rqv("""
                     SELECT
                         COALESCE(right_sph::text,'') AS sr,
@@ -641,10 +641,6 @@ def _render_record_detail(record):
                             st.error(f"Convert error: {_r2['error']}")
                     else:
                         _rxd2 = _r2.get("rx",{})
-                        _fee2 = float(_r2.get("consult_fee",0) or 0)
-                        _lines2 = []
-                        if _fee2 > 0 and _r2.get("prod_id"):
-                            _lines2 = [{"line_id":str(uuid.uuid4()),"provisional_order_id":None,"product_id":_r2["prod_id"],"product_name":_r2.get("prod_name","Consultation Fee"),"brand":"Service","main_group":"Services","batch_no":"","eye_side":"SERVICE","sph":None,"cyl":None,"axis":None,"add_power":None,"lens_params":{},"boxing_params":{},"requested_qty":1,"billing_qty":1,"order_qty":0,"display_qty":"1 SERVICE","batch_allocation":[],"unit_price":_fee2,"total_price":_fee2,"gst_percent":0.0,"gst_amount":0.0,"status":"Complete","created_at":_dt2.datetime.now().isoformat()}]
                         _prefill_data = {
                             "patient_name":    _r2["patient_name"],
                             "patient_mobile":  _r2.get("patient_mobile",""),
@@ -652,7 +648,8 @@ def _render_record_detail(record):
                             "consult_order_id": _full_oid,   # ← UUID used for re-billing check
                             "rx_r": {"sph":_rxd2.get("sph_r",0),"cyl":_rxd2.get("cyl_r",0),"axis":_rxd2.get("ax_r",0),"add":_rxd2.get("add_r",0)},
                             "rx_l": {"sph":_rxd2.get("sph_l",0),"cyl":_rxd2.get("cyl_l",0),"axis":_rxd2.get("ax_l",0),"add":_rxd2.get("add_l",0)},
-                            "order_lines": _lines2,
+                            "order_lines": [],
+                            "include_consult_fee": False,
                         }
                         st.session_state["_consult_prefill"] = _prefill_data
                         st.session_state["_sidebar_page"] = "🛍️  Retail Order"
@@ -1324,7 +1321,8 @@ def get_examiner_list():
         
         return []
         
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         return []
 
 

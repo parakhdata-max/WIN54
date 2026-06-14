@@ -20,6 +20,7 @@ DB triggers auto-update challan.amount_paid / invoice.payment_status.
 import streamlit as st
 import uuid as _uuid
 from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Optional, Tuple
 
 # ── DB helpers ────────────────────────────────────────────────────────────
@@ -51,6 +52,9 @@ def _fd(v) -> str:
         if isinstance(v, (date, datetime)): return v.strftime("%d %b %Y")
         return datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%d %b %Y")
     except: return str(v)[:10]
+
+def _round_to_rupee(v) -> float:
+    return float(Decimal(str(v or 0)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 def _pill(status: str, color: str = None) -> str:
     s = str(status or "").upper()
@@ -140,7 +144,7 @@ def render_record_payment(
     Works for: challan payment, invoice payment, advance against order.
     """
     balance = round(grand_total - amount_paid, 2)
-    if balance <= 0.01 and payment_type != "ADVANCE":
+    if grand_total > 0 and balance <= 0.50:
         st.success("✅ Fully paid")
         return
 
@@ -150,9 +154,13 @@ def render_record_payment(
         with c1:
             method = st.selectbox("Mode", PAYMENT_METHODS, key=f"pm_meth_{_uk}")
         with c2:
-            _amt_default = float(max(balance, 0.0)) if payment_type != "ADVANCE" else 0.0
+            _rounded_due = _round_to_rupee(float(max(balance, 0.0)))
+            if grand_total > 0 and abs(_rounded_due - balance) <= 0.50:
+                balance = _rounded_due
+            _cap = float(max(balance, 0.0)) if grand_total > 0 else 9999999.0
+            _amt_default = float(max(balance, 0.0)) if grand_total > 0 else 0.0
             amt = st.number_input("Amount ₹", min_value=0.0,
-                                  max_value=float(max(balance,0)) if payment_type != "ADVANCE" else 9999999.0,
+                                  max_value=_cap,
                                   value=_amt_default,
                                   step=0.01, key=f"pm_amt_{_uk}")
         with c3:
@@ -163,6 +171,13 @@ def render_record_payment(
             ref_no = st.text_input(
                 "Reference / TXN No" if method != "CHEQUE" else "Cheque No",
                 key=f"pm_ref_{_uk}")
+        provisional_cheque = False
+        if method == "CHEQUE" and str(payment_type or "").upper() == "ADVANCE" and pay_date > date.today():
+            provisional_cheque = st.checkbox(
+                "Provisional advance cheque (post-dated)",
+                key=f"pm_pdc_{_uk}",
+                help="Future dates are blocked except for provisional advance cheques.",
+            )
 
         remarks = st.text_input("Remarks (optional)", key=f"pm_rmk_{_uk}")
 
@@ -176,13 +191,34 @@ def render_record_payment(
                 order_id=order_id, party_id=party_id, party_name=party_name,
                 amount=amt, method=method, pay_date=pay_date,
                 ref_no=ref_no, remarks=remarks, payment_type=payment_type,
+                allow_provisional_advance_cheque=provisional_cheque,
             )
 
 
 def _submit_payment(
     *, challan_id, invoice_id, order_id, party_id, party_name,
     amount, method, pay_date, ref_no="", remarks="", payment_type="RECEIPT",
+    allow_provisional_advance_cheque: bool = False,
+    rerun_on_success: bool = True,
 ):
+    try:
+        from modules.core.date_guard import validate_payment_date
+        _ok_dt, _msg_dt = validate_payment_date(
+            pay_date,
+            payment_type=payment_type,
+            payment_mode=method,
+            method=method,
+            remarks=remarks,
+            reference_no=ref_no,
+            allow_provisional_advance_cheque=allow_provisional_advance_cheque,
+        )
+        if not _ok_dt:
+            st.error(_msg_dt)
+            return
+    except Exception as _date_guard_error:
+        st.error(f"Payment date validation failed: {_date_guard_error}")
+        return
+
     # ── Allocate payment number and INSERT in ONE transaction ────────────────
     # alloc_doc_number without cursor = own transaction (legacy).
     # Payment INSERT goes into _tx(steps) = second transaction.
@@ -230,6 +266,192 @@ def _submit_payment(
         "by":      st.session_state.get("user_name", "System"),
     })]
 
+    if payment_type == "ADVANCE" and order_id:
+        steps.append((""" 
+            UPDATE orders
+            SET advance_amount = COALESCE(advance_amount, 0) + %(amt)s,
+                advance_received = TRUE,
+                payment_status = CASE
+                    WHEN COALESCE(total_value, 0) > 0
+                     AND COALESCE(advance_amount, 0) + %(amt)s >= COALESCE(total_value, 0) - 0.50
+                    THEN 'PAID'
+                    ELSE 'PARTIAL'
+                END,
+                updated_at = NOW()
+            WHERE id = %(oid)s::uuid
+        """, {
+            "amt": amount,
+            "oid": order_id,
+        }))
+
+    if challan_id:
+        steps.append((""" 
+            WITH ch AS (
+                SELECT id, order_ids, COALESCE(grand_total,total_amount,0) AS gt
+                FROM challans
+                WHERE id = %(cid)s::uuid
+            ),
+            paid AS (
+                SELECT
+                    ch.id,
+                    COALESCE((
+                        SELECT SUM(p.amount)
+                        FROM payments p
+                        WHERE p.challan_id = ch.id
+                          AND NOT COALESCE(p.is_deleted,FALSE)
+                    ), 0)
+                    +
+                    COALESCE((
+                        SELECT SUM(p.amount)
+                        FROM payments p
+                        WHERE p.advance_for_order_id::text = ANY(ch.order_ids::text[])
+                          AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                          AND NOT COALESCE(p.is_deleted,FALSE)
+                    ), 0) AS amt
+                FROM ch
+            )
+            UPDATE challans c
+            SET amount_paid = paid.amt,
+                advance_applied = COALESCE((
+                    SELECT SUM(p.amount)
+                    FROM payments p, ch
+                    WHERE p.advance_for_order_id::text = ANY(ch.order_ids::text[])
+                      AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0),
+                balance_due = GREATEST(COALESCE(c.grand_total,c.total_amount,0) - paid.amt, 0),
+                payment_complete = CASE
+                    WHEN COALESCE(c.grand_total,c.total_amount,0) - paid.amt <= 0.50 THEN TRUE
+                    ELSE FALSE
+                END,
+                updated_at = NOW()
+            FROM paid
+            WHERE c.id = paid.id
+        """, {"cid": challan_id}))
+        steps.append((""" 
+            WITH ch AS (
+                SELECT order_ids FROM challans WHERE id = %(cid)s::uuid
+            ),
+            tgt AS (
+                SELECT o.id, COALESCE(o.total_value,0) AS total_value
+                FROM orders o, ch
+                WHERE o.id::text = ANY(ch.order_ids::text[])
+            ),
+            paid AS (
+                SELECT tgt.id,
+                       COALESCE((SELECT SUM(p.amount) FROM payments p
+                                 WHERE p.advance_for_order_id = tgt.id
+                                   AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+                       +
+                       COALESCE((SELECT SUM(p.amount) FROM payments p
+                                 JOIN challans c ON p.challan_id = c.id
+                                 WHERE tgt.id::text = ANY(c.order_ids::text[])
+                                   AND p.invoice_id IS NULL
+                                   AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+                       +
+                       COALESCE((SELECT SUM(p.amount) FROM payments p
+                                 JOIN invoices i ON p.invoice_id = i.id
+                                 WHERE tgt.id::text = ANY(i.order_ids::text[])
+                                   AND NOT COALESCE(p.is_deleted,FALSE)), 0) AS amt
+                FROM tgt
+            )
+            UPDATE orders o
+            SET payment_status = CASE
+                    WHEN paid.amt - COALESCE(o.total_value,0) > 0.50 THEN 'EXCESS'
+                    WHEN COALESCE(o.total_value,0) - paid.amt <= 0.50 THEN 'PAID'
+                    WHEN paid.amt > 0 THEN 'PARTIAL'
+                    ELSE 'UNPAID'
+                END,
+                advance_received = paid.amt > 0,
+                updated_at = NOW()
+            FROM paid
+            WHERE o.id = paid.id
+        """, {"cid": challan_id}))
+
+    if invoice_id:
+        steps.append((""" 
+            WITH inv AS (
+                SELECT id, order_ids, COALESCE(grand_total,0) AS gt
+                FROM invoices
+                WHERE id = %(iid)s::uuid
+            ),
+            paid AS (
+                SELECT
+                    inv.id,
+                    COALESCE((
+                        SELECT SUM(p.amount)
+                        FROM payments p
+                        WHERE p.invoice_id = inv.id
+                          AND NOT COALESCE(p.is_deleted,FALSE)
+                    ), 0)
+                    +
+                    COALESCE((
+                        SELECT SUM(p.amount)
+                        FROM payments p
+                        WHERE p.advance_for_order_id::text = ANY(inv.order_ids::text[])
+                          AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                          AND NOT COALESCE(p.is_deleted,FALSE)
+                    ), 0) AS amt
+                FROM inv
+            )
+            UPDATE invoices i
+            SET amount_paid = paid.amt,
+                balance_due = GREATEST(COALESCE(i.grand_total,0) - paid.amt, 0),
+                status = CASE
+                    WHEN COALESCE(i.status,'') IN ('CANCELLED','VOID') THEN i.status
+                    WHEN COALESCE(i.grand_total,0) - paid.amt <= 0.50 THEN 'PAID'
+                    ELSE 'ACTIVE'
+                END,
+                payment_status = CASE
+                    WHEN paid.amt - COALESCE(i.grand_total,0) > 0.50 THEN 'EXCESS'
+                    WHEN COALESCE(i.grand_total,0) - paid.amt <= 0.50 THEN 'PAID'
+                    WHEN paid.amt > 0 THEN 'PARTIAL'
+                    ELSE 'UNPAID'
+                END,
+                updated_at = NOW()
+            FROM paid
+            WHERE i.id = paid.id
+        """, {"iid": invoice_id}))
+        steps.append((""" 
+            WITH inv AS (
+                SELECT order_ids FROM invoices WHERE id = %(iid)s::uuid
+            ),
+            tgt AS (
+                SELECT o.id, COALESCE(o.total_value,0) AS total_value
+                FROM orders o, inv
+                WHERE o.id::text = ANY(inv.order_ids::text[])
+            ),
+            paid AS (
+                SELECT tgt.id,
+                       COALESCE((SELECT SUM(p.amount) FROM payments p
+                                 WHERE p.advance_for_order_id = tgt.id
+                                   AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+                       +
+                       COALESCE((SELECT SUM(p.amount) FROM payments p
+                                 JOIN challans c ON p.challan_id = c.id
+                                 WHERE tgt.id::text = ANY(c.order_ids::text[])
+                                   AND p.invoice_id IS NULL
+                                   AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+                       +
+                       COALESCE((SELECT SUM(p.amount) FROM payments p
+                                 JOIN invoices i ON p.invoice_id = i.id
+                                 WHERE tgt.id::text = ANY(i.order_ids::text[])
+                                   AND NOT COALESCE(p.is_deleted,FALSE)), 0) AS amt
+                FROM tgt
+            )
+            UPDATE orders o
+            SET payment_status = CASE
+                    WHEN paid.amt - COALESCE(o.total_value,0) > 0.50 THEN 'EXCESS'
+                    WHEN COALESCE(o.total_value,0) - paid.amt <= 0.50 THEN 'PAID'
+                    WHEN paid.amt > 0 THEN 'PARTIAL'
+                    ELSE 'UNPAID'
+                END,
+                advance_received = paid.amt > 0,
+                updated_at = NOW()
+            FROM paid
+            WHERE o.id = paid.id
+        """, {"iid": invoice_id}))
+
     # Party ledger entry
     steps.append(("""
         INSERT INTO party_ledger
@@ -252,7 +474,8 @@ def _submit_payment(
     ok, err = _tx(steps)
     if ok:
         st.success(f"✅ {pno} — {_fc(amount)} recorded via {method}")
-        st.rerun()
+        if rerun_on_success:
+            st.rerun()
     else:
         st.error(f"❌ Failed: {err}")
 
@@ -330,7 +553,8 @@ def render_retail_payment_panel(challan_id: str, challan_no: str,
 
     paid    = round(advance + challan_direct, 2)
     balance = round(max(grand - paid, 0), 2)
-    done    = balance <= 0.01
+    excess  = round(max(paid - grand, 0), 2)
+    done    = balance <= 0.50
 
     # Sync challan row if stale (so invoice gate works correctly)
     if abs(float(c.get("amount_paid") or 0) - paid) > 0.005:
@@ -386,9 +610,9 @@ def render_retail_payment_panel(challan_id: str, challan_no: str,
         {_adv_disp}
       </div>
       <div style='{_CARD};border-top:3px solid {"#10b981" if done else "#ef4444"}'>
-        <div style='{_HDR}'>Balance Due</div>
-        <div style='{_VAL};color:{"#10b981" if done else "#ef4444"}'>{_fc(balance)}</div>
-        {"<div style='" + _SUB + "'>after advance</div>" if advance > 0 else ""}
+        <div style='{_HDR}'>{"Excess Received" if excess > 0 else "Balance Due"}</div>
+        <div style='{_VAL};color:{"#f59e0b" if excess > 0 else ("#10b981" if done else "#ef4444")}'>{_fc(excess if excess > 0 else balance)}</div>
+        {"<div style='" + _SUB + "'>customer credit/refund due</div>" if excess > 0 else ("<div style='" + _SUB + "'>after advance</div>" if advance > 0 else "")}
       </div>
       <div style='{_CARD};border-top:3px solid {"#10b981" if done else "#f59e0b"}'>
         <div style='{_HDR}'>Status</div>
@@ -462,7 +686,7 @@ def render_retail_payment_panel(challan_id: str, challan_no: str,
                 _inv_result = _generate_invoice_from_challan(challan_id, party_id, party_name)
                 # Trigger WA for invoice made
                 try:
-                    from modules.wa_hub import wa_panel, wa_invoice_made
+                    from modules.wa_hub import wa_document_attachment, wa_panel, wa_invoice_made
                     from modules.settings.shop_master import get_unit_info as _gui
                     _s  = _gui("retail") or {}
                     _ch = _q("SELECT grand_total, order_ids FROM challans WHERE id=%(i)s", {"i": challan_id})
@@ -478,7 +702,11 @@ def render_retail_payment_panel(challan_id: str, challan_no: str,
                         upi_id=_s.get("shop_upi_id",""),
                     )
                     wa_panel(_mob_inv, _msg_inv, key="inv_wa_" + _inv_no.replace("/","_"),
-                             title="📲 Send Invoice WhatsApp", expanded=True)
+                             title="📲 Send Invoice WhatsApp", expanded=True,
+                             party_name=party_name,
+                             attachments=[
+                                 wa_document_attachment("invoice", _inv_no)
+                             ])
                 except Exception:
                     pass
 
@@ -580,35 +808,28 @@ def render_wholesale_payment_panel(invoice_id: str, invoice_no: str,
 
     grand   = float(i.get("grand_total") or 0)
 
-    # Total received = invoice.amount_paid (direct payments) +
-    #                  order-level advances (punch-time, linked via advance_for_order_id)
     _inv_order_ids = [str(x) for x in (i.get("order_ids") or [])]
-    _order_adv = 0.0
     if _inv_order_ids:
         try:
-            _adv_r = _q("""
-                SELECT COALESCE(SUM(amount), 0) AS tot
-                FROM payments
-                WHERE advance_for_order_id::text = ANY(%(oids)s)
-                  AND payment_type = 'ADVANCE'
-                  AND COALESCE(is_deleted, FALSE) = FALSE
-            """, {"oids": _inv_order_ids})
-            _order_adv = float((_adv_r[0]["tot"] if _adv_r else 0) or 0)
+            from modules.db.advance_allocator import allocate_order_advance
+            for _oid in _inv_order_ids:
+                if _oid:
+                    allocate_order_advance(_oid)
+            _fresh = _q("""
+                SELECT amount_paid, balance_due, payment_status
+                FROM invoices WHERE id = %(id)s::uuid
+            """, {"id": invoice_id}) or []
+            if _fresh:
+                i.update(_fresh[0])
         except Exception:
-            _order_adv = 0.0
+            pass
 
-    # Direct payments recorded against this invoice
-    _inv_direct_paid = float(i.get("amount_paid") or 0)
-    paid    = round(max(_inv_direct_paid, _order_adv), 2)   # use whichever is higher (avoids double-counting if amount_paid was already synced)
-    balance = round(max(grand - paid, 0), 2)
+    # The allocator-maintained invoice fields are the source of truth. Do not
+    # add the full order advance here, or partial invoices double-consume it.
+    paid    = round(float(i.get("amount_paid") or 0), 2)
+    balance = round(float(i.get("balance_due") if i.get("balance_due") is not None else max(grand - paid, 0)), 2)
+    excess  = round(max(paid - grand, 0), 2)
     pstatus = str(i.get("payment_status") or "UNPAID").upper()
-
-    # Sync invoice row if stale (so invoice list shows correct status)
-    if abs(float(i.get("amount_paid") or 0) - paid) > 0.005 or abs(float(i.get("balance_due") or 0) - balance) > 0.005:
-        _new_pstatus = "PAID" if balance <= 0.01 else ("PARTIAL" if paid > 0 else "UNPAID")
-        _q("UPDATE invoices SET amount_paid=%(p)s, balance_due=%(b)s, payment_status=%(ps)s, updated_at=NOW() WHERE id=%(id)s",
-           {"p": paid, "b": balance, "ps": _new_pstatus, "id": str(i["id"])})
-        pstatus = _new_pstatus
     due     = i.get("due_date")
     is_overdue = (due and (due if isinstance(due, date)
                    else datetime.strptime(str(due)[:10], "%Y-%m-%d").date()) < date.today()
@@ -625,10 +846,10 @@ def render_wholesale_payment_panel(invoice_id: str, invoice_no: str,
         <div style='{_HDR}'>Received</div>
         <div style='{_VAL};color:#10b981'>{_fc(paid)}</div>
       </div>
-      <div style='{_CARD};border-top:3px solid {"#ef4444" if is_overdue else "#f59e0b" if balance > 0 else "#10b981"}'>
-        <div style='{_HDR}'>{"⚠️ OVERDUE" if is_overdue else "Balance Due"}</div>
-        <div style='{_VAL};color:{"#ef4444" if is_overdue else "#f59e0b" if balance > 0 else "#10b981"}'>{_fc(balance)}</div>
-        <div style='{_SUB}'>Due: {_fd(due)}</div>
+      <div style='{_CARD};border-top:3px solid {"#f59e0b" if excess > 0 else ("#ef4444" if is_overdue else "#f59e0b" if balance > 0 else "#10b981")}'>
+        <div style='{_HDR}'>{"Excess Received" if excess > 0 else ("⚠️ OVERDUE" if is_overdue else "Balance Due")}</div>
+        <div style='{_VAL};color:{"#f59e0b" if excess > 0 else ("#ef4444" if is_overdue else "#f59e0b" if balance > 0 else "#10b981")}'>{_fc(excess if excess > 0 else balance)}</div>
+        <div style='{_SUB}'>{"customer credit/refund due" if excess > 0 else "Due: " + _fd(due)}</div>
       </div>
       <div style='{_CARD};border-top:3px solid {"#10b981" if pstatus=="PAID" else "#f59e0b" if pstatus=="PARTIAL" else "#ef4444"}'>
         <div style='{_HDR}'>Payment Status</div>
@@ -1315,7 +1536,8 @@ def render_payment_provisioning(order: dict, all_lines: list):
     recv_total = sum(float(p["amount"]) for p in all_payments if str(p.get("payment_type","")).upper() != "ADVANCE")
     total_paid = adv_total + recv_total
     balance    = round(order_total - total_paid, 2)
-    fully_paid = balance <= 0.01
+    excess     = round(max(total_paid - order_total, 0), 2)
+    fully_paid = balance <= 0.50
 
     _MODE_COLOR = {
         "ADVANCE_BALANCE": "#8b5cf6",
@@ -1343,12 +1565,17 @@ def render_payment_provisioning(order: dict, all_lines: list):
         <div style='{_HDR}'>Received</div>
         <div style='{_VAL};font-size:1rem;color:#10b981'>{_fc(recv_total)}</div>
       </div>
-      <div style='{_CARD};border-top:3px solid {"#10b981" if fully_paid else "#ef4444"}'>
-        <div style='{_HDR}'>{"✅ Settled" if fully_paid else "Balance Due"}</div>
-        <div style='{_VAL};font-size:1rem;color:{"#10b981" if fully_paid else "#ef4444"}'>{_fc(max(balance,0))}</div>
+      <div style='{_CARD};border-top:3px solid {"#f59e0b" if excess > 0 else ("#10b981" if fully_paid else "#ef4444")}'>
+        <div style='{_HDR}'>{"Excess Received" if excess > 0 else ("✅ Settled" if fully_paid else "Balance Due")}</div>
+        <div style='{_VAL};font-size:1rem;color:{"#f59e0b" if excess > 0 else ("#10b981" if fully_paid else "#ef4444")}'>{_fc(excess if excess > 0 else max(balance,0))}</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
+    if excess > 0:
+        st.info(
+            f"Customer credit / excess received: {_fc(excess)}. "
+            "Keep it on account or refund/transfer it from Payment Correction."
+        )
 
     # ── Sub-tabs: Payments | Challans/Invoices | Edit/Correct ────────────
     _pt1, _pt2, _pt3 = st.tabs(["📜 Payment Ledger", "🧾 Linked Documents", "✏️ Edit / Correct"])
@@ -1415,10 +1642,6 @@ def _compute_order_total(all_lines: list, order_type: str,
         elif up > 0 and qty > 0:
             # Fallback without governor
             total += up * qty if ot == "RETAIL" else up * qty * (1 + gst / 100)
-            if ot == "RETAIL":
-                total += up * qty
-            else:
-                total += up * qty * (1 + gst / 100)
 
     # Add service charges
     if order_id:
@@ -1505,7 +1728,8 @@ def _render_payment_ledger(all_payments, order_id, party_id, party_name,
                   str(p.get("payment_mode","")).upper(), "#64748b")
             pt = str(p.get("payment_type","RECEIPT")).upper()
             pt_color = "#8b5cf6" if pt == "ADVANCE" else "#10b981"
-            against = p.get("challan_no") or p.get("invoice_no") or "Direct"
+            _against_parts = [x for x in (p.get("challan_no"), p.get("invoice_no")) if x]
+            against = " / ".join(_against_parts) if _against_parts else "Direct"
             rows += f"""<tr>
               <td style='padding:5px 8px;color:#38bdf8;font-family:monospace;font-size:0.7rem'>{p['payment_no']}</td>
               <td style='padding:5px 8px;color:#94a3b8'>{_fd(p.get('payment_date'))}</td>
@@ -1536,14 +1760,17 @@ def _render_payment_ledger(all_payments, order_id, party_id, party_name,
     # Quick add payment
     _label = "💰 Add Advance Payment" if pmode in ("ADVANCE_BALANCE","PRE_PAYMENT") else "💰 Record Payment"
     _ptype = "ADVANCE" if pmode in ("ADVANCE_BALANCE","PRE_PAYMENT") else "RECEIPT"
-    render_record_payment(
-        order_id=order_id, party_id=party_id, party_name=party_name,
-        grand_total=order_total, amount_paid=total_paid,
-        payment_type=_ptype,
-        label=_label,
-        key_suffix=f"bo_ledger_{order_id[:8]}",
-        context="bo_ledger",
-    )
+    if order_total > 0 and total_paid >= order_total - 0.50:
+        st.success("✅ Fully paid — further receipt is blocked here. Use Payment Correction for refund/transfer.")
+    else:
+        render_record_payment(
+            order_id=order_id, party_id=party_id, party_name=party_name,
+            grand_total=order_total, amount_paid=total_paid,
+            payment_type=_ptype,
+            label=_label,
+            key_suffix=f"bo_ledger_{order_id[:8]}",
+            context="bo_ledger",
+        )
 
 
 def _render_linked_documents(linked_docs, party_id, party_name, pmode):
@@ -1559,7 +1786,15 @@ def _render_linked_documents(linked_docs, party_id, party_name, pmode):
         for c in challans:
             _done  = bool(c.get("payment_complete"))
             _bdue  = float(c.get("balance_due") or 0)
-            _color = "#10b981" if _done else "#f59e0b"
+            _paid  = float(c.get("amount_paid") or 0)
+            _grand = float(c.get("grand_total") or 0)
+            _excess = round(max(_paid - _grand, 0), 2)
+            _color = "#f59e0b" if _excess > 0 else ("#10b981" if _done else "#f59e0b")
+            _status_txt = (
+                f"Excess: {_fc(_excess)}"
+                if _excess > 0 else
+                ("✅ PAID" if _done else f"Balance: {_fc(_bdue)}")
+            )
             st.markdown(f"""
             <div style='{_CARD};border-left:3px solid {_color};padding:10px 14px;margin-bottom:6px'>
               <div style='display:flex;justify-content:space-between;align-items:center'>
@@ -1569,7 +1804,7 @@ def _render_linked_documents(linked_docs, party_id, party_name, pmode):
                 </div>
                 <div style='text-align:right'>
                   <div style='color:#10b981;font-weight:700;font-family:monospace'>{_fc(c.get('grand_total',0))}</div>
-                  <div style='color:{_color};font-size:0.68rem'>{"✅ PAID" if _done else f"Balance: {_fc(_bdue)}"}</div>
+                  <div style='color:{_color};font-size:0.68rem'>{_status_txt}</div>
                 </div>
               </div>
             </div>""", unsafe_allow_html=True)
@@ -1697,6 +1932,18 @@ def _render_payment_correction(*, order, all_lines, all_payments,
             if st.button("💾 Save Changes", type="primary",
                          key=f"edit_save_{order_id[:8]}",
                          width='stretch'):
+                from modules.core.date_guard import validate_payment_date
+                _ok_dt, _msg_dt = validate_payment_date(
+                    new_date,
+                    payment_type=str(_ep.get("payment_type") or ""),
+                    payment_mode=new_mode,
+                    method=new_mode,
+                    remarks=new_rmk,
+                    reference_no=new_ref,
+                )
+                if not _ok_dt:
+                    st.error(_msg_dt)
+                    return
                 ok, err = _tx([("""
                     UPDATE payments
                     SET amount=%(amt)s, payment_mode=%(mode)s,

@@ -111,24 +111,25 @@ def _load_supplier_performance() -> Optional[pd.DataFrame]:
                 COALESCE(COUNT(so.id), 0)::int                        AS po_count,
                 COALESCE(
                     AVG(EXTRACT(DAY FROM
-                        (COALESCE(so.received_at, so.updated_at) - so.created_at)
+                        (COALESCE(so.last_receipt_date::timestamp, so.updated_at) - so.created_at)
                     )), 0
                 )::float                                              AS delivery_days_avg,
                 COALESCE(
                     100.0 * SUM(
                         CASE
-                            WHEN so.expected_delivery IS NOT NULL
-                             AND COALESCE(so.received_at, so.updated_at)::date
-                                 > so.expected_delivery
+                            WHEN so.expected_delivery_date IS NOT NULL
+                             AND COALESCE(so.last_receipt_date, so.updated_at::date)
+                                 > so.expected_delivery_date
                             THEN 1 ELSE 0
                         END
                     ) / NULLIF(COUNT(so.id), 0), 0
                 )::float                                              AS delay_pct
             FROM parties p
-            LEFT JOIN supplier_orders so ON so.supplier_id = p.id
+            LEFT JOIN supplier_orders so ON so.supplier_id ~* '^[0-9a-f-]{36}$'
+                AND so.supplier_id::uuid = p.id
                 AND so.created_at >= NOW() - INTERVAL '180 days'
-            WHERE LOWER(COALESCE(p.roletype,'')) IN ('supplier','vendor')
-              AND COALESCE(p.isactive, true) = true
+            WHERE LOWER(COALESCE(p.party_type,'')) IN ('supplier','vendor')
+              AND COALESCE(p.is_active, true) = true
             GROUP BY p.id, p.party_name
             ORDER BY po_count DESC
         """)

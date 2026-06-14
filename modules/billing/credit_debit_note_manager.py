@@ -265,7 +265,14 @@ def get_invoice_lines_for_cdn(invoice_id: str) -> List[Dict]:
                COALESCE(il.tax_amount, 0)                         AS tax_amount,
                COALESCE(il.line_total, il.total_price, 0)         AS line_total,
                COALESCE(p.hsn_code, '')                           AS hsn_sac_code,
-               COALESCE(il.eye_side, '')                          AS eye_side
+               COALESCE(il.eye_side, '')                          AS eye_side,
+               ol.id::text                                        AS order_line_id,
+               ol.product_id::text                                AS product_id,
+               COALESCE(p.brand, '')                              AS brand,
+               COALESCE(p.category, p.main_group, '')             AS category,
+               COALESCE(p.box_size, 1)                            AS box_size,
+               ol.sph, ol.cyl, ol.axis, ol.add_power,
+               ol.lens_params
         FROM invoice_lines il
         LEFT JOIN order_lines ol ON ol.id = il.order_line_id
         LEFT JOIN products p     ON p.id  = ol.product_id
@@ -273,6 +280,74 @@ def get_invoice_lines_for_cdn(invoice_id: str) -> List[Dict]:
           AND COALESCE(il.is_deleted, FALSE) = FALSE
         ORDER BY il.id
     """, {"iid": invoice_id})
+
+
+def search_parties_for_cdn(query: str) -> List[Dict]:
+    """Party picker for CN/DN workflows."""
+    q = str(query or "").strip()
+    if len(q) < 2:
+        return []
+    return _q("""
+        SELECT id::text AS id,
+               party_name,
+               COALESCE(gstin, '')  AS gstin,
+               COALESCE(mobile, '') AS mobile,
+               COALESCE(city, '')   AS city
+        FROM parties
+        WHERE COALESCE(is_active, TRUE) = TRUE
+          AND (
+                UPPER(party_name) LIKE %(q)s
+             OR UPPER(COALESCE(mobile,'')) LIKE %(q)s
+             OR UPPER(COALESCE(gstin,'')) LIKE %(q)s
+          )
+        ORDER BY party_name
+        LIMIT 30
+    """, {"q": f"%{q.upper()}%"})
+
+
+def list_party_invoices_for_cdn(party_id: str, limit: int = 30) -> List[Dict]:
+    """Recent invoices for a party, newest first."""
+    if not party_id:
+        return []
+    return _q("""
+        SELECT i.id::text AS id,
+               i.invoice_no,
+               i.invoice_date,
+               i.grand_total,
+               i.status,
+               COALESCE(p.party_name, '') AS party_name
+        FROM invoices i
+        LEFT JOIN parties p ON p.id = i.party_id
+        WHERE i.party_id = %(pid)s::uuid
+          AND COALESCE(i.is_deleted, FALSE) = FALSE
+          AND i.status NOT IN ('CANCELLED')
+        ORDER BY i.invoice_date DESC, i.created_at DESC
+        LIMIT %(lim)s
+    """, {"pid": party_id, "lim": int(limit or 30)})
+
+
+def list_party_open_orders_for_cdn(party_id: str, limit: int = 20) -> List[Dict]:
+    """
+    Orders for a party that are not clearly invoiced/cancelled.
+    These are shown as guidance: un-invoiced orders should be cancelled/edited
+    in Backoffice, not via GST CN/DN.
+    """
+    if not party_id:
+        return []
+    return _q("""
+        SELECT o.id::text AS id,
+               o.order_no,
+               o.created_at::date AS order_date,
+               o.status,
+               COALESCE(o.total_value, 0) AS total_value,
+               COALESCE(o.patient_name, o.party_name, '') AS customer_name
+        FROM orders o
+        WHERE o.party_id = %(pid)s::uuid
+          AND COALESCE(o.is_deleted, FALSE) = FALSE
+          AND UPPER(COALESCE(o.status,'')) NOT IN ('CANCELLED','CLOSED','INVOICED','DISPATCHED','DELIVERED')
+        ORDER BY o.created_at DESC
+        LIMIT %(lim)s
+    """, {"pid": party_id, "lim": int(limit or 20)})
 
 
 def search_invoices(query: str, party_id: Optional[str] = None) -> List[Dict]:
@@ -322,6 +397,156 @@ def _gen_dn_number() -> str:
 
 
 # ── Credit Note ───────────────────────────────────────────────────────
+
+# ── Inventory hooks (Phase-3 gap fill: 2026-05-24) ────────────────────
+
+def _build_cn_inventory_tx(
+    cn_id: str,
+    cn_number: str,
+    reason: str,
+    lines: List[Dict],
+    party_name: str,
+    created_by: str,
+) -> list:
+    """
+    Append inventory return steps for sales-return credit notes.
+
+    RETURN/CANCELLATION credit notes create a fresh RTN-<cn_no> stock batch
+    rather than merging into the original batch. That keeps returned goods
+    auditable until staff inspect them.
+    """
+    if reason not in ("RETURN", "CANCELLATION"):
+        return []
+
+    steps: list = []
+    for line in lines:
+        pid = line.get("product_id")
+        qty = float(line.get("quantity") or 0)
+        if not pid or qty <= 0:
+            continue
+
+        new_stock_id = str(_uuid.uuid4())
+        batch_no = f"RTN-{cn_number}"
+        unit_rate = float(line.get("unit_price") or 0)
+
+        steps.append(("""
+            INSERT INTO inventory_stock (
+                id, product_id, batch_no, quantity,
+                stock_type, item_type, is_active,
+                purchase_rate, purchase_price, selling_price,
+                created_at, updated_at
+            ) VALUES (
+                %(id)s::uuid, %(pid)s::uuid, %(bn)s, %(qty)s,
+                'BATCH', 'STOCK', TRUE,
+                %(rate)s, %(rate)s, %(rate)s,
+                NOW(), NOW()
+            )
+        """, {
+            "id": new_stock_id,
+            "pid": pid,
+            "bn": batch_no,
+            "qty": qty,
+            "rate": unit_rate,
+        }))
+
+        steps.append(("""
+            INSERT INTO inventory_stock_ledger (
+                inventory_stock_id, product_id, batch_no, qty_change,
+                ref_type, ref_id, ref_no, remarks, created_at, created_by
+            ) VALUES (
+                %(sid)s::uuid, %(pid)s::uuid, %(bn)s, %(qty)s,
+                'CN_RETURN', %(cn_id)s::uuid, %(cn_no)s,
+                %(rmk)s, NOW(), %(by)s
+            )
+        """, {
+            "sid": new_stock_id,
+            "pid": pid,
+            "bn": batch_no,
+            "qty": qty,
+            "cn_id": cn_id,
+            "cn_no": cn_number,
+            "rmk": f"Stock returned via CN {cn_number} from {party_name or '?'} (reason: {reason})",
+            "by": created_by,
+        }))
+
+    return steps
+
+
+def _build_dn_inventory_tx(
+    dn_id: str,
+    dn_number: str,
+    lines: List[Dict],
+    party_name: str,
+    created_by: str,
+) -> list:
+    """
+    Append inventory consumption steps for physical-goods debit notes.
+
+    Gated by per-line move_inventory=True because most debit notes are
+    value-only adjustments and must not touch physical stock.
+    """
+    steps: list = []
+    for line in lines:
+        if not line.get("move_inventory"):
+            continue
+
+        pid = line.get("product_id")
+        qty = float(line.get("quantity") or 0)
+        if not pid or qty <= 0:
+            continue
+
+        steps.append(("""
+            WITH target AS (
+                SELECT id, batch_no
+                FROM inventory_stock
+                WHERE product_id = %(pid)s::uuid
+                  AND COALESCE(quantity, 0) > 0
+                  AND COALESCE(is_active, TRUE) = TRUE
+                ORDER BY updated_at DESC NULLS LAST,
+                         created_at DESC NULLS LAST
+                LIMIT 1
+            ),
+            dec AS (
+                UPDATE inventory_stock s
+                   SET quantity   = GREATEST(0, COALESCE(s.quantity, 0) - %(qty)s),
+                       is_active  = CASE
+                                       WHEN GREATEST(0, COALESCE(s.quantity, 0) - %(qty)s) <= 0
+                                       THEN FALSE ELSE TRUE
+                                    END,
+                       updated_at = NOW()
+                  FROM target t
+                 WHERE s.id = t.id
+                RETURNING s.id, s.batch_no
+            )
+            INSERT INTO inventory_stock_ledger (
+                inventory_stock_id, product_id, batch_no, qty_change,
+                ref_type, ref_id, ref_no, remarks, created_at, created_by
+            )
+            SELECT (SELECT id FROM dec),
+                   %(pid)s::uuid,
+                   COALESCE((SELECT batch_no FROM dec), '(no-stock-shortage)'),
+                   -%(qty)s,
+                   'DN_CONSUMPTION',
+                   %(dn_id)s::uuid,
+                   %(dn_no)s,
+                   CASE
+                     WHEN (SELECT id FROM dec) IS NULL
+                          THEN 'DN ' || %(dn_no)s || ': no active batch found - flagged for owner audit'
+                     ELSE 'Stock consumed via DN ' || %(dn_no)s || ' to ' || COALESCE(%(pn)s, '?')
+                   END,
+                   NOW(),
+                   %(by)s
+        """, {
+            "pid": pid,
+            "qty": qty,
+            "dn_id": dn_id,
+            "dn_no": dn_number,
+            "pn": party_name,
+            "by": created_by,
+        }))
+
+    return steps
+
 
 def create_credit_note(
     *,
@@ -478,6 +703,63 @@ def create_credit_note(
             "total": agg["grand_total"],
         }))
 
+    # 4. Party ledger — credit entry (CN reduces what party owes)
+    tx.append(("""
+        INSERT INTO party_ledger
+            (party_id, party_name, entry_date, entry_type,
+             ref_id, ref_no, debit, credit,
+             running_balance, narration, created_by)
+        VALUES
+            (%(pid)s, %(pn)s, %(dt)s, 'CN',
+             %(rid)s::uuid, %(rno)s, 0, %(amt)s,
+             0, %(nar)s, %(by)s)
+        ON CONFLICT DO NOTHING
+    """, {
+        "pid": party_id or None,
+        "pn":  party_name,
+        "dt":  date.today(),
+        "rid": cn_id,
+        "rno": cn_number,
+        "amt": agg["grand_total"],
+        "nar": f"Credit Note {cn_number} against {invoice_no} — {reason}",
+        "by":  created_by,
+    }))
+
+    try:
+        tx.extend(_build_cn_inventory_tx(
+            cn_id=cn_id,
+            cn_number=cn_number,
+            reason=reason,
+            lines=lines,
+            party_name=party_name,
+            created_by=created_by,
+        ))
+    except Exception as _inv_err:
+        log.warning("CN inventory step builder failed (non-fatal): %s", _inv_err)
+
+    # 5. Update invoice balance — CN reduces balance_due only
+    # CN is NOT a payment collected — do NOT increase amount_paid.
+    # The credit note absorbs outstanding debt; amount_paid stays unchanged.
+    if invoice_id:
+        tx.append(("""
+            UPDATE invoices
+            SET balance_due    = GREATEST(0, COALESCE(balance_due,
+                                   COALESCE(grand_total,0) - COALESCE(amount_paid,0)
+                                 ) - %(amt)s),
+                payment_status = CASE
+                    WHEN GREATEST(0, COALESCE(balance_due,
+                                     COALESCE(grand_total,0) - COALESCE(amount_paid,0)
+                                   ) - %(amt)s) <= 0.50 THEN 'PAID'
+                    WHEN COALESCE(amount_paid, 0) > 0                THEN 'PARTIAL'
+                    ELSE 'UNPAID'
+                END,
+                updated_at = NOW()
+            WHERE id = %(iid)s::uuid
+        """, {
+            "amt": agg["grand_total"],
+            "iid": invoice_id,
+        }))
+
     try:
         ok = _run_tx(tx)
     except Exception as _tx_err:
@@ -485,6 +767,31 @@ def create_credit_note(
     if ok:
         log.info("Credit Note created: %s  party=%s  total=%.2f",
                  cn_number, party_name, agg["grand_total"])
+        try:
+            from modules.accounting.accounts_engine import post_credit_note_jv
+            _acc_ok, _acc_msg = post_credit_note_jv(
+                cn_number=cn_number,
+                cn_id=cn_id,
+                party_name=party_name,
+                grand_total=float(agg["grand_total"] or 0),
+                taxable=float(agg["taxable_amount"] or 0),
+                cgst_amount=float(agg["cgst_amount"] or 0),
+                sgst_amount=float(agg["sgst_amount"] or 0),
+                igst_amount=float(agg["igst_amount"] or 0),
+                voucher_date=date.today(),
+                created_by=created_by,
+            )
+            if not _acc_ok:
+                log.warning("[CN] accounting post pending: %s", _acc_msg)
+        except Exception as _acc_e:
+            log.warning("[CN] accounting post failed: %s", _acc_e)
+        # Re-run advance allocator — CN changes outstanding balance
+        if order_id:
+            try:
+                from modules.db.advance_allocator import allocate_order_advance
+                allocate_order_advance(str(order_id))
+            except Exception as _alloc_e:
+                log.warning("[CN] advance re-alloc failed: %s", _alloc_e)
         return True, cn_number
     return False, "Database transaction failed — credit note not saved."
 
@@ -631,10 +938,39 @@ def create_debit_note(
         "total": agg["grand_total"],
     }))
 
+    try:
+        tx.extend(_build_dn_inventory_tx(
+            dn_id=dn_id,
+            dn_number=dn_number,
+            lines=lines,
+            party_name=party_name,
+            created_by=created_by,
+        ))
+    except Exception as _inv_err:
+        log.warning("DN inventory step builder failed (non-fatal): %s", _inv_err)
+
     ok = _run_tx(tx)
     if ok:
         log.info("Debit Note created: %s  party=%s  total=%.2f",
                  dn_number, party_name, agg["grand_total"])
+        try:
+            from modules.accounting.accounts_engine import post_debit_note_jv
+            _acc_ok, _acc_msg = post_debit_note_jv(
+                dn_number=dn_number,
+                dn_id=dn_id,
+                party_name=party_name,
+                grand_total=float(agg["grand_total"] or 0),
+                taxable=float(agg["taxable_amount"] or 0),
+                cgst_amount=float(agg["cgst_amount"] or 0),
+                sgst_amount=float(agg["sgst_amount"] or 0),
+                igst_amount=float(agg["igst_amount"] or 0),
+                voucher_date=date.today(),
+                created_by=created_by,
+            )
+            if not _acc_ok:
+                log.warning("[DN] accounting post pending: %s", _acc_msg)
+        except Exception as _acc_e:
+            log.warning("[DN] accounting post failed: %s", _acc_e)
         return True, dn_number
     return False, "Database transaction failed — debit note not saved."
 

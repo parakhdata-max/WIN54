@@ -55,6 +55,7 @@ def resolve_mobile(
     order:      dict | None = None,
     patient_id: str  | None = None,
     order_id:   str  | None = None,
+    party_name: str  = "",
     fallback:   str         = "",
 ) -> str:
     """
@@ -102,7 +103,7 @@ def resolve_mobile(
         try:
             from modules.sql_adapter import run_query
             rows = run_query(
-                "SELECT COALESCE(patient_mobile, party_mobile, '') AS mobile "
+                "SELECT COALESCE(patient_mobile, '') AS mobile "
                 "FROM orders WHERE id=%s::uuid LIMIT 1",
                 (str(order_id),)
             ) or []
@@ -114,7 +115,14 @@ def resolve_mobile(
     if not raw:
         raw = fallback or ""
 
-    return _clean_mobile(raw)
+    resolved = _clean_mobile(raw)
+    if resolved:
+        return resolved
+    try:
+        from modules.wa_contact_tools import lookup_mobile
+        return lookup_mobile(party_name, order_id=order_id or "", patient_id=patient_id or "", fallback=fallback)
+    except Exception:
+        return ""
 
 
 def _clean_mobile(raw: str) -> str:
@@ -153,6 +161,7 @@ def render_wa_trigger(
     order:     dict | None = None,
     patient_id:str  | None = None,
     order_id:  str  | None = None,
+    party_name: str  = "",
     label:     str  = "📲 Send WhatsApp",
     panel:     bool = False,
     show_mobile_field: bool = True,
@@ -185,31 +194,39 @@ def render_wa_trigger(
     # Resolve mobile from best source
     resolved = resolve_mobile(
         order=order, patient_id=patient_id,
-        order_id=order_id, fallback=mobile
+        order_id=order_id, party_name=party_name, fallback=mobile
     )
 
     if panel:
-        _render_wa_panel(key, msg, resolved, label, show_mobile_field)
+        _render_wa_panel(key, msg, resolved, label, show_mobile_field, party_name, order_id or "", patient_id or "")
     else:
-        _render_wa_button(key, msg, resolved, label, show_mobile_field)
+        _render_wa_button(key, msg, resolved, label, show_mobile_field, party_name, order_id or "", patient_id or "")
 
 
 def _render_wa_button(
-    key: str, msg: str, mobile: str, label: str, show_mobile_field: bool
+    key: str, msg: str, mobile: str, label: str, show_mobile_field: bool,
+    party_name: str = "", order_id: str = "", patient_id: str = "",
 ) -> None:
     """Compact: editable mobile + send button on one row."""
     if show_mobile_field:
         c1, c2 = st.columns([1.4, 1])
         with c1:
             mob_key = f"{key}_mob"
-            if mob_key not in st.session_state:
-                st.session_state[mob_key] = mobile
-            _mob = st.text_input(
-                "Mobile",
-                key=mob_key,
-                placeholder="10-digit number",
-                label_visibility="collapsed",
-            )
+            try:
+                from modules.wa_contact_tools import render_mobile_field
+                _mob = render_mobile_field(
+                    key, name=party_name, mobile=mobile,
+                    order_id=order_id, patient_id=patient_id, label="Mobile",
+                )
+            except Exception:
+                if mob_key not in st.session_state:
+                    st.session_state[mob_key] = mobile
+                _mob = st.text_input(
+                    "Mobile",
+                    key=mob_key,
+                    placeholder="10-digit number",
+                    label_visibility="collapsed",
+                )
         with c2:
             url = _wa_url(_mob, msg)
             if url:
@@ -238,7 +255,8 @@ def _render_wa_button(
 
 
 def _render_wa_panel(
-    key: str, msg: str, mobile: str, label: str, show_mobile_field: bool
+    key: str, msg: str, mobile: str, label: str, show_mobile_field: bool,
+    party_name: str = "", order_id: str = "", patient_id: str = "",
 ) -> None:
     """Expanded panel: editable mobile + editable message + send."""
     mob_key = f"{key}_mob"
@@ -252,9 +270,16 @@ def _render_wa_panel(
     with st.expander(label, expanded=False):
         c1, c2 = st.columns([2, 3])
         with c1:
-            _mob = st.text_input(
-                "Mobile", key=mob_key, placeholder="10-digit number"
-            )
+            try:
+                from modules.wa_contact_tools import render_mobile_field
+                _mob = render_mobile_field(
+                    key, name=party_name, mobile=mobile,
+                    order_id=order_id, patient_id=patient_id, label="Mobile",
+                )
+            except Exception:
+                _mob = st.text_input(
+                    "Mobile", key=mob_key, placeholder="10-digit number"
+                )
         with c2:
             _msg_edited = st.text_area(
                 "Message (edit if needed)", key=msg_key, height=120

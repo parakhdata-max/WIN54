@@ -23,6 +23,7 @@ from typing import Optional, List, Dict
 from modules.billing.credit_debit_note_manager import (
     # Lookups
     get_invoice_for_cdn, get_invoice_lines_for_cdn, search_invoices,
+    search_parties_for_cdn, list_party_invoices_for_cdn, list_party_open_orders_for_cdn,
     # Creators
     create_credit_note, create_debit_note,
     # Listings
@@ -40,6 +41,30 @@ from modules.security.roles import (
 )
 
 
+def _cdn_q(sql: str, params=None) -> List[Dict]:
+    try:
+        from modules.sql_adapter import run_query
+        return run_query(sql, params or {}) or []
+    except Exception as exc:
+        st.error(f"CN/DN lookup failed: {exc}")
+        return []
+
+
+def _cdn_scope_clause(scope: str, order_alias: str = "o", invoice_alias: str = "i") -> str:
+    ot = f"UPPER(COALESCE({order_alias}.order_type,''))"
+    if scope == "Retail":
+        return f"AND {ot} = 'RETAIL'"
+    if scope == "Online":
+        return f"AND {ot} = 'ONLINE'"
+    if scope == "Wholesale":
+        return (
+            f"AND (COALESCE({invoice_alias}.party_id::text,'') <> '' "
+            f"OR {ot} IN ('WHOLESALE','BULK','BULK_ORDER')) "
+            f"AND {ot} NOT IN ('RETAIL','ONLINE')"
+        )
+    return ""
+
+
 def render_cdn_module(inline: bool = False) -> None:
     """
     Main entry point.
@@ -51,6 +76,17 @@ def render_cdn_module(inline: bool = False) -> None:
         st.caption(
             "GST-compliant · Section 34 CGST Act · "
             "GSTR-1 Table 9B · Tally Prime compatible"
+        )
+        st.markdown(
+            "<div style='background:#08111f;border:1px solid #1e3a5f;"
+            "border-left:4px solid #38bdf8;border-radius:8px;padding:10px 14px;"
+            "margin:8px 0 12px 0'>"
+            "<b style='color:#e2e8f0'>Workflow</b>"
+            "<span style='color:#94a3b8;font-size:0.82rem;margin-left:8px'>"
+            "Search/scan invoice or party → select invoice lines → adjust qty/rate/reason → "
+            "preview GST → issue CN/DN → export to Tally/GSTR-1."
+            "</span></div>",
+            unsafe_allow_html=True,
         )
         _render_summary_bar()
         st.markdown("---")
@@ -95,6 +131,289 @@ def _render_summary_bar() -> None:
 
 # ── Shared invoice lookup widget ──────────────────────────────────────
 
+def _extract_invoice_candidates_from_upload(uploaded) -> List[str]:
+    """Best-effort invoice number extraction from uploaded PDF/text/image name."""
+    if uploaded is None:
+        return []
+    import re
+
+    text = uploaded.name or ""
+    data = b""
+    try:
+        data = uploaded.getvalue()
+    except Exception:
+        data = b""
+
+    # Text files / CSV / HTML exports
+    if uploaded.type and ("text" in uploaded.type or uploaded.name.lower().endswith((".txt", ".csv", ".html"))):
+        try:
+            text += "\n" + data.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+    # PDF text extraction if pypdf/PyPDF2 is available. Scanned PDFs/images
+    # still need real OCR later, but filename/manual search remains usable.
+    if uploaded.name.lower().endswith(".pdf"):
+        try:
+            import io
+            try:
+                from pypdf import PdfReader
+            except Exception:
+                from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            pdf_text = "\n".join((p.extract_text() or "") for p in reader.pages[:3])
+            text += "\n" + pdf_text
+        except Exception:
+            pass
+
+    patterns = [
+        r"\bINV[/-]?\d{2,4}[/-]?\d{1,8}\b",
+        r"\bINV[/-][A-Z0-9/-]{3,30}\b",
+        r"\bR/\d{4}/\d{3,8}\b",
+        r"\b[A-Z]{1,4}/\d{2,4}/\d{3,8}\b",
+    ]
+    found = []
+    for pat in patterns:
+        for hit in re.findall(pat, text.upper()):
+            h = hit.strip(" .,:;")
+            if h and h not in found:
+                found.append(h)
+    return found[:8]
+
+
+def _invoice_upload_scan_panel(key_prefix: str) -> None:
+    with st.expander("📎 Upload / Scan Previous Invoice", expanded=False):
+        up = st.file_uploader(
+            "Upload invoice PDF / text / image",
+            type=["pdf", "txt", "csv", "html", "png", "jpg", "jpeg", "webp"],
+            key=f"{key_prefix}_invoice_upload",
+            help="Text PDFs can be read directly. Scanned images are kept as a helper now; full OCR can be added later.",
+        )
+        if not up:
+            st.caption("Upload an old invoice if staff does not know the invoice number.")
+            return
+        candidates = _extract_invoice_candidates_from_upload(up)
+        st.session_state[f"{key_prefix}_uploaded_invoice_file"] = up.name
+        if candidates:
+            chosen = st.selectbox(
+                "Detected invoice/order reference",
+                candidates,
+                key=f"{key_prefix}_ocr_candidate",
+            )
+            if st.button("Use this reference", key=f"{key_prefix}_ocr_use", use_container_width=True):
+                st.session_state[f"{key_prefix}_inv_search"] = chosen
+                st.session_state[f"{key_prefix}_prefilled_inv"] = chosen
+                st.rerun()
+        else:
+            st.warning("No invoice number detected. Use manual search below.")
+
+
+def _party_invoice_picker(key_prefix: str) -> Optional[Dict]:
+    with st.expander("🏪 Party / Customer → Invoice → Product / Power", expanded=True):
+        c1, c2 = st.columns([2, 2])
+        scope = c1.radio(
+            "Sale source",
+            ["All", "Wholesale", "Retail", "Online"],
+            horizontal=True,
+            key=f"{key_prefix}_acct_scope",
+        )
+        active_mode = c2.radio(
+            "Account list",
+            ["With invoices", "All accounts"],
+            horizontal=True,
+            key=f"{key_prefix}_acct_active",
+            help="With invoices keeps only accounts where a CN/DN can actually be raised.",
+        )
+        q = st.text_input(
+            "Search party / customer / mobile / GSTIN",
+            key=f"{key_prefix}_party_search",
+            placeholder="Type name, mobile or GSTIN",
+        ).strip()
+
+        if len(q) < 2:
+            st.caption("Type at least 2 characters to search party/customer.")
+            return None
+
+        scope_clause = _cdn_scope_clause(scope, "o", "i")
+        if active_mode == "With invoices":
+            parties = _cdn_q(f"""
+                SELECT
+                    COALESCE(i.party_id::text, 'NAME:' || COALESCE(pt.party_name, o.party_name, o.patient_name, '')) AS key,
+                    COALESCE(pt.party_name, o.party_name, o.patient_name, 'Customer') AS party_name,
+                    COALESCE(pt.mobile, o.patient_mobile, '') AS mobile,
+                    COALESCE(pt.gstin, '') AS gstin,
+                    COUNT(DISTINCT i.id) AS invoice_count,
+                    MAX(i.invoice_date)::text AS last_invoice_date
+                FROM invoices i
+                LEFT JOIN parties pt ON pt.id = i.party_id
+                LEFT JOIN LATERAL (
+                    SELECT o2.party_name, o2.patient_name, o2.patient_mobile, o2.order_type
+                    FROM orders o2
+                    WHERE o2.id::text = ANY(i.order_ids)
+                    LIMIT 1
+                ) o ON TRUE
+                WHERE COALESCE(i.is_deleted, FALSE) = FALSE
+                  AND i.status NOT IN ('CANCELLED','VOID')
+                  AND (
+                        UPPER(COALESCE(pt.party_name, o.party_name, o.patient_name, '')) LIKE %(q)s
+                     OR UPPER(COALESCE(pt.mobile, o.patient_mobile, '')) LIKE %(q)s
+                     OR UPPER(COALESCE(pt.gstin, '')) LIKE %(q)s
+                  )
+                  {scope_clause}
+                GROUP BY i.party_id, pt.party_name, o.party_name, o.patient_name,
+                         pt.mobile, o.patient_mobile, pt.gstin
+                ORDER BY MAX(i.invoice_date) DESC, party_name
+                LIMIT 40
+            """, {"q": f"%{q.upper()}%"})
+        else:
+            order_scope = ""
+            if scope == "Retail":
+                order_scope = "AND UPPER(COALESCE(order_type,'')) = 'RETAIL'"
+            elif scope == "Online":
+                order_scope = "AND UPPER(COALESCE(order_type,'')) = 'ONLINE'"
+            elif scope == "Wholesale":
+                order_scope = "AND UPPER(COALESCE(order_type,'')) NOT IN ('RETAIL','ONLINE')"
+            parties = _cdn_q("""
+                SELECT key, party_name, mobile, gstin, 0 AS invoice_count, '' AS last_invoice_date
+                FROM (
+                    SELECT id::text AS key, party_name, COALESCE(mobile,'') AS mobile, COALESCE(gstin,'') AS gstin
+                    FROM parties
+                    WHERE COALESCE(is_active, TRUE) = TRUE
+                    UNION
+                    SELECT 'NAME:' || COALESCE(patient_name, party_name, '') AS key,
+                           COALESCE(patient_name, party_name, '') AS party_name,
+                           COALESCE(patient_mobile, '') AS mobile,
+                           '' AS gstin
+                    FROM orders
+                    WHERE COALESCE(patient_name, party_name, '') <> ''
+                      """ + order_scope + """
+                ) x
+                WHERE UPPER(COALESCE(party_name,'')) LIKE %(q)s
+                   OR UPPER(COALESCE(mobile,'')) LIKE %(q)s
+                   OR UPPER(COALESCE(gstin,'')) LIKE %(q)s
+                ORDER BY party_name
+                LIMIT 40
+            """, {"q": f"%{q.upper()}%"})
+
+        if not parties:
+            st.warning("No matching party/customer found.")
+            return None
+
+        labels = {
+            p["key"]: (
+                f"{p['party_name']} · {p.get('mobile','') or '—'}"
+                + (f" · {int(p.get('invoice_count') or 0)} invoice(s)" if active_mode == "With invoices" else "")
+            )
+            for p in parties
+        }
+        pkey = st.selectbox(
+            "Party / Customer",
+            list(labels.keys()),
+            format_func=lambda x: labels.get(x, x),
+            key=f"{key_prefix}_party_select",
+        )
+        selected_party = next((p for p in parties if p["key"] == pkey), {})
+
+        f1, f2, f3, f4, f5 = st.columns([2, 1, 1, 1, 1])
+        prod_filter = f1.text_input("Product filter", key=f"{key_prefix}_inv_product_filter", placeholder="Product / brand")
+        sph_filter = f2.text_input("SPH", key=f"{key_prefix}_inv_sph_filter", placeholder="+/-")
+        cyl_filter = f3.text_input("CYL", key=f"{key_prefix}_inv_cyl_filter", placeholder="+/-")
+        ax_filter = f4.text_input("AX", key=f"{key_prefix}_inv_axis_filter", placeholder="Axis")
+        add_filter = f5.text_input("ADD", key=f"{key_prefix}_inv_add_filter", placeholder="+")
+
+        party_where = ""
+        params = {
+            "name": selected_party.get("party_name", ""),
+            "prod": f"%{prod_filter.strip().upper()}%",
+        }
+        if str(pkey).startswith("NAME:"):
+            party_where = "AND COALESCE(pt.party_name, o.party_name, o.patient_name, '') = %(name)s"
+        else:
+            party_where = "AND i.party_id = %(pid)s::uuid"
+            params["pid"] = pkey
+
+        line_filters = ""
+        if prod_filter.strip():
+            line_filters += """
+                AND EXISTS (
+                    SELECT 1 FROM invoice_lines ilx
+                    LEFT JOIN order_lines olx ON olx.id = ilx.order_line_id
+                    LEFT JOIN products px ON px.id = olx.product_id
+                    WHERE ilx.invoice_id = i.id
+                      AND (
+                            UPPER(COALESCE(ilx.product_name,'')) LIKE %(prod)s
+                         OR UPPER(COALESCE(px.product_name,'')) LIKE %(prod)s
+                         OR UPPER(COALESCE(px.brand,'')) LIKE %(prod)s
+                      )
+                )
+            """
+        for key, col, val in [
+            ("sph", "sph", sph_filter), ("cyl", "cyl", cyl_filter),
+            ("axis", "axis", ax_filter), ("add", "add_power", add_filter),
+        ]:
+            if str(val).strip():
+                try:
+                    params[key] = float(val)
+                    line_filters += f"""
+                        AND EXISTS (
+                            SELECT 1 FROM invoice_lines ilp
+                            JOIN order_lines olp ON olp.id = ilp.order_line_id
+                            WHERE ilp.invoice_id = i.id
+                              AND ROUND(COALESCE(olp.{col}, 0)::numeric, 2)
+                                = ROUND(%({key})s::numeric, 2)
+                        )
+                    """
+                except Exception:
+                    st.caption(f"Ignoring invalid {key.upper()} filter.")
+
+        invs = _cdn_q(f"""
+            SELECT i.id::text AS id,
+                   i.invoice_no,
+                   i.invoice_date,
+                   i.grand_total,
+                   i.payment_status,
+                   COALESCE(STRING_AGG(DISTINCT COALESCE(il.product_name,''), ', '), '') AS products
+            FROM invoices i
+            LEFT JOIN parties pt ON pt.id = i.party_id
+            LEFT JOIN LATERAL (
+                SELECT o2.party_name, o2.patient_name, o2.order_type
+                FROM orders o2
+                WHERE o2.id::text = ANY(i.order_ids)
+                LIMIT 1
+            ) o ON TRUE
+            LEFT JOIN invoice_lines il ON il.invoice_id = i.id AND COALESCE(il.is_deleted,FALSE)=FALSE
+            WHERE COALESCE(i.is_deleted, FALSE) = FALSE
+              AND i.status NOT IN ('CANCELLED','VOID')
+              {party_where}
+              {scope_clause}
+              {line_filters}
+            GROUP BY i.id, i.invoice_no, i.invoice_date, i.grand_total, i.payment_status
+            ORDER BY i.invoice_date DESC, i.created_at DESC
+            LIMIT 50
+        """, params)
+
+        if not invs:
+            st.warning("No invoices found for this party/customer with the selected filters.")
+            return None
+
+        inv_labels = {
+            i["invoice_no"]: (
+                f"{i['invoice_no']} · {str(i.get('invoice_date'))[:10]} · "
+                f"₹{float(i.get('grand_total') or 0):,.2f} · {i.get('products') or 'No product lines'}"
+            )
+            for i in invs
+        }
+        ino = st.selectbox(
+            "Invoice with products",
+            list(inv_labels.keys()),
+            format_func=lambda x: inv_labels.get(x, x),
+            key=f"{key_prefix}_party_invoice_select",
+        )
+        if st.button("Use selected invoice", key=f"{key_prefix}_party_invoice_use", use_container_width=True):
+            st.session_state[f"{key_prefix}_prefilled_inv"] = ino
+            st.rerun()
+        return None
+
 def _invoice_lookup_widget(key_prefix: str) -> Optional[Dict]:
     """
     Search for an invoice by number or party name.
@@ -113,6 +432,8 @@ def _invoice_lookup_widget(key_prefix: str) -> Optional[Dict]:
     _stable_prefill = st.session_state.get(f"{key_prefix}_prefilled_inv", "")
 
     st.markdown("#### 🔍 Find Invoice")
+    _invoice_upload_scan_panel(key_prefix)
+    _party_invoice_picker(key_prefix)
 
     # If we have a prefill, skip the search widget and go direct to lookup
     if _stable_prefill:
@@ -294,6 +615,7 @@ def _line_builder(invoice_id: Optional[str], key_prefix: str) -> List[Dict]:
 
     lines: List[Dict] = []
 
+    _line_filter = ""
     if invoice_id:
         inv_lines = get_invoice_lines_for_cdn(str(invoice_id))
         # Get already-credited line IDs to disable those checkboxes
@@ -304,18 +626,60 @@ def _line_builder(invoice_id: Optional[str], key_prefix: str) -> List[Dict]:
             _credited = {}
         if inv_lines:
             st.caption("Select which invoice lines to include in this note:")
+            _line_filter = st.text_input(
+                "Search within invoice lines",
+                key=f"{key_prefix}_line_filter",
+                placeholder="Product / power / eye / brand",
+                label_visibility="collapsed",
+            )
+            if _line_filter.strip():
+                needle = _line_filter.strip().lower()
+                def _line_blob(row: Dict) -> str:
+                    lp = row.get("lens_params") or {}
+                    return " ".join(str(row.get(k) or "") for k in (
+                        "product_name", "brand", "category", "eye_side",
+                        "sph", "cyl", "axis", "add_power"
+                    )) + " " + str(lp)
+                inv_lines = [r for r in inv_lines if needle in _line_blob(r).lower()]
+                if not inv_lines:
+                    st.warning("No invoice lines match this search.")
+
             for i, il in enumerate(inv_lines):
                 key = f"{key_prefix}_line_{i}"
                 with st.container(border=True):
-                    col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 1])
+                    col1, col2, col3, col4, col5 = st.columns([3.4, 1, 1, 1, 1])
                     with col1:
                         _line_id = str(il.get("id") or "")
                         _already_cn = _credited.get(_line_id)
+                        _pwr_bits = []
+                        for _pk, _lbl in [("sph","SPH"),("cyl","CYL"),("axis","AX"),("add_power","ADD")]:
+                            _pv = il.get(_pk)
+                            if _pv not in (None, "", "None", 0, 0.0, "0", "0.0"):
+                                try:
+                                    _pf = float(_pv)
+                                    if _pk == "axis":
+                                        _pwr_bits.append(f"AX {int(_pf)}")
+                                    elif _pk == "add_power":
+                                        _pwr_bits.append(f"ADD {_pf:+.2f}")
+                                    else:
+                                        _pwr_bits.append(f"{_lbl} {_pf:+.2f}")
+                                except Exception:
+                                    pass
+                        _pwr_str = "  ".join(_pwr_bits)
+                        _line_meta = " · ".join(
+                            x for x in [
+                                str(il.get("eye_side") or "").upper(),
+                                str(il.get("brand") or ""),
+                                str(il.get("category") or ""),
+                                _pwr_str,
+                            ] if x
+                        )
                         if _already_cn:
                             st.markdown(
                                 f"<div style='color:#94a3b8;font-size:0.82rem'>"
                                 f"✅ {il.get('product_name','Item')}</div>"
-                                f"<div style='color:#10b981;font-size:0.7rem'>"
+                                + (f"<div style='color:#38bdf8;font-size:0.7rem'>{_line_meta}</div>" if _line_meta else "")
+                                + f"<div style='color:#10b981;font-size:0.7rem'>"
                                 f"Credited: {_already_cn}</div>",
                                 unsafe_allow_html=True
                             )
@@ -325,6 +689,8 @@ def _line_builder(invoice_id: Optional[str], key_prefix: str) -> List[Dict]:
                                 f"{il.get('product_name','Item')}",
                                 value=True, key=f"{key}_include"
                             )
+                            if _line_meta:
+                                st.caption(_line_meta)
                     with col2:
                         qty = st.number_input(
                             "Qty", min_value=0.0,
@@ -363,40 +729,147 @@ def _line_builder(invoice_id: Optional[str], key_prefix: str) -> List[Dict]:
                         # Show as read-only metric
                         st.metric("GST %", f"{_gst_val:.1f}%")
 
+                    _move_inv = False
+                    if key_prefix == "dn":
+                        _move_inv = st.checkbox(
+                            "Physical goods (reduce stock)",
+                            value=False,
+                            key=f"{key}_move_inv",
+                            help=(
+                                "Tick only when this DN line covers extra goods "
+                                "actually shipped. Leave off for value-only "
+                                "adjustments such as rate, freight, or interest."
+                            ),
+                        )
+
                     if include and qty > 0:
                         lines.append({
                             "product_name":    il.get("product_name", ""),
                             "hsn_sac_code":    il.get("hsn_sac_code", ""),
                             "invoice_line_id": il.get("id"),
+                            "order_line_id":   il.get("order_line_id"),
+                            "product_id":      il.get("product_id"),
                             "quantity":        qty,
                             "unit_price":      unit_price,
                             "taxable_amount":  taxable,
                             "gst_percent":     gst_pct,
+                            "tax_amount":      round(taxable * gst_pct / 100, 2),
+                            "move_inventory":  _move_inv,
                         })
 
     # Manual line entry
-    with st.expander("➕ Add Manual Line Item", expanded=False):
+    with st.expander("➕ Add Manual Line Item / Scan Product", expanded=False):
+        _prod_search = st.text_input(
+            "Search / scan product",
+            key=f"{key_prefix}_m_product_search",
+            placeholder="Barcode, SKU or product name",
+        )
+        _prod_choice = None
+        if len(_prod_search.strip()) >= 2:
+            try:
+                from modules.ui_product_selector import lookup_sku
+                _sku_hit = lookup_sku(_prod_search.strip())
+                if _sku_hit:
+                    _prod_choice = {
+                        "id": _sku_hit.get("product_id"),
+                        "product_name": _sku_hit.get("product_name"),
+                        "brand": _sku_hit.get("brand", ""),
+                        "category": _sku_hit.get("category", ""),
+                        "gst_percent": _sku_hit.get("gst_percent", 0),
+                        "hsn_code": _sku_hit.get("hsn_code", ""),
+                        "rate": _sku_hit.get("selling_price") or _sku_hit.get("mrp") or 0,
+                    }
+                    st.caption(
+                        "Matched via product selector: "
+                        f"{_prod_choice.get('product_name')} · "
+                        f"{_sku_hit.get('batch_no') or _sku_hit.get('item_code') or ''}"
+                    )
+            except Exception:
+                _prod_choice = None
+        if len(_prod_search.strip()) >= 2 and not _prod_choice:
+            try:
+                from modules.sql_adapter import run_query
+                _prod_rows = run_query("""
+                    SELECT id::text AS id,
+                           product_name,
+                           COALESCE(brand,'') AS brand,
+                           COALESCE(category, main_group, '') AS category,
+                           COALESCE(gst_percent, 0) AS gst_percent,
+                           COALESCE(hsn_code, '') AS hsn_code,
+                           COALESCE(mrp, selling_price, 0) AS rate
+                    FROM products
+                    WHERE COALESCE(is_active, TRUE) = TRUE
+                      AND (
+                            LOWER(product_name) LIKE %(q)s
+                         OR LOWER(COALESCE(barcode,'')) LIKE %(q)s
+                         OR LOWER(COALESCE(sku_code,'')) LIKE %(q)s
+                      )
+                    ORDER BY product_name
+                    LIMIT 25
+                """, {"q": f"%{_prod_search.strip().lower()}%"}) or []
+            except Exception:
+                _prod_rows = []
+            if _prod_rows:
+                _prod_map = {p["id"]: p for p in _prod_rows}
+                _prod_id = st.selectbox(
+                    "Matched product",
+                    list(_prod_map.keys()),
+                    format_func=lambda x: (
+                        f"{_prod_map[x]['product_name']} · {_prod_map[x].get('brand','')} · "
+                        f"₹{float(_prod_map[x].get('rate') or 0):,.2f}"
+                    ),
+                    key=f"{key_prefix}_m_product_match",
+                )
+                _prod_choice = _prod_map.get(_prod_id)
+            else:
+                st.caption("No product match; enter manual line below.")
         mc1, mc2, mc3, mc4 = st.columns([3, 1, 1, 1])
         with mc1:
-            m_name = st.text_input("Product / Service", key=f"{key_prefix}_m_name")
+            m_name = st.text_input(
+                "Product / Service",
+                value=str((_prod_choice or {}).get("product_name") or ""),
+                key=f"{key_prefix}_m_name",
+            )
         with mc2:
             m_qty  = st.number_input("Qty", min_value=0.0, step=0.5, key=f"{key_prefix}_m_qty")
         with mc3:
-            m_rate = st.number_input("Rate ₹", min_value=0.0, step=0.5, key=f"{key_prefix}_m_rate")
+            m_rate = st.number_input(
+                "Rate ₹",
+                min_value=0.0,
+                value=float((_prod_choice or {}).get("rate") or 0),
+                step=0.5,
+                key=f"{key_prefix}_m_rate",
+            )
         with mc4:
             m_gst  = st.number_input("GST %", min_value=0.0, max_value=28.0,
-                                     value=12.0, step=0.5, key=f"{key_prefix}_m_gst")
-        m_hsn = st.text_input("HSN/SAC Code (optional)", key=f"{key_prefix}_m_hsn")
+                                     value=float((_prod_choice or {}).get("gst_percent") or 5.0),
+                                     step=0.5, key=f"{key_prefix}_m_gst")
+        m_hsn = st.text_input(
+            "HSN/SAC Code (optional)",
+            value=str((_prod_choice or {}).get("hsn_code") or ""),
+            key=f"{key_prefix}_m_hsn",
+        )
+        _m_move_inv = False
+        if key_prefix == "dn":
+            _m_move_inv = st.checkbox(
+                "Physical goods (reduce stock)",
+                value=False,
+                key=f"{key_prefix}_m_move_inv",
+                help="Tick only when this DN line covers extra goods actually shipped.",
+            )
 
         if st.button("Add Line", key=f"{key_prefix}_m_add") and m_name and m_qty > 0:
             lines.append({
                 "product_name":   m_name,
                 "hsn_sac_code":   m_hsn,
                 "invoice_line_id": None,
+                "product_id":      (_prod_choice or {}).get("id"),
                 "quantity":       m_qty,
                 "unit_price":     m_rate,
                 "taxable_amount": round(m_qty * m_rate, 2),
                 "gst_percent":    m_gst,
+                "tax_amount":      round(m_qty * m_rate * m_gst / 100, 2),
+                "move_inventory":  _m_move_inv,
             })
             st.success(f"Added: {m_name}")
 

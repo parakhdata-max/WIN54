@@ -16,6 +16,195 @@ def _parse_jsonb(val):
 
 
 
+import streamlit as st
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_orders_summary(limit: int = 100, include_closed: bool = False) -> list:
+    """Fast order list — headers only, no line detail. Used by backoffice list view.
+
+    Adds two roll-up fields per order so cards can show the right number even
+    when older retail orders saved order_lines.total_price as the gross
+    (pre-discount) value:
+
+      total_discount  — SUM(order_lines.discount_amount)
+      net_total_value — total_value adjusted for discount when total_value
+                        looks like the gross sum (sum of unit_price*qty)
+
+    The heuristic compares orders.total_value against
+    sum(unit_price * quantity) — the TRUE gross — rather than against
+    sum(total_price). This way the heuristic stays correct after retail
+    punching is fixed to write net into total_price (otherwise total_value
+    and sum(total_price) become equal for both gross-era and net-era rows
+    and the comparison loses signal).
+    """
+    from modules.core.system_observer import perf_step
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        with perf_step(f"Backoffice summary list ({limit})", category="loader", detail=f"include_closed={include_closed}"):
+            closed_filter = ""
+            if not include_closed:
+                closed_filter = """
+                    AND UPPER(COALESCE(o.status, '')) NOT IN (
+                        'DELIVERED', 'CLOSED', 'CANCELLED', 'RETURNED'
+                    )
+                """
+
+            # Try with discount_amount aggregation; fall back if column not yet added
+            try:
+                cur.execute(f"""
+                SELECT
+                    o.id::text AS order_id,
+                    o.id::text AS id,
+                    o.order_no,
+                    COALESCE(o.patient_name, o.party_name, '\u2014') AS patient_name,
+                    COALESCE(o.party_name, '')     AS party_name,
+                    COALESCE(o.status, 'PENDING') AS status,
+                    o.created_at,
+                    COALESCE(o.total_value, 0)    AS total_value,
+                    COALESCE(o.order_type, 'RETAIL') AS order_type,
+                    COALESCE(o.patient_mobile, '') AS patient_mobile,
+                    COALESCE(o.party_id::text, '') AS party_id,
+                    COALESCE(o.customer_order_no, '') AS customer_order_no,
+                    COUNT(ol.id) AS line_count,
+                    COALESCE(SUM(COALESCE(ol.discount_amount, 0)), 0) AS total_discount,
+                    COALESCE(SUM(COALESCE(ol.unit_price, 0)
+                                 * COALESCE(ol.quantity, 0)), 0)     AS lines_gross_calc
+                FROM orders o
+                LEFT JOIN order_lines ol
+                  ON ol.order_id = o.id AND COALESCE(ol.is_deleted, FALSE) = FALSE
+                WHERE COALESCE(o.is_deleted, FALSE) = FALSE
+                  AND UPPER(COALESCE(o.order_type, '')) != 'CONSULTATION'
+                {closed_filter}
+                GROUP BY o.id, o.order_no, o.patient_name, o.party_name,
+                         o.status, o.created_at, o.total_value, o.order_type,
+                         o.patient_mobile, o.party_id, o.customer_order_no
+                ORDER BY o.created_at DESC
+                LIMIT %(lim)s
+            """, {"lim": limit})
+            except Exception:
+                conn.rollback()
+                cur.execute(f"""
+                SELECT
+                    o.id::text AS order_id,
+                    o.id::text AS id,
+                    o.order_no,
+                    COALESCE(o.patient_name, o.party_name, '\u2014') AS patient_name,
+                    COALESCE(o.party_name, '')     AS party_name,
+                    COALESCE(o.status, 'PENDING') AS status,
+                    o.created_at,
+                    COALESCE(o.total_value, 0)    AS total_value,
+                    COALESCE(o.order_type, 'RETAIL') AS order_type,
+                    COALESCE(o.patient_mobile, '') AS patient_mobile,
+                    COALESCE(o.party_id::text, '') AS party_id,
+                    COALESCE(o.customer_order_no, '') AS customer_order_no,
+                    COUNT(ol.id) AS line_count,
+                    0::numeric AS total_discount,
+                    0::numeric AS lines_gross_calc
+                FROM orders o
+                LEFT JOIN order_lines ol
+                  ON ol.order_id = o.id AND COALESCE(ol.is_deleted, FALSE) = FALSE
+                WHERE COALESCE(o.is_deleted, FALSE) = FALSE
+                  AND UPPER(COALESCE(o.order_type, '')) != 'CONSULTATION'
+                {closed_filter}
+                GROUP BY o.id, o.order_no, o.patient_name, o.party_name,
+                         o.status, o.created_at, o.total_value, o.order_type,
+                         o.patient_mobile, o.party_id, o.customer_order_no
+                ORDER BY o.created_at DESC
+                LIMIT %(lim)s
+            """, {"lim": limit})
+
+            cols = [d[0] for d in cur.description]
+            out = []
+            for row in cur.fetchall():
+                rec = dict(zip(cols, row))
+
+                # Defensive net total. We compare orders.total_value to
+                # sum(unit_price * quantity) — the TRUE pre-discount gross.
+                #   - total_value ≈ gross AND discount > 0 → legacy gross row,
+                #     subtract discount to get net.
+                #   - total_value < gross by ≈ discount      → already net,
+                #     leave alone.
+                # The previous comparison (against sum(total_price)) failed
+                # once retail started writing net into total_price, because
+                # then both gross-era and net-era rows had total_value ==
+                # sum(total_price) and the test couldn't distinguish them.
+                try:
+                    _tv   = float(rec.get("total_value") or 0)
+                    _disc = float(rec.get("total_discount") or 0)
+                    _gc   = float(rec.get("lines_gross_calc") or 0)
+                    if _disc > 0 and _gc > 0 and abs(_tv - _gc) < 1.0:
+                        # total_value looks gross — subtract discount
+                        rec["net_total_value"] = round(_tv - _disc, 2)
+                    else:
+                        # total_value already reflects net (or no discount)
+                        rec["net_total_value"] = round(_tv, 2)
+                except Exception:
+                    rec["net_total_value"] = float(rec.get("total_value") or 0)
+
+                rec.setdefault("lines", [])
+                rec["_summary_only"] = True
+                out.append(rec)
+            return out
+    except Exception as _e:
+        import logging; logging.warning(f"[BO] load_orders_summary: {_e}")
+        return []
+    finally:
+        cur.close()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_single_order(order_id: str):
+    """
+    Load FULL detail for ONE order (header + lines + product join).
+    Called lazily when a user opens an order card.
+    Cache TTL=15s so changes reflect quickly.
+    Returns a fully hydrated order dict matching the existing bo_active_orders format,
+    so render_order_detail() and all downstream functions work unchanged.
+    """
+    from modules.core.system_observer import perf_step
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        with perf_step("Backoffice resolve single order", category="loader", detail=str(order_id or "")[:80]):
+            order_ref = str(order_id or "").strip()
+            if not order_ref:
+                return None
+
+            import uuid as _uuid
+            try:
+                _uuid.UUID(order_ref)
+                cur.execute(
+                    "SELECT order_no FROM orders WHERE id=%s::uuid LIMIT 1",
+                    (order_ref,)
+                )
+            except Exception:
+                conn.rollback()
+                cur.execute(
+                    "SELECT order_no FROM orders WHERE order_no=%s LIMIT 1",
+                    (order_ref,)
+                )
+            row = cur.fetchone()
+            if not row:
+                return None
+            order_no = row[0]
+    finally:
+        cur.close()
+
+    # Load only this order. The older path hydrated every recent order and then
+    # filtered in Python, which made Backoffice detail/billing jumps feel slow.
+    try:
+        from modules.backoffice.backoffice_helpers import load_orders_from_database as _load_full_order
+        with perf_step("Backoffice hydrate single order", category="loader", detail=str(order_no)):
+            rows = _load_full_order(limit=1, include_closed=True, order_no=order_no) or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def load_orders_from_database():
     """
     Load orders + lines from DB, mapping real column names to UI field names.
@@ -53,10 +242,16 @@ def load_orders_from_database():
             cur.execute("""
                 SELECT
                     id, order_no, patient_name, status, created_at,
-                    party_name, party_id, order_type, total_value,
+                    party_name, party_id,
+                    COALESCE(order_type, 'RETAIL') AS order_type,
+                    total_value,
                     patient_mobile, customer_order_no,
-                    COALESCE(order_source, order_type) AS order_source
-                FROM orders WHERE COALESCE(is_deleted,FALSE)=FALSE ORDER BY created_at DESC LIMIT 50
+                    COALESCE(order_source, order_type, 'RETAIL') AS order_source,
+                    COALESCE(extra_data, '{}'::jsonb) AS extra_data
+                FROM orders
+                WHERE COALESCE(is_deleted,FALSE)=FALSE
+                  AND UPPER(COALESCE(order_type, '')) != 'CONSULTATION'
+                ORDER BY created_at DESC LIMIT 50
             """)
             _has_order_source = True
         except Exception:
@@ -64,9 +259,15 @@ def load_orders_from_database():
             cur.execute("""
                 SELECT
                     id, order_no, patient_name, status, created_at,
-                    party_name, party_id, order_type, total_value,
-                    patient_mobile, customer_order_no
-                FROM orders WHERE COALESCE(is_deleted,FALSE)=FALSE ORDER BY created_at DESC LIMIT 50
+                    party_name, party_id,
+                    COALESCE(order_type, 'RETAIL') AS order_type,
+                    total_value,
+                    patient_mobile, customer_order_no,
+                    '{}'::jsonb AS extra_data
+                FROM orders
+                WHERE COALESCE(is_deleted,FALSE)=FALSE
+                  AND UPPER(COALESCE(order_type, '')) != 'CONSULTATION'
+                ORDER BY created_at DESC LIMIT 50
             """)
             _has_order_source = False
 
@@ -80,11 +281,12 @@ def load_orders_from_database():
                 "created_at":        row[4],
                 "party_name":        row[5] or "",
                 "party_id":          str(row[6]) if row[6] else None,
-                "order_type":        row[7],
+                "order_type":        row[7] or "RETAIL",  # COALESCE in query, but belt+suspenders
                 "total_value":       float(row[8] or 0),
                 "patient_mobile":    row[9] or "",
                 "customer_order_no": row[10] or "",
                 "order_source":      (row[11] if _has_order_source else row[7]) or "unknown",
+                "extra_data":        _parse_jsonb(row[12] if _has_order_source else row[11]),
                 "stock_lines":       [],
                 "inhouse_lines":     [],
                 "lab_order_lines":   [],
@@ -179,7 +381,8 @@ def load_orders_from_database():
                 COALESCE(ol.gst_amount, 0)        AS gst_amount,         -- 30
                 COALESCE(ol.discount_percent, 0)  AS discount_percent,   -- 31
                 COALESCE(ol.discount_amount, 0)   AS discount_amount,    -- 32
-                COALESCE(ol.is_service_line, FALSE) AS is_service_line   -- 33
+                COALESCE(ol.is_service_line, FALSE) AS is_service_line,  -- 33
+                ol.production_ref                                      -- 34
             FROM order_lines ol
             LEFT JOIN products p ON p.id = ol.product_id
             WHERE ol.order_id = ANY(%s::uuid[])
@@ -244,6 +447,7 @@ def load_orders_from_database():
                 "line_id":             str(row[0]),
                 "order_id":            str(row[1]),
                 "product_id":          str(row[21]) if row[21] else None,
+                "production_ref":      str(row[34] or "") if len(row) > 34 else "",
 
                 # Product master fields (hydrated via JOIN)
                 "product_name":        row[2] or "Unknown Product",
@@ -346,14 +550,89 @@ def load_orders_from_database():
             _is_svc  = bool(line.get("is_service_line"))  # already set in line dict above
             _route   = manufacturing_route or ""
 
+            # Frames are NEVER production items — route them to stock/procurement
+            # regardless of manufacturing_route value. Only ophthalmic prescription
+            # lenses (eye_side R/L with sph values) go to inhouse_lines.
+            _is_frame = (
+                "frame" in str(line.get("main_group") or "").lower()
+                or "sunglass" in str(line.get("main_group") or "").lower()
+                or (str(line.get("eye_side") or "").upper() in ("B","OTHER","X","")
+                    and not line.get("sph")
+                    and str(line.get("main_group") or "").lower() not in ("ophthalmic",""))
+            )
+            _is_rx_lens = (
+                str(line.get("eye_side") or "").upper() in ("R","L","RIGHT","LEFT")
+                and line.get("sph") is not None
+                and not _is_frame
+            )
+
             if _is_svc:
                 order.setdefault("service_lines", []).append(line)
+            elif _is_frame:
+                # Frame/stock item — goes to stock regardless of route
+                order["stock_lines"].append(line)
             elif _route == "STOCK":
                 order["stock_lines"].append(line)
-            elif _route == "INHOUSE":
+            elif _route == "INHOUSE" and _is_rx_lens:
                 order["inhouse_lines"].append(line)
+            elif _route == "INHOUSE" and not _is_rx_lens:
+                # Non-lens marked as INHOUSE (shouldn't happen but guard it)
+                order["stock_lines"].append(line)
             else:
                 order["lab_order_lines"].append(line)
+
+        # ────────────────────────────────────────────────────────────────
+        # POST-LOAD: defensive net rollup
+        # ────────────────────────────────────────────────────────────────
+        # Some retail orders saved order_lines.total_price as GROSS
+        # (pre-discount) — the punching INSERT uses ln.get("total_price")
+        # which discount_engine never restamped. Wholesale uses
+        # restamp_line_totals so total_price is already net there.
+        #
+        # Heuristic: if discount_amount > 0 AND billing_total ≈ unit_price*qty
+        # (i.e. it looks gross), subtract discount_amount to make it net.
+        # This is idempotent on already-net rows because for those
+        # billing_total < unit_price*qty by exactly the discount, so the
+        # heuristic does not fire.
+        #
+        # Result: billing_total throughout backoffice is the actual
+        # post-discount line total, and order["total_value"] reflects what
+        # the customer pays. order["total_discount"] carries the rolled-up
+        # discount for display.
+        for _o in orders.values():
+            try:
+                from modules.backoffice.backoffice_helpers import auto_heal_zero_priced_sibling_lines
+                auto_heal_zero_priced_sibling_lines(_o, persist=True)
+            except Exception:
+                pass
+            _disc_total = 0.0
+            _net_total  = 0.0
+            for _ln in _o.get("lines", []):
+                _bt   = float(_ln.get("billing_total") or 0)
+                _up   = float(_ln.get("unit_price") or 0)
+                _q    = int(_ln.get("billing_qty") or 0)
+                _da   = float(_ln.get("discount_amount") or 0)
+                _gross_calc = round(_up * _q, 2)
+                # Defensive net adjustment for legacy gross rows
+                if _da > 0 and _gross_calc > 0 and abs(_bt - _gross_calc) < 0.5:
+                    _bt_net = round(_bt - _da, 2)
+                    if _bt_net < 0:
+                        _bt_net = 0.0
+                    _ln["billing_total_gross"] = _bt
+                    _ln["billing_total"]       = _bt_net
+                    _bt = _bt_net
+                _disc_total += _da
+                _net_total  += _bt
+            _o["total_discount"]   = round(_disc_total, 2)
+            _o["total_value_net"]  = round(_net_total, 2)
+            # Override total_value with the net so backoffice cards/headers
+            # show the actual payable amount. The original gross is kept
+            # under total_value_gross for any caller that needs it.
+            try:
+                _o["total_value_gross"] = float(_o.get("total_value") or 0)
+            except Exception:
+                _o["total_value_gross"] = 0.0
+            _o["total_value"] = round(_net_total, 2) if _net_total > 0 else _o.get("total_value", 0)
 
         return list(orders.values())
 

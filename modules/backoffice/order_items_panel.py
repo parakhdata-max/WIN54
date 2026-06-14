@@ -299,6 +299,33 @@ def product_change_dialog(ctx: BackofficeContext) -> None:
     modal = ctx.session.get("bo_product_change_modal", {})
     if not modal.get("active", False):
         return
+    st.markdown(
+        """
+<style>
+div[role="dialog"] {
+    max-height: 94vh !important;
+}
+div[role="dialog"] > div {
+    max-height: 90vh !important;
+    overflow-y: auto !important;
+    padding-bottom: 1rem !important;
+}
+div[role="dialog"] [data-testid="stHorizontalBlock"] {
+    gap: 0.55rem !important;
+}
+div[role="dialog"] [data-testid="stVerticalBlock"] {
+    gap: 0.35rem !important;
+}
+div[role="dialog"] [data-baseweb="popover"] [role="listbox"],
+div[role="dialog"] [data-baseweb="menu"],
+div[role="dialog"] ul[role="listbox"] {
+    max-height: 46vh !important;
+    overflow-y: auto !important;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     line      = modal["line"]
     idx       = modal["idx"]
@@ -764,6 +791,52 @@ def _render_billing_summary_table(ctx: BackofficeContext) -> None:
               delta=f"+₹{_svc_total:,.2f} services" if _svc_total > 0 else None,
               delta_color="normal")
 
+    if total_disc > 0 or any(
+        str((l.get("lens_params") or {}).get("discount_status") if isinstance(l.get("lens_params"), dict) else "").upper() == "CANCELLED"
+        for l in all_lines
+    ):
+        try:
+            from modules.pricing.discount_flow import discount_summary
+            _disc_sum = discount_summary(all_lines)
+        except Exception:
+            _disc_sum = {"gross": 0.0, "discount": total_disc, "net": total_billing, "cancelled": False}
+
+        with st.expander("🏷️ Discount Control", expanded=False):
+            if _disc_sum.get("cancelled"):
+                st.warning("Discount is cancelled for this order. Challan/invoice will use non-discounted totals.")
+            else:
+                st.success(f"Discount continuing: ₹{float(_disc_sum.get('discount') or 0):,.2f}")
+            dc1, dc2, dc3 = st.columns(3)
+            dc1.metric("Gross", f"₹{float(_disc_sum.get('gross') or 0):,.2f}")
+            dc2.metric("Discount", f"₹{float(_disc_sum.get('discount') or 0):,.2f}")
+            dc3.metric("Net", f"₹{float(_disc_sum.get('net') or 0):,.2f}")
+
+            order_status = str(ctx.order.get("status") or "").upper()
+            billing_locked = order_status in ("BILLED", "DISPATCHED", "DELIVERED", "CLOSED", "CANCELLED")
+            if billing_locked:
+                st.caption("Discount cannot be changed after billing/cancellation.")
+            else:
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button("✅ Continue Discount", key=f"disc_continue_{order_id}", use_container_width=True):
+                        try:
+                            from modules.pricing.discount_flow import reinstate_order_discount
+                            reinstate_order_discount(order_id)
+                            st.success("Discount reinstated.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not reinstate discount: {e}")
+                with b2:
+                    if st.button("🚫 Cancel Discount", key=f"disc_cancel_{order_id}", use_container_width=True):
+                        try:
+                            from modules.pricing.discount_flow import cancel_order_discount
+                            _user = st.session_state.get("user_name", "Backoffice")
+                            cancel_order_discount(order_id, user=str(_user))
+                            st.success("Discount cancelled for billing.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not cancel discount: {e}")
+
     st.markdown("---")
 
     def _eye_table(lines: List[Dict], label: str, subtotal: float) -> None:
@@ -866,7 +939,36 @@ def _render_gst_verification(ctx: BackofficeContext) -> None:
 
 
 def _apply_product_change(line: Dict, product_row, eye_label: str, idx: int, order: Dict, ctx: BackofficeContext) -> None:
-    """Apply a product change to a line dict."""
+    """Apply a product change to a line dict AND persist it to the database.
+
+    Per handover doc: product_change_dialog() writes UPDATE order_lines SET
+    product_id, lens_params to DB and clears load_single_order.clear() after.
+
+    This was the missing wiring — earlier versions only mutated the in-memory
+    dict, so re-opening the order from the dashboard loaded the old product
+    back from DB.
+
+    Pricing & discount re-evaluation
+    --------------------------------
+    When the product changes, the *previous* product's discount no longer
+    applies. The new product may be eligible for a different rule entirely
+    — for example, a wholesale party with a 10% rule on Ultra View brand
+    plus a special-price rule on a specific SKU. Both cases are handled by
+    a single apply_order_discounts() call (the engine evaluates all rule
+    types: PERCENT, SPECIAL_PRICE, FIXED, BOGO, slabs).
+
+    Flow:
+      1. Mutate product fields in memory.
+      2. Resolve fresh unit_price + gst_percent for the NEW product from
+         inventory_stock + products (order-type aware: wholesale uses
+         selling_price, retail uses mrp).
+      3. Resolve party_id (some orders only carry party_name).
+      4. apply_order_discounts() — stamps discount_percent / discount_amount
+         per rules AND calls restamp_line_totals which writes net into
+         total_price, billing_total, gst_amount.
+      5. Persist the full new state to DB (not just product_id).
+    """
+    # ── 1. In-memory mutation (existing behaviour, kept) ──────────────────
     line["product_id"]   = str(product_row["product_id"])
     line["product_name"] = str(product_row["product_name"])
     line["brand"]        = str(product_row.get("brand", ""))
@@ -886,6 +988,13 @@ def _apply_product_change(line: Dict, product_row, eye_label: str, idx: int, ord
     line["batch_status"]        = "PENDING"
     line["manufacturing_route"] = None
     line["supplier_order_id"]   = None
+    # Clear stale rule attribution from the OLD product
+    line["discount_percent"]    = 0.0
+    line["discount_amount"]     = 0.0
+    line["discount_rule"]       = ""
+    line["applied_rule_ids"]    = ""
+    line.pop("discount_breakdown", None)
+    line.pop("scheme_info", None)
     temp_key = f"temp_alloc_{eye_label}_{idx}"
     if temp_key in ctx.session:
         del ctx.session[temp_key]
@@ -896,6 +1005,362 @@ def _apply_product_change(line: Dict, product_row, eye_label: str, idx: int, ord
         "new_product": product_row["product_name"],
         "changed_by":  ctx.user.get("name", "backoffice_user"),
     })
+
+    # ── 2. Resolve fresh unit_price + GST for the NEW product ────────────
+    _reprice_line_for_new_product(line, product_row, order)
+
+    # ── 3. Re-evaluate discount rules for the NEW product/brand ──────────
+    _reapply_discount_rules(line, order)
+
     refresh_line_state(line)
     ctx.session["current_order"] = order
     recalculate_order_totals(order)
+
+    # ── 4. PERSIST to DB ──────────────────────────────────────────────────
+    # This is the contract from the handover doc — without it, product change
+    # is invisible after page reload.
+    _persist_product_change(line, order, ctx)
+
+
+def _reprice_line_for_new_product(line: Dict, product_row, order: Dict) -> None:
+    """Resolve unit_price + gst_percent for the new product.
+
+    Wholesale → inventory_stock.selling_price (trade price)
+    Retail    → inventory_stock.mrp (counter price, GST-inclusive)
+    Falls back to products.gst_percent if inventory has none.
+
+    Soft-fail: if the lookup throws or returns no rows, leaves unit_price
+    at 0 and lets allocation/pricing engine pick it up later. Discount
+    re-eval will then stamp 0 because gross is 0 — safer than over-stamping.
+    """
+    try:
+        from modules.sql_adapter import run_query as _rq
+        _pid = str(line.get("product_id") or "").strip()
+        if not _pid:
+            return
+
+        _ot = str(order.get("order_type") or "RETAIL").upper()
+        _rows = _rq("""
+            SELECT
+                COALESCE(p.gst_percent, 0)         AS gst_percent,
+                COALESCE(MAX(i.selling_price), 0)  AS selling_price,
+                COALESCE(MAX(i.mrp), 0)            AS mrp,
+                COALESCE(MAX(i.purchase_rate), 0)  AS purchase_rate
+            FROM products p
+            LEFT JOIN inventory_stock i
+                   ON i.product_id = p.id
+                  AND COALESCE(i.is_active, TRUE) = TRUE
+            WHERE p.id = %s::uuid
+            GROUP BY p.gst_percent
+            LIMIT 1
+        """, (_pid,)) or []
+
+        if not _rows:
+            return
+
+        _r = _rows[0]
+        _gst    = float(_r.get("gst_percent") or 0)
+        _sp     = float(_r.get("selling_price") or 0)
+        _mrp    = float(_r.get("mrp") or 0)
+
+        # Order-type-aware price pick (mirrors resolve_price_for_order_type)
+        if _ot == "RETAIL":
+            _price = _mrp or _sp
+        else:  # WHOLESALE / COUNTER_SALE / etc
+            _price = _sp or _mrp
+
+        # Normalise BOX → PCS if product is a BOX SKU
+        try:
+            from modules.core.price_qty_governor import normalize_to_pcs_price
+            _price = normalize_to_pcs_price(_price, line) if _price > 0 else 0.0
+        except Exception:
+            pass
+
+        line["gst_percent"] = _gst
+        line["unit_price"]  = float(_price or 0)
+
+        # Set a gross baseline; restamp will overwrite once discount is known
+        _qty = int(line.get("billing_qty") or line.get("quantity") or 1)
+        line["total_price"]   = round(line["unit_price"] * _qty, 2)
+        line["billing_total"] = line["total_price"]
+
+    except Exception as _e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[product_change.reprice] price lookup failed for product "
+            f"{line.get('product_id')}: {_e}"
+        )
+
+
+def _reapply_discount_rules(line: Dict, order: Dict) -> None:
+    """Run apply_order_discounts on the single mutated line.
+
+    Resolves party_id (orders may only carry party_name) and order_type,
+    then delegates to discount_flow.apply_order_discounts which stamps
+    discount_percent / discount_amount AND calls restamp_line_totals
+    (writes net into total_price / billing_total / gst_amount).
+
+    Soft-fail: any exception leaves the line at gross — operator can edit
+    manually from the Edit tab if needed.
+    """
+    try:
+        from modules.pricing.discount_flow import apply_order_discounts
+
+        _ot = str(order.get("order_type") or "RETAIL").upper()
+        _pid = str(order.get("party_id") or "").strip()
+
+        # Resolve party_id from name if missing (wholesale UI sometimes only
+        # passes party_name into the order dict — same fallback used by
+        # order_pipeline.py)
+        if not _pid:
+            _pname = str(order.get("party_name") or order.get("party") or "").strip()
+            if _pname:
+                try:
+                    from modules.sql_adapter import run_query as _rq
+                    _rows = _rq(
+                        "SELECT id::text AS id FROM parties "
+                        "WHERE party_name = %s "
+                        "AND COALESCE(is_active, TRUE) = TRUE LIMIT 1",
+                        (_pname,)
+                    ) or []
+                    if _rows:
+                        _pid = str(_rows[0].get("id") or "")
+                except Exception:
+                    pass
+
+        # Make sure brand is on the line (engine matches on it)
+        if not str(line.get("brand") or "").strip():
+            return
+
+        apply_order_discounts([line], party_id=_pid, order_type=_ot)
+    except Exception as _e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[product_change.discount] re-eval failed for product "
+            f"{line.get('product_id')}: {_e}"
+        )
+
+
+def _persist_product_change(line: Dict, order: Dict, ctx: BackofficeContext) -> None:
+    """Write product change to order_lines and bust loader caches.
+
+    Persists the FULL re-evaluated state — product_id, lens_params, AND
+    the freshly-computed pricing + discount fields. Earlier this zeroed
+    out unit_price/total_price/discount and let downstream recompute, but
+    that loses the discount-rule re-evaluation done in
+    _reapply_discount_rules. Now we trust the in-memory line.
+
+    Soft-fail: any DB error surfaces a Streamlit warning but does not raise,
+    so the in-memory state stays consistent with what the user sees.
+    """
+    line_id = str(line.get("line_id") or line.get("id") or "").strip()
+    if not line_id or len(line_id) < 10:
+        st.warning(" Product changed on screen but line has no DB id  skipping persist.")
+        return
+
+    try:
+        import json as _json
+        from modules.sql_adapter import run_write as _rw, run_query as _rq
+
+        # Fetch current lens_params so we don't blow away unrelated keys
+        _row = _rq(
+            "SELECT COALESCE(lens_params,'{}')::text AS lp "
+            "FROM order_lines WHERE id=%(lid)s::uuid LIMIT 1",
+            {"lid": line_id}
+        ) or []
+        if _row:
+            try:
+                _lp_db = _json.loads(_row[0].get("lp") or "{}") or {}
+            except Exception:
+                _lp_db = {}
+        else:
+            _lp_db = {}
+
+        # Merge in-memory lens_params (which now reflects new product) over DB copy
+        _lp_mem = line.get("lens_params") or {}
+        if isinstance(_lp_mem, str):
+            try: _lp_mem = _json.loads(_lp_mem) or {}
+            except Exception: _lp_mem = {}
+        _lp_merged = {**_lp_db, **_lp_mem}
+
+        # Reset stale routing/allocation hints in lens_params
+        _lp_merged["manufacturing_route"] = line.get("manufacturing_route")
+        _lp_merged["batch_allocation"]    = []
+        _lp_merged["batch_status"]        = "PENDING"
+        # Drop surfacing_data  the new product may not be a lens at all
+        _lp_merged.pop("surfacing_data", None)
+        # Discount status reflects the freshly applied rule
+        _disc_amt_new = float(line.get("discount_amount") or 0)
+        if _disc_amt_new > 0:
+            _lp_merged["discount_status"] = "APPLIED"
+        else:
+            _lp_merged.pop("discount_status", None)
+
+        # Pricing + discount values from the in-memory line (post re-eval).
+        # These come from _reprice_line_for_new_product +
+        # _reapply_discount_rules: total_price/billing_total are NET,
+        # gst_amount is recomputed on net.
+        _unit_price = float(line.get("unit_price") or 0)
+        _gst_pct    = float(line.get("gst_percent") or 0)
+        _gst_amt    = float(line.get("gst_amount") or 0)
+        _disc_pct   = float(line.get("discount_percent") or 0)
+        _disc_amt   = float(line.get("discount_amount") or 0)
+        _net_total  = float(line.get("billing_total") or line.get("total_price") or 0)
+        _disc_rule  = str(line.get("discount_rule") or "")
+        _applied_rule_ids = str(line.get("applied_rule_ids") or "")
+
+        # Try the full UPDATE first; if billing_total column is absent on
+        # this DB schema, fall back to the version without it.
+        _params = {
+            "pid":  str(line["product_id"]),
+            "lp":   _json.dumps(_lp_merged),
+            "up":   _unit_price,
+            "tp":   _net_total,
+            "gp":   _gst_pct,
+            "ga":   _gst_amt,
+            "dp":   _disc_pct,
+            "da":   _disc_amt,
+            "dr":   _disc_rule,
+            "ari":  _applied_rule_ids,
+            "lid":  line_id,
+        }
+        try:
+            _rw("""
+                UPDATE order_lines
+                SET product_id        = %(pid)s::uuid,
+                    lens_params       = %(lp)s::jsonb,
+                    unit_price        = %(up)s,
+                    total_price       = %(tp)s,
+                    billing_total     = %(tp)s,
+                    gst_percent       = %(gp)s,
+                    gst_amount        = %(ga)s,
+                    discount_percent  = %(dp)s,
+                    discount_amount   = %(da)s,
+                    discount_rule     = %(dr)s,
+                    applied_rule_ids  = %(ari)s,
+                    allocated_qty     = 0,
+                    batch_status      = 'PENDING',
+                    suggested_allocation = NULL
+                WHERE id = %(lid)s::uuid
+            """, _params)
+        except Exception:
+            # billing_total column missing on this schema  retry without it
+            _rw("""
+                UPDATE order_lines
+                SET product_id        = %(pid)s::uuid,
+                    lens_params       = %(lp)s::jsonb,
+                    unit_price        = %(up)s,
+                    total_price       = %(tp)s,
+                    gst_percent       = %(gp)s,
+                    gst_amount        = %(ga)s,
+                    discount_percent  = %(dp)s,
+                    discount_amount   = %(da)s,
+                    discount_rule     = %(dr)s,
+                    applied_rule_ids  = %(ari)s,
+                    allocated_qty     = 0,
+                    batch_status      = 'PENDING',
+                    suggested_allocation = NULL
+                WHERE id = %(lid)s::uuid
+            """, _params)
+
+        # Product edits can change which supplier/customer/cart schemes apply
+        # to this order. Re-run the full pricing stack and persist sibling
+        # lines too, so backoffice, challan and invoice all read the same net.
+        try:
+            from modules.backoffice.backoffice_helpers import refresh_order_pricing_rules
+            refresh_order_pricing_rules(order, persist=True)
+        except Exception as _sync_e:
+            logging.getLogger(__name__).warning(
+                "[product_change.pricing_sync] failed: %s", _sync_e
+            )
+
+        # ── Roll up orders.total_value to keep header in sync ──────────
+        _refresh_order_total_value_in_db(line, order)
+
+        # ── Bust loader caches so dashboard + reopen show new product ──
+        _clear_order_loader_caches()
+
+    except Exception as _e:
+        import logging, traceback
+        logging.getLogger(__name__).warning(
+            "[product_change] DB write failed: " + str(_e) + "\n" + traceback.format_exc()
+        )
+        st.warning(f" Product changed on screen but DB write failed: {_e}")
+
+
+def _refresh_order_total_value_in_db(line: Dict, order: Dict) -> None:
+    """Recompute orders.total_value as SUM(net) of all active lines.
+
+    Called after any line write that changes pricing (product change or
+    power change with discount re-eval). Without this, orders.total_value
+    drifts away from the sum of order_lines.total_price and the
+    backoffice card / accounting reports show stale numbers.
+    """
+    try:
+        from modules.sql_adapter import run_write as _rw, run_query as _rq
+        from decimal import Decimal, ROUND_HALF_UP
+        _oid = str(order.get("order_id") or order.get("id") or "").strip()
+        if not _oid or len(_oid) < 10:
+            return
+        # Sum net from order_lines  same shape the loader heuristic uses,
+        # but here at write time so DB stays consistent
+        _rows = _rq("""
+            SELECT
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(ol.discount_amount, 0) > 0
+                         AND ABS(COALESCE(ol.total_price, 0)
+                                 - COALESCE(ol.unit_price, 0)
+                                 * COALESCE(ol.quantity, 0)) < 0.5
+                        THEN COALESCE(ol.total_price, 0)
+                             - COALESCE(ol.discount_amount, 0)
+                        ELSE COALESCE(ol.total_price, 0)
+                    END
+                ), 0) AS net_total
+            FROM order_lines ol
+            WHERE ol.order_id = %(oid)s::uuid
+              AND COALESCE(ol.is_deleted, FALSE) = FALSE
+        """, {"oid": _oid}) or []
+        if _rows:
+            _net = float(_rows[0].get("net_total") or 0)
+            if str(order.get("order_type") or "").upper() == "RETAIL":
+                _net = float(Decimal(str(_net)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+            _rw(
+                "UPDATE orders SET total_value = %(tv)s, updated_at = NOW() "
+                "WHERE id = %(oid)s::uuid",
+                {"tv": round(_net, 2), "oid": _oid}
+            )
+            # Sync in-memory order so the page render shows the same
+            try:
+                order["total_value"] = round(_net, 2)
+            except Exception:
+                pass
+    except Exception as _e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[product_change.header_rollup] failed: {_e}"
+        )
+
+
+def _clear_order_loader_caches() -> None:
+    """Clear @st.cache_data on order_loader functions after any DB write.
+
+    Per handover doc: 'Cache invalidation after DB write: call
+    load_single_order.clear() + load_orders_from_database.clear() + set
+    bo_orders_loaded=False.'
+    """
+    try:
+        from . import order_loader as _ol
+        for _fn_name in ("load_single_order", "load_orders_from_database", "load_orders_summary"):
+            _fn = getattr(_ol, _fn_name, None)
+            if _fn is not None and hasattr(_fn, "clear"):
+                try:
+                    _fn.clear()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        st.session_state["bo_orders_loaded"] = False
+    except Exception:
+        pass

@@ -5,7 +5,7 @@ HTML print templates for all DV Optical documents.
 All return HTML strings that trigger window.print() via Streamlit components.
 
 Templates:
-  job_card_label()       — 75×65mm TSPL lens envelope label (R/L)
+  job_card_label()       — 75×50mm TSPL lens envelope label (R/L)
   retail_invoice()       — A4 tax invoice with RX + items
   challan()              — A4 delivery challan
   clinical_slip()        — A5 prescription slip
@@ -15,6 +15,12 @@ Templates:
 """
 
 from typing import Optional
+
+from modules.printing.internal_print_config import (
+    TSC_LABEL_H_MM,
+    TSC_LABEL_W_MM,
+    css_size,
+)
 
 
 # ── Shop config helper ─────────────────────────────────────────────────────────
@@ -80,13 +86,21 @@ def _base_css() -> str:
 
 
 def _barcode_html(value: str, size: int = 36) -> str:
-    """Render barcode using Google Fonts Libre Barcode 128."""
-    return (
-        f'<link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+128&display=swap" rel="stylesheet">'
-        f'<div style="font-family:\'Libre Barcode 128\',monospace;font-size:{size}px;'
-        f'letter-spacing:-2px;line-height:1;color:#111">{value}</div>'
-        f'<div style="font-size:9px;color:#475569;font-family:monospace;letter-spacing:.1em;margin-top:2px">{value}</div>'
-    )
+    """Real scannable Code128 SVG via patient_card_printer."""
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    try:
+        from modules.printing.patient_card_printer import barcode_svg as _bsvg
+        return _bsvg(value, width=int(size * 4.5), height=int(size * 1.5))
+    except Exception:
+        # Fallback: Libre Barcode 128 font (requires Google Fonts / internet)
+        return (
+            f'<link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+128&display=swap" rel="stylesheet">'
+            f'<div style="font-family:\'Libre Barcode 128\',monospace;font-size:{size}px;'
+            f'letter-spacing:-2px;line-height:1;color:#111">{value}</div>'
+            f'<div style="font-size:9px;color:#475569;font-family:monospace;letter-spacing:.1em;margin-top:2px">{value}</div>'
+        )
 
 
 def _print_trigger() -> str:
@@ -94,7 +108,7 @@ def _print_trigger() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. JOB CARD LABEL — 75×65mm TSPL (R and L)
+# 1. JOB CARD LABEL — 75×50mm TSPL (R and L)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def job_card_label_tspl(
@@ -106,7 +120,7 @@ def job_card_label_tspl(
     party_barcode: str = "",
 ) -> str:
     """
-    Build TSPL command for 75×65mm lens envelope label.
+    Build TSPL command for 75×50mm lens envelope label.
     eye: 'R' or 'L'
     Returns TSPL string ready to send to printer.
     """
@@ -118,9 +132,9 @@ def job_card_label_tspl(
         RIGHT_PAD_MM, ROW_GAP_DOTS, FOLD_MM, BAR_MODULE_MIN
     )
 
-    # 75×65mm label config (overrides the 80×14 MRP sticker config)
-    W_MM  = 75
-    H_MM  = 65
+    # 75×50mm production/customer label config.
+    W_MM  = TSC_LABEL_W_MM
+    H_MM  = TSC_LABEL_H_MM
     GAP   = 2
 
     eye_u   = (eye or "").strip().upper()[0:1] or "R"
@@ -135,7 +149,7 @@ def job_card_label_tspl(
         except:
             return str(v or "—")
 
-    # TSPL for 75×65mm
+    # TSPL for 75×50mm
     # Left half: barcode + order info
     # Right half: RX table + product
     # Uses TEXT commands with coordinate layout
@@ -163,13 +177,13 @@ def job_card_label_tspl(
         f"TEXT {left_x},36,\"1\",0,1,1,\"{patient[:22]}\"\n"
         f"TEXT {left_x},46,\"1\",0,1,1,\"{date[:10]}\"\n"
         # Barcode
-        f"BARCODE {left_x},{mm(23)},\"128\",{mm(12)},1,0,2,2,\"{bc_val}\"\n"
+        f"BARCODE {left_x},{mm(20)},\"128\",{mm(10)},1,0,2,2,\"{bc_val}\"\n"
         # RX
         f"TEXT {right_x},22,\"2\",0,1,1,\"SPH  CYL  AX  ADD\"\n"
         f"TEXT {right_x},36,\"2\",0,1,1,\"{_fmt(sph)} {_fmt(cyl)} {_fmt(axis,0)} {_fmt(add)}\"\n"
         # Product
-        f"TEXT {left_x},{mm(42)},\"1\",0,1,1,\"{product_name[:28]}\"\n"
-        f"TEXT {left_x},{mm(48)},\"1\",0,1,1,\"{brand}  {batch_no}  {location}\"\n"
+        f"TEXT {left_x},{mm(38)},\"1\",0,1,1,\"{product_name[:28]}\"\n"
+        f"TEXT {left_x},{mm(44)},\"1\",0,1,1,\"{brand}  {batch_no}  {location}\"\n"
         f"PRINT 1\n"
     )
     return tspl
@@ -212,7 +226,7 @@ def job_card_label_html(
     .bc{{font-family:'Libre Barcode 128',monospace;font-size:32px;text-align:center;line-height:1;margin:2px 0}}
     .bc-num{{font-size:8px;text-align:center;color:#6b7280;font-family:monospace}}
     .product{{font-size:9px;color:#374151;border-top:0.5px solid #e5e7eb;padding-top:4px}}
-    @media print{{body{{background:#fff;padding:0}}@page{{size:75mm 65mm;margin:0}}}}
+    @media print{{body{{background:#fff;padding:0}}@page{{size:{css_size(TSC_LABEL_W_MM, TSC_LABEL_H_MM)};margin:0}}}}
     </style></head><body>
     <div class="card">
       <div class="eye-hdr">{eye_lbl}</div>
@@ -240,6 +254,141 @@ def job_card_label_html(
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. RETAIL INVOICE
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+
+# ──────────────────────────────────────────────────────────────
+# DISPATCH ADDRESS STICKER — 75×50mm
+# Party name / address / phone / order-challan ref / barcode
+# ──────────────────────────────────────────────────────────────
+
+def dispatch_address_sticker_html(
+    party_name: str = "",
+    address: str = "",
+    phone: str = "",
+    order_no: str = "",
+    doc_ref: str = "",
+    extra_line: str = "",
+) -> str:
+    """
+    HTML address sticker for dispatch — 75×50mm, print-ready.
+    Includes:
+      - Party name (bold, large)
+      - Address block
+      - Phone
+      - Order no + challan/invoice ref
+      - Barcode of order_no
+    """
+    css = """
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Libre+Barcode+128&display=swap');
+      @media print {
+        body { background: #fff; margin: 0; padding: 0; }
+        @page { size: 75mm 50mm; margin: 0; }
+        .no-print { display: none; }
+      }
+      .addr-sticker {
+        width: 75mm; height: 50mm;
+        border: 1px solid #000;
+        padding: 2.5mm 3mm 2mm 3mm;
+        box-sizing: border-box;
+        font-family: Arial, sans-serif;
+        display: flex; flex-direction: column;
+        justify-content: space-between;
+        background: #fff; color: #000;
+        page-break-inside: avoid;
+      }
+      .addr-party { font-size: 10pt; font-weight: 900; line-height: 1.15; }
+      .addr-address { font-size: 7pt; line-height: 1.22; margin-top: 1.4mm; color: #333; }
+      .addr-phone { font-size: 8pt; font-weight: 700; margin-top: .7mm; }
+      .addr-ref { font-size: 6.8pt; color: #444; margin-top: .8mm; border-top: 0.5px solid #ccc; padding-top: .7mm; }
+      .addr-barcode { text-align: center; }
+      .addr-barcode-no { font-size: 7pt; text-align: center; font-family: monospace; color: #555; }
+    </style>
+    """
+    # Format address: split on comma or newline, max 3 lines
+    addr_lines = [a.strip() for a in (address or "").replace("\n", ",").split(",") if a.strip()]
+    addr_html  = "<br/>".join(addr_lines[:4])
+
+    ref_parts = []
+    if order_no: ref_parts.append(f"Order: {order_no}")
+    if doc_ref:  ref_parts.append(doc_ref)
+    if extra_line: ref_parts.append(extra_line)
+    ref_str = "  ·  ".join(ref_parts)
+
+    barcode_val = order_no or doc_ref or ""
+    try:
+        from modules.printing.patient_card_printer import barcode_svg as _bsvg
+        _bc_div = _bsvg(barcode_val, width=160, height=36) if barcode_val else ""
+    except Exception:
+        _bc_div = (
+            f'<link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+128&display=swap" rel="stylesheet">'
+            f'<div style="font-family:\'Libre Barcode 128\',monospace;font-size:23pt;'
+            f'line-height:1;letter-spacing:-1px">{barcode_val}</div>'
+        ) if barcode_val else ""
+
+    html = f"""
+    {css}
+    <div class="addr-sticker">
+      <div>
+        <div class="addr-party">{party_name or "—"}</div>
+        <div class="addr-address">{addr_html or "—"}</div>
+        <div class="addr-phone">📞 {phone or "—"}</div>
+        <div class="addr-ref">{ref_str}</div>
+      </div>
+      <div>
+        <div class="addr-barcode">{_bc_div}</div>
+        <div class="addr-barcode-no">{barcode_val}</div>
+      </div>
+    </div>
+    """
+    return html
+
+
+def dispatch_address_sticker_tspl(
+    party_name: str = "",
+    address: str = "",
+    phone: str = "",
+    order_no: str = "",
+    doc_ref: str = "",
+    extra_line: str = "",
+) -> str:
+    """
+    TSPL command string for 75x50mm thermal address sticker.
+    Compatible with Zebra / TSC / GODEX label printers via label_printer module.
+    """
+    def mm(v):
+        return int(v * 8)  # 8 dots/mm at 203 dpi
+
+    addr_lines = [a.strip() for a in (address or "").replace(chr(10), ",").split(",") if a.strip()]
+    pn  = (party_name or "")[:35].replace('"', "'")
+    ph  = (phone or "")[:20].replace('"', "'")
+    ref = ("Ord:" + order_no + "  " + doc_ref)[:50].replace('"', "'")
+    extra = (extra_line or "")[:50].replace('"', "'")
+    bc  = (order_no or doc_ref or "")[:25].replace('"', "'")
+
+    lines_tspl = [
+        f"SIZE {TSC_LABEL_W_MM} mm, {TSC_LABEL_H_MM} mm",
+        "GAP 3 mm, 0 mm",
+        "DIRECTION 0",
+        "CLS",
+        'TEXT ' + str(mm(3)) + ',' + str(mm(2)) + ',"3",0,1,1,"' + pn + '"',
+    ]
+    y = mm(12)
+    for al in addr_lines[:4]:
+        al_s = al[:42].replace('"', "'")
+        lines_tspl.append('TEXT ' + str(mm(3)) + ',' + str(y) + ',"2",0,1,1,"' + al_s + '"')
+        y += mm(5)
+    lines_tspl.append('TEXT ' + str(mm(3)) + ',' + str(y) + ',"2",0,1,1,"Tel: ' + ph + '"')
+    y += mm(6)
+    if extra:
+        lines_tspl.append('TEXT ' + str(mm(3)) + ',' + str(y) + ',"2",0,1,1,"' + extra + '"')
+        y += mm(5)
+    lines_tspl.append('TEXT ' + str(mm(3)) + ',' + str(y) + ',"1",0,1,1,"' + ref + '"')
+    if bc:
+        lines_tspl.append('BARCODE ' + str(mm(3)) + ',' + str(mm(38)) + ',"128",' + str(mm(9)) + ',1,0,2,2,"' + bc + '"')
+    lines_tspl.append("PRINT 1,1")
+    return "\n".join(lines_tspl) + "\n"
 
 def retail_invoice(
     invoice_no: str, order_no: str, patient: str, mobile: str,
@@ -313,8 +462,8 @@ def retail_invoice(
     <link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+128&display=swap" rel="stylesheet">
     {_base_css()}
     <style>
-    .page{{padding:10mm 12mm}}
-    @media print{{@page{{size:A4;margin:8mm}}}}
+    .page{{padding:8mm 9mm;max-width:148mm}}
+    @media print{{@page{{size:A5;margin:6mm}}}}
     </style>
     </head><body><div class="page">
     <div class="hdr">
@@ -386,8 +535,8 @@ def challan(
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
     <link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+128&display=swap" rel="stylesheet">
     {_base_css()}
-    <style>.hdr{{background:#0f4c75}}.page{{padding:10mm 12mm}}
-    @media print{{@page{{size:A4;margin:8mm}}}}</style>
+    <style>.hdr{{background:#0f4c75}}.page{{padding:8mm 9mm;max-width:148mm}}
+    @media print{{@page{{size:A5;margin:6mm}}}}</style>
     </head><body><div class="page">
     <div class="hdr">
       <div><div class="hdr-shop">{shop.upper()}</div>
@@ -532,8 +681,8 @@ def credit_debit_note(
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
     {_base_css()}
-    <style>.hdr{{background:{hdr_col}}}.page{{padding:10mm 12mm}}
-    @media print{{@page{{size:A4;margin:8mm}}}}</style>
+    <style>.hdr{{background:{hdr_col}}}.page{{padding:8mm 9mm;max-width:148mm}}
+    @media print{{@page{{size:A5;margin:6mm}}}}</style>
     </head><body><div class="page">
     <div class="hdr">
       <div><div class="hdr-shop">{shop.upper()}</div>

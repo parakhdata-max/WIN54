@@ -149,7 +149,12 @@ def is_assignment_confirmed(session_state, all_lines=None) -> bool:
             if not l.get("is_service_line")
             and str(l.get("eye_side", "")).upper() not in ("S", "SERVICE")
         ]
-        if non_svc and all(
+        # Service-only orders: no non-service lines → auto-confirm always
+        if not non_svc:
+            return True
+
+        # Mixed orders: all non-service lines must be STOCK-routed + allocated
+        if all(
             str(l.get("manufacturing_route") or "").upper() == "STOCK"
             and int(l.get("allocated_qty") or 0) >= int(
                 l.get("billing_qty") or l.get("quantity") or 0

@@ -485,16 +485,26 @@ def _open_docs(party_id: str) -> Dict:
                 i.invoice_date                  AS doc_date,
                 COALESCE(i.grand_total,0)       AS grand_total,
                 i.challan_id::text              AS challan_id,
-                -- amount_paid: sum of payments.invoice_id FK (relational truth)
+                -- amount_paid: direct invoice receipts + punched order advances
                 COALESCE((
                     SELECT SUM(p.amount) FROM payments p
                     WHERE p.invoice_id = i.id
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0) + COALESCE((
+                    SELECT SUM(p.amount) FROM payments p
+                    WHERE p.advance_for_order_id::text = ANY(i.order_ids::text[])
+                      AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
                       AND NOT COALESCE(p.is_deleted,FALSE)
                 ), 0) AS amount_paid,
                 -- balance_due: derived, never trust stored value
                 GREATEST(COALESCE(i.grand_total,0) - COALESCE((
                     SELECT SUM(p.amount) FROM payments p
                     WHERE p.invoice_id = i.id
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0) - COALESCE((
+                    SELECT SUM(p.amount) FROM payments p
+                    WHERE p.advance_for_order_id::text = ANY(i.order_ids::text[])
+                      AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
                       AND NOT COALESCE(p.is_deleted,FALSE)
                 ), 0), 0) AS balance_due,
                 -- payment_status: derived from payments JOIN, not stored field
@@ -503,12 +513,22 @@ def _open_docs(party_id: str) -> Dict:
                         SELECT SUM(p.amount) FROM payments p
                         WHERE p.invoice_id = i.id
                           AND NOT COALESCE(p.is_deleted,FALSE)
-                    ), 0), 0) <= 0.01 THEN 'PAID'
+                    ), 0) - COALESCE((
+                        SELECT SUM(p.amount) FROM payments p
+                        WHERE p.advance_for_order_id::text = ANY(i.order_ids::text[])
+                          AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                          AND NOT COALESCE(p.is_deleted,FALSE)
+                    ), 0), 0) <= 0.50 THEN 'PAID'
                     WHEN COALESCE((
                         SELECT SUM(p.amount) FROM payments p
-                        WHERE p.invoice_id = i.id
-                          AND NOT COALESCE(p.is_deleted,FALSE)
-                    ), 0) > 0 THEN 'PARTIAL'
+                    WHERE p.invoice_id = i.id
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0) + COALESCE((
+                    SELECT SUM(p.amount) FROM payments p
+                    WHERE p.advance_for_order_id::text = ANY(i.order_ids::text[])
+                      AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0) > 0 THEN 'PARTIAL'
                     ELSE 'UNPAID'
                 END AS payment_status
             FROM invoices i
@@ -523,15 +543,25 @@ def _open_docs(party_id: str) -> Dict:
                 c.challan_date                      AS doc_date,
                 COALESCE(c.grand_total,c.total_amount,0) AS grand_total,
                 NULL::text                          AS challan_id,
-                -- amount_paid: from payments.challan_id FK (relational truth)
+                -- amount_paid: direct challan receipts + punched order advances
                 COALESCE((
                     SELECT SUM(p.amount) FROM payments p
                     WHERE p.challan_id = c.id
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0) + COALESCE((
+                    SELECT SUM(p.amount) FROM payments p
+                    WHERE p.advance_for_order_id::text = ANY(c.order_ids::text[])
+                      AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
                       AND NOT COALESCE(p.is_deleted,FALSE)
                 ), 0) AS amount_paid,
                 GREATEST(COALESCE(c.grand_total,c.total_amount,0) - COALESCE((
                     SELECT SUM(p.amount) FROM payments p
                     WHERE p.challan_id = c.id
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0) - COALESCE((
+                    SELECT SUM(p.amount) FROM payments p
+                    WHERE p.advance_for_order_id::text = ANY(c.order_ids::text[])
+                      AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
                       AND NOT COALESCE(p.is_deleted,FALSE)
                 ), 0), 0) AS balance_due,
                 -- INVOICED status: derived from invoices.challan_id FK (not stored status)
@@ -566,14 +596,23 @@ def _open_docs(party_id: str) -> Dict:
                        i.invoice_date AS doc_date,
                        COALESCE(i.grand_total,0) AS grand_total,
                        i.challan_id::text AS challan_id,
-                       -- relational amount_paid
+                       -- relational amount_paid incl. order advances
                        COALESCE((SELECT SUM(p.amount) FROM payments p
                                  WHERE p.invoice_id = i.id
-                                   AND NOT COALESCE(p.is_deleted,FALSE)), 0) AS amount_paid,
+                                   AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+                       + COALESCE((SELECT SUM(p.amount) FROM payments p
+                                   WHERE p.advance_for_order_id::text = ANY(i.order_ids::text[])
+                                     AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                                     AND NOT COALESCE(p.is_deleted,FALSE)), 0) AS amount_paid,
                        -- relational balance_due
                        GREATEST(COALESCE(i.grand_total,0) - COALESCE(
                            (SELECT SUM(p.amount) FROM payments p
                             WHERE p.invoice_id = i.id
+                              AND NOT COALESCE(p.is_deleted,FALSE)), 0
+                       ) - COALESCE(
+                           (SELECT SUM(p.amount) FROM payments p
+                            WHERE p.advance_for_order_id::text = ANY(i.order_ids::text[])
+                              AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
                               AND NOT COALESCE(p.is_deleted,FALSE)), 0
                        ), 0) AS balance_due,
                        -- relational payment_status
@@ -581,7 +620,12 @@ def _open_docs(party_id: str) -> Dict:
                            (SELECT SUM(p.amount) FROM payments p
                             WHERE p.invoice_id = i.id
                               AND NOT COALESCE(p.is_deleted,FALSE)), 0
-                       ), 0) <= 0.01 THEN 'PAID' ELSE 'UNPAID' END AS payment_status
+                       ) - COALESCE(
+                           (SELECT SUM(p.amount) FROM payments p
+                            WHERE p.advance_for_order_id::text = ANY(i.order_ids::text[])
+                              AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                              AND NOT COALESCE(p.is_deleted,FALSE)), 0
+                       ), 0) <= 0.50 THEN 'PAID' ELSE 'UNPAID' END AS payment_status
                 FROM invoices i
                 WHERE EXISTS (
                     SELECT 1 FROM unnest(i.order_ids) AS oid WHERE oid = ANY(%s)
@@ -593,6 +637,46 @@ def _open_docs(party_id: str) -> Dict:
             invoices += [r for r in extra if r["id"] not in seen]
         except Exception as _ie:
             pass
+
+    # Opening balance is treated as the first clearable document.
+    opening_docs = []
+    try:
+        ob_rows = _q("""
+            SELECT COALESCE(opening_balance, 0) AS opening_balance,
+                   UPPER(COALESCE(balance_type, 'DR')) AS balance_type,
+                   created_at::date AS created_date
+            FROM parties
+            WHERE id::text = %s
+            LIMIT 1
+        """, (pid,)) or []
+        if ob_rows:
+            ob = ob_rows[0]
+            opening_total = float(ob.get("opening_balance") or 0)
+            balance_type = str(ob.get("balance_type") or "DR").upper()
+            if opening_total > 0 and balance_type not in ("CR", "CREDIT"):
+                paid_opening_rows = _q("""
+                    SELECT COALESCE(SUM(amount), 0) AS paid
+                    FROM payments
+                    WHERE party_id::text = %s
+                      AND UPPER(COALESCE(payment_type, '')) = 'OPENING'
+                      AND COALESCE(is_deleted, FALSE) = FALSE
+                """, (pid,)) or []
+                opening_paid = float((paid_opening_rows[0].get("paid") if paid_opening_rows else 0) or 0)
+                opening_due = round(max(opening_total - opening_paid, 0), 2)
+                if opening_due > 0.50:
+                    opening_docs.append({
+                        "id": "OPENING:" + pid,
+                        "doc_no": "Opening Balance",
+                        "doc_type": "OPENING",
+                        "doc_date": ob.get("created_date") or datetime.date(1900, 1, 1),
+                        "grand_total": opening_total,
+                        "challan_id": None,
+                        "amount_paid": opening_paid,
+                        "balance_due": opening_due,
+                        "payment_status": "PARTIAL" if opening_paid > 0 else "UNPAID",
+                    })
+    except Exception:
+        opening_docs = []
 
     # Orders with balance (not yet invoiced)
     orders = _q("""
@@ -627,7 +711,15 @@ def _open_docs(party_id: str) -> Dict:
     for ch in challans:
         ch["_covered_by_invoice"] = ch["id"] in covered_challan_ids
 
-    all_docs  = invoices + challans + orders
+    all_docs  = opening_docs + invoices + challans + orders
+    all_docs = sorted(
+        all_docs,
+        key=lambda d: (
+            {"OPENING": 0, "INVOICE": 1, "CHALLAN": 2, "ON_ACCOUNT": 3}.get(d.get("doc_type"), 9),
+            str(d.get("doc_date") or "9999-12-31"),
+            str(d.get("doc_no") or ""),
+        ),
+    )
     total     = round(sum(float(d.get("balance_due") or 0) for d in all_docs), 2)
     net_total = round(sum(
         float(d.get("balance_due") or 0)
@@ -638,6 +730,35 @@ def _open_docs(party_id: str) -> Dict:
         "docs": all_docs, "invoices": invoices, "challans": challans,
         "orders": orders, "covered_challan_ids": covered_challan_ids,
         "total": total, "net_total": net_total,
+    }
+
+
+def _open_doc_breakdown(ost: Dict) -> Dict[str, float]:
+    invoices = ost.get("invoices") or []
+    challans = ost.get("challans") or []
+    orders = ost.get("orders") or []
+    docs = ost.get("docs") or []
+    invoice_due = round(sum(float(d.get("balance_due") or 0) for d in invoices), 2)
+    challan_due = round(sum(
+        float(d.get("balance_due") or 0)
+        for d in challans
+        if not d.get("_covered_by_invoice")
+    ), 2)
+    opening_due = round(sum(
+        float(d.get("balance_due") or 0)
+        for d in docs
+        if d.get("doc_type") == "OPENING"
+    ), 2)
+    order_due = round(sum(float(d.get("balance_due") or 0) for d in orders), 2)
+    other_due = round(opening_due + order_due, 2)
+    combined_due = round(invoice_due + challan_due + other_due, 2)
+    return {
+        "invoice_due": invoice_due,
+        "challan_due": challan_due,
+        "opening_due": opening_due,
+        "order_due": order_due,
+        "other_due": other_due,
+        "combined_due": combined_due,
     }
 
 
@@ -727,7 +848,7 @@ def _allocate(selected_docs: List[Dict], payment_amount: float,
               discount: float = 0.0) -> List[Dict]:
     """
     SAP-style allocation:
-      1. Sort by date ascending (oldest first)
+      1. Opening/on-account first, then invoices/challans oldest first
       2. If challan is covered by a selected invoice, skip (balance = 0 effectively)
       3. Fill each doc's balance_due from the payment pool
       4. Stop when money runs out
@@ -742,10 +863,14 @@ def _allocate(selected_docs: List[Dict], payment_amount: float,
         if d.get("doc_type") == "INVOICE" and d.get("challan_id"):
             sel_invoice_challan_ids.add(d["challan_id"])
 
-    # Sort: oldest doc first
+    # Sort: opening first, then oldest doc first.
     sorted_docs = sorted(
         selected_docs,
-        key=lambda d: str(d.get("doc_date") or "9999-12-31")
+        key=lambda d: (
+            {"OPENING": 0, "INVOICE": 1, "CHALLAN": 2, "ON_ACCOUNT": 3}.get(d.get("doc_type"), 9),
+            str(d.get("doc_date") or "9999-12-31"),
+            str(d.get("doc_no") or ""),
+        ),
     )
 
     pool = round(float(payment_amount), 2)
@@ -814,9 +939,25 @@ def _record_allocation(party_id: str, party_name: str,
     """
     Write one payment record per allocated doc + one excess On Account if needed.
     """
+    try:
+        from modules.core.date_guard import validate_payment_date
+        _ok_dt, _msg_dt = validate_payment_date(
+            pay_date,
+            payment_type="PAYMENT",
+            payment_mode=mode,
+            method=mode,
+            remarks=narration,
+            reference_no=ref_no,
+        )
+        if not _ok_dt:
+            return {"error": _msg_dt}
+    except Exception as _dg_e:
+        return {"error": f"Payment date validation failed: {_dg_e}"}
+
     pno = _gen_pno()
     steps = []
     saved_pnos = []
+    total_payment_amount = 0.0
 
     for alloc in allocations:
         if alloc.get("skipped"):
@@ -825,6 +966,7 @@ def _record_allocation(party_id: str, party_name: str,
         disc = alloc["allocated_discount"]
         if amt <= 0 and disc <= 0:
             continue
+        total_payment_amount = round(total_payment_amount + float(amt or 0), 2)
 
         doc = alloc["doc"]
         dtype = doc.get("doc_type")
@@ -835,6 +977,12 @@ def _record_allocation(party_id: str, party_name: str,
         inv_id = did if dtype == "INVOICE"    else None
         chl_id = did if dtype == "CHALLAN"    else None
         ord_id = did if dtype == "ON_ACCOUNT" else None
+        ptype = "OPENING" if dtype == "OPENING" else "PAYMENT"
+        pay_narration = (
+            "Opening balance receipt"
+            if dtype == "OPENING" else
+            (narration or "Payment received")
+        )
 
         steps.append((_PAYMENTS_INSERT, {
             "id": pid_rec, "pno": pno if not saved_pnos else pno + "-" + str(len(saved_pnos) + 1),
@@ -842,7 +990,8 @@ def _record_allocation(party_id: str, party_name: str,
             "iid": inv_id, "cid": chl_id, "oid": ord_id,
             "dt": pay_date, "mode": mode,
             "amt": amt, "ref": ref_no or None,
-            "nar": narration or "Payment received",
+            "nar": pay_narration,
+            "ptype": ptype,
             "by": st.session_state.get("user_name", "Staff"),
         }))
         steps.append((_LEDGER_INSERT, {
@@ -863,13 +1012,16 @@ def _record_allocation(party_id: str, party_name: str,
 
         if inv_id:
             steps.append((_INV_UPDATE, {"a": amt, "d": disc, "id": inv_id}))
+            steps.append((_ORDER_SYNC_BY_INVOICE, {"id": inv_id}))
         if chl_id:
             steps.append((_CHAL_UPDATE, {"a": amt + disc, "id": chl_id}))
+            steps.append((_ORDER_SYNC_BY_CHALLAN, {"id": chl_id}))
 
         saved_pnos.append(dno)
 
     # Excess → On Account
     if excess > 0.01:
+        total_payment_amount = round(total_payment_amount + float(excess or 0), 2)
         exc_id = str(uuid.uuid4())
         exc_pno = pno + "-OA"
         steps.append((_PAYMENTS_INSERT, {
@@ -879,6 +1031,7 @@ def _record_allocation(party_id: str, party_name: str,
             "dt": pay_date, "mode": mode,
             "amt": excess, "ref": ref_no or None,
             "nar": "Excess credit — On Account",
+            "ptype": "PAYMENT",
             "by": st.session_state.get("user_name", "Staff"),
         }))
         steps.append((_LEDGER_INSERT, {
@@ -899,14 +1052,14 @@ def _record_allocation(party_id: str, party_name: str,
         import datetime as _dt
         post_payment_receipt_jv(
             payment_no   = pno,
-            payment_id   = str(uuid.uuid4()),   # transaction already saved
+            payment_id   = "",                  # use payment_no for idempotent source matching
             party_name   = party_name or "",
-            amount       = float(pay_amount or 0),
+            amount       = float(total_payment_amount or 0),
             payment_mode = mode or "CASH",
             bank_account = "",
             voucher_date = pay_date if isinstance(pay_date, _dt.date)
                            else _dt.date.today(),
-            created_by   = created_by or "Staff",
+            created_by   = st.session_state.get("user_name", "Staff"),
         )
     except Exception as _jve:
         import logging; logging.getLogger(__name__).warning(f"[JV] receipt: {_jve}")
@@ -941,7 +1094,7 @@ _PAYMENTS_INSERT = """
         (%(id)s, %(pno)s, %(pid)s, %(pn)s,
          %(iid)s, %(cid)s, %(oid)s,
          %(dt)s, %(mode)s, %(amt)s,
-         %(ref)s, %(nar)s, 'PAYMENT',
+         %(ref)s, %(nar)s, %(ptype)s,
          FALSE, %(oid)s, %(by)s)
 """
 
@@ -960,59 +1113,155 @@ _LEDGER_DISC_INSERT = """
 """
 
 _INV_UPDATE = """
-    UPDATE invoices
-    SET
-        -- Keep denormalized columns in sync for legacy queries/reports
-        amount_paid    = COALESCE((
-            SELECT SUM(p.amount) FROM payments p
-            WHERE p.invoice_id = %(id)s
-              AND NOT COALESCE(p.is_deleted,FALSE)
-        ), 0),
-        balance_due    = GREATEST(COALESCE(grand_total,0) - COALESCE((
-            SELECT SUM(p.amount) FROM payments p
-            WHERE p.invoice_id = %(id)s
-              AND NOT COALESCE(p.is_deleted,FALSE)
-        ), 0), 0),
+    WITH inv AS (
+        SELECT id, order_ids, COALESCE(grand_total,0) AS gt
+        FROM invoices
+        WHERE id = %(id)s
+    ),
+    paid AS (
+        SELECT
+            inv.id,
+            -- Direct receipts only (NOT advance) — advance allocated by advance_allocator
+            COALESCE((SELECT SUM(p.amount) FROM payments p
+                      WHERE p.invoice_id = inv.id
+                        AND NOT COALESCE(p.is_advance, FALSE)
+                        AND UPPER(COALESCE(p.payment_type,'')) NOT IN ('ADVANCE')
+                        AND NOT COALESCE(p.is_deleted,FALSE)), 0) AS amt
+        FROM inv
+    )
+    UPDATE invoices i
+    SET amount_paid = paid.amt,
+        balance_due = GREATEST(COALESCE(i.grand_total,0) - paid.amt, 0),
+        status = CASE
+            WHEN COALESCE(i.status,'') IN ('CANCELLED','VOID') THEN i.status
+            WHEN COALESCE(i.grand_total,0) - paid.amt <= 0.50 THEN 'PAID'
+            ELSE 'ACTIVE'
+        END,
         payment_status = CASE
-            WHEN GREATEST(COALESCE(grand_total,0) - COALESCE((
-                SELECT SUM(p.amount) FROM payments p
-                WHERE p.invoice_id = %(id)s
-                  AND NOT COALESCE(p.is_deleted,FALSE)
-            ), 0), 0) <= 0.01 THEN 'PAID'
-            WHEN COALESCE((
-                SELECT SUM(p.amount) FROM payments p
-                WHERE p.invoice_id = %(id)s
-                  AND NOT COALESCE(p.is_deleted,FALSE)
-            ), 0) > 0 THEN 'PARTIAL'
+            WHEN paid.amt - COALESCE(i.grand_total,0) > 0.50 THEN 'EXCESS'
+            WHEN COALESCE(i.grand_total,0) - paid.amt <= 0.50 THEN 'PAID'
+            WHEN paid.amt > 0 THEN 'PARTIAL'
             ELSE 'UNPAID'
         END,
         updated_at = NOW()
-    WHERE id = %(id)s
+    FROM paid
+    WHERE i.id = paid.id
 """
 
 _CHAL_UPDATE = """
-    UPDATE challans
-    SET
-        amount_paid = COALESCE((
-            SELECT SUM(p.amount) FROM payments p
-            WHERE p.challan_id = %(id)s
-              AND NOT COALESCE(p.is_deleted,FALSE)
-        ), 0),
-        balance_due = GREATEST(COALESCE(grand_total,total_amount,0) - COALESCE((
-            SELECT SUM(p.amount) FROM payments p
-            WHERE p.challan_id = %(id)s
-              AND NOT COALESCE(p.is_deleted,FALSE)
-        ), 0), 0),
-        -- Covered by invoice? Derive from invoices.challan_id FK
+    WITH ch AS (
+        SELECT id, order_ids, COALESCE(grand_total,total_amount,0) AS gt
+        FROM challans
+        WHERE id = %(id)s
+    ),
+    paid AS (
+        SELECT
+            ch.id,
+            -- Direct challan receipts only (NOT advance) — advance handled by allocator
+            COALESCE((SELECT SUM(p.amount) FROM payments p
+                      WHERE p.challan_id = ch.id
+                        AND NOT COALESCE(p.is_advance, FALSE)
+                        AND UPPER(COALESCE(p.payment_type,'')) NOT IN ('ADVANCE')
+                        AND NOT COALESCE(p.is_deleted,FALSE)), 0) AS amt
+        FROM ch
+    )
+    UPDATE challans c
+    SET amount_paid = paid.amt,
+        balance_due = GREATEST(COALESCE(c.grand_total,c.total_amount,0) - paid.amt, 0),
+        payment_complete = CASE
+            WHEN COALESCE(c.grand_total,c.total_amount,0) - paid.amt <= 0.50 THEN TRUE
+            ELSE FALSE
+        END,
         status = CASE
             WHEN EXISTS (SELECT 1 FROM invoices inv
-                         WHERE inv.challan_id = %(id)s
+                         WHERE inv.challan_id = c.id
                            AND COALESCE(inv.is_deleted,FALSE)=FALSE)
             THEN 'INVOICED'
             ELSE status
         END,
         updated_at = NOW()
-    WHERE id = %(id)s
+    FROM paid
+    WHERE c.id = paid.id
+"""
+
+_ORDER_SYNC_BY_CHALLAN = """
+    WITH ch AS (
+        SELECT order_ids FROM challans WHERE id = %(id)s
+    ),
+    tgt AS (
+        SELECT o.id, COALESCE(o.total_value,0) AS total_value
+        FROM orders o, ch
+        WHERE o.id::text = ANY(ch.order_ids::text[])
+    ),
+    paid AS (
+        SELECT tgt.id,
+               COALESCE((SELECT SUM(p.amount) FROM payments p
+                         WHERE p.advance_for_order_id = tgt.id
+                           AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+               +
+               COALESCE((SELECT SUM(p.amount) FROM payments p
+                         JOIN challans c ON p.challan_id = c.id
+                         WHERE tgt.id::text = ANY(c.order_ids::text[])
+                           AND p.invoice_id IS NULL
+                           AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+               +
+               COALESCE((SELECT SUM(p.amount) FROM payments p
+                         JOIN invoices i ON p.invoice_id = i.id
+                         WHERE tgt.id::text = ANY(i.order_ids::text[])
+                           AND NOT COALESCE(p.is_deleted,FALSE)), 0) AS amt
+        FROM tgt
+    )
+    UPDATE orders o
+    SET payment_status = CASE
+            WHEN paid.amt - COALESCE(o.total_value,0) > 0.50 THEN 'EXCESS'
+            WHEN COALESCE(o.total_value,0) - paid.amt <= 0.50 THEN 'PAID'
+            WHEN paid.amt > 0 THEN 'PARTIAL'
+            ELSE 'UNPAID'
+        END,
+        advance_received = paid.amt > 0,
+        updated_at = NOW()
+    FROM paid
+    WHERE o.id = paid.id
+"""
+
+_ORDER_SYNC_BY_INVOICE = """
+    WITH inv AS (
+        SELECT order_ids FROM invoices WHERE id = %(id)s
+    ),
+    tgt AS (
+        SELECT o.id, COALESCE(o.total_value,0) AS total_value
+        FROM orders o, inv
+        WHERE o.id::text = ANY(inv.order_ids::text[])
+    ),
+    paid AS (
+        SELECT tgt.id,
+               COALESCE((SELECT SUM(p.amount) FROM payments p
+                         WHERE p.advance_for_order_id = tgt.id
+                           AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+               +
+               COALESCE((SELECT SUM(p.amount) FROM payments p
+                         JOIN challans c ON p.challan_id = c.id
+                         WHERE tgt.id::text = ANY(c.order_ids::text[])
+                           AND p.invoice_id IS NULL
+                           AND NOT COALESCE(p.is_deleted,FALSE)), 0)
+               +
+               COALESCE((SELECT SUM(p.amount) FROM payments p
+                         JOIN invoices i ON p.invoice_id = i.id
+                         WHERE tgt.id::text = ANY(i.order_ids::text[])
+                           AND NOT COALESCE(p.is_deleted,FALSE)), 0) AS amt
+        FROM tgt
+    )
+    UPDATE orders o
+    SET payment_status = CASE
+            WHEN paid.amt - COALESCE(o.total_value,0) > 0.50 THEN 'EXCESS'
+            WHEN COALESCE(o.total_value,0) - paid.amt <= 0.50 THEN 'PAID'
+            WHEN paid.amt > 0 THEN 'PARTIAL'
+            ELSE 'UNPAID'
+        END,
+        advance_received = paid.amt > 0,
+        updated_at = NOW()
+    FROM paid
+    WHERE o.id = paid.id
 """
 
 
@@ -1141,7 +1390,9 @@ def _receipt_html(rec: Dict, shop: Dict, bal_after: float) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ledger_monthly_wa(party_id: str, party_name: str,
-                       mobile: str, shop: Dict) -> Tuple[str, float]:
+                       mobile: str, shop: Dict,
+                       view: str = "Combined") -> Tuple[str, float]:
+    view = view if view in ("Combined", "Invoices", "Challans") else "Combined"
     monthly = _q("""
         SELECT DATE_TRUNC('month', entry_date)::date AS month_start,
                SUM(credit) AS total_credit
@@ -1153,26 +1404,44 @@ def _ledger_monthly_wa(party_id: str, party_name: str,
         GROUP BY 1 ORDER BY 1 DESC LIMIT 6
     """, (party_id, "%" + party_name + "%"))
 
-    ost_rows = _q("""
-        SELECT
-          COALESCE((SELECT SUM(GREATEST(grand_total - COALESCE(amount_paid,0), 0))
-           FROM invoices WHERE party_id::text = %s
-           AND COALESCE(is_deleted, FALSE) = FALSE
-           AND UPPER(COALESCE(payment_status,'UNPAID')) != 'PAID'), 0)
-          +
-          COALESCE((SELECT SUM(GREATEST(grand_total - COALESCE(amount_paid,0), 0))
-           FROM challans WHERE party_id::text = %s
-           AND COALESCE(is_deleted, FALSE) = FALSE
-           AND UPPER(COALESCE(status,'PENDING')) NOT IN ('PAID','CANCELLED')), 0)
-          AS total_outstanding
-    """, (party_id, party_id))
+    ost = _open_docs(party_id)
+    due_break = _open_doc_breakdown(ost)
+    if view == "Invoices":
+        statement_docs = ost.get("invoices") or []
+        outstanding_now = due_break["invoice_due"]
+        title_scope = "Invoice Statement"
+    elif view == "Challans":
+        statement_docs = [
+            d for d in (ost.get("challans") or [])
+            if not d.get("_covered_by_invoice")
+        ]
+        outstanding_now = due_break["challan_due"]
+        title_scope = "Challan Statement"
+    else:
+        statement_docs = [
+            d for d in (ost.get("docs") or [])
+            if not d.get("_covered_by_invoice")
+        ]
+        outstanding_now = due_break["combined_due"]
+        title_scope = "Combined Statement"
 
-    outstanding_now = float((ost_rows[0]["total_outstanding"] if ost_rows else 0) or 0)
     nl = "\n"
     sn = shop.get("shop_name", "DV Optical")
     m  = "Hello {} 👋".format(party_name) + nl + nl
-    m += "📊 *Account Statement — {}*".format(sn) + nl
+    m += "📊 *{} — {}*".format(title_scope, sn) + nl
     m += "─────────────────" + nl + nl
+
+    if statement_docs:
+        m += "📄 *Pending Documents:*" + nl
+        for d in statement_docs[:20]:
+            m += "  • {} · {} · {}".format(
+                d.get("doc_no") or "",
+                d.get("doc_type") or "",
+                _fc(float(d.get("balance_due") or 0)),
+            ) + nl
+        if len(statement_docs) > 20:
+            m += "  • ...and {} more".format(len(statement_docs) - 20) + nl
+        m += nl
 
     months_order = list(reversed(monthly))
     if months_order:
@@ -1186,12 +1455,12 @@ def _ledger_monthly_wa(party_id: str, party_name: str,
             m += "  • {}: {}".format(mname, _fc(amt)) + nl
         period_sum    = sum(a for _, a in month_names)
         oldest_month  = month_names[0][0] if month_names else ""
-        m += nl + "💰 *Total Outstanding Now: {}*".format(_fc(outstanding_now)) + nl + nl
+        m += nl + "💰 *{} Outstanding: {}*".format(view, _fc(outstanding_now)) + nl + nl
         pre_period_bal = round(outstanding_now - period_sum, 2)
         m += "📌 *Balance from before {} = {}*".format(oldest_month, _fc(pre_period_bal)) + nl
     else:
         m += "No payment records found in last 6 months." + nl
-        m += "💰 *Current Outstanding: {}*".format(_fc(outstanding_now)) + nl
+        m += "💰 *{} Outstanding: {}*".format(view, _fc(outstanding_now)) + nl
 
     m += nl + "For queries please contact us." + nl + "Thank you! 🙏 " + sn
     return m, outstanding_now
@@ -1244,6 +1513,16 @@ def _post_payment_panel(result: Dict, mobile: str, shop: Dict,
     # ── WA + Print buttons ──────────────────────────────────────────────
     msg_rcpt = _wa_receipt(result, shop)
     msg_bal  = _wa_with_balance(result, shop, bal_after)
+    try:
+        from modules.wa_contact_tools import render_mobile_field
+        mobile = render_mobile_field(
+            "pc_post_" + sk,
+            name=str(result.get("party_name") or result.get("party") or ""),
+            mobile=mobile,
+            label="WhatsApp mobile",
+        )
+    except Exception:
+        pass
 
     c1, c2, c3, c4 = st.columns(4)
     c1.markdown(
@@ -1275,14 +1554,22 @@ def _post_payment_panel(result: Dict, mobile: str, shop: Dict,
     )
 
     if c4.button("🖨️ Print Receipt", key="pc_print_" + sk, width='stretch'):
-        import base64
         html = _receipt_html(result, shop, bal_after)
-        b64  = base64.b64encode(html.encode()).decode()
-        st.components.v1.html(
-            "<script>var w=window.open('about:blank','_blank');"
-            "w.document.write(atob('{}'));w.document.close();</script>".format(b64),
-            height=0
-        )
+        try:
+            from modules.printing.print_opener import open_html_print
+
+            path = open_html_print(html, f"payment_receipt_{result.get('pno','')}.html")
+            st.success(f"Receipt opened: {path}")
+        except Exception as exc:
+            import base64
+
+            b64 = base64.b64encode(html.encode()).decode()
+            st.warning(f"Browser print open failed, trying in-app print: {exc}")
+            st.components.v1.html(
+                "<script>var w=window.open('about:blank','_blank');"
+                "w.document.write(atob('{}'));w.document.close();</script>".format(b64),
+                height=0
+            )
 
     # ── Cancel / Reverse payment ─────────────────────────────────────────
     with st.expander("⚠️ Cancel / Reverse This Payment", expanded=False):
@@ -1379,6 +1666,7 @@ def _render_doc_checklist(docs: List[Dict], covered_ids: set,
     st.markdown(header_html, unsafe_allow_html=True)
 
     PILL = {
+        "OPENING":    "<span class='pill pill-warn'>OPENING</span>",
         "INVOICE":    "<span class='pill pill-inv'>INVOICE</span>",
         "CHALLAN":    "<span class='pill pill-chal'>CHALLAN</span>",
         "ON_ACCOUNT": "<span class='pill pill-oa'>ON ACCOUNT</span>",
@@ -1504,6 +1792,7 @@ def _render_allocation_preview(allocations: List[Dict], excess: float,
             status_html = "<span class='pill' style='background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b44'>PARTIAL</span>"
 
         PILL_MAP = {
+            "OPENING":    "pill-warn",
             "INVOICE":    "pill-inv",
             "CHALLAN":    "pill-chal",
             "ON_ACCOUNT": "pill-oa",
@@ -1745,38 +2034,64 @@ def _panel(shop: Dict, ptype: str):
     docs      = ost["docs"]
     net_total = ost["net_total"]
     covered   = ost["covered_challan_ids"]
+    due_break = _open_doc_breakdown(ost)
 
     # Metrics
     st.markdown(
         "<div class='pc-metrics'>"
         "<div class='pc-metric'>"
-        "<div class='pc-metric-label'>Net Outstanding</div>"
-        "<div class='pc-metric-value' style='color:#ef4444'>{nt}</div>"
-        "<div class='pc-metric-sub'>excl. covered challans</div>"
+        "<div class='pc-metric-label'>Invoice Due</div>"
+        "<div class='pc-metric-value' style='color:#ef4444'>{inv_due}</div>"
+        "<div class='pc-metric-sub'>{ni} open invoice(s)</div>"
         "</div>"
         "<div class='pc-metric'>"
-        "<div class='pc-metric-label'>Open Invoices</div>"
-        "<div class='pc-metric-value' style='color:#10b981'>{ni}</div>"
+        "<div class='pc-metric-label'>Challan Due</div>"
+        "<div class='pc-metric-value' style='color:#3b82f6'>{ch_due}</div>"
+        "<div class='pc-metric-sub'>{nc} open challan(s)</div>"
         "</div>"
         "<div class='pc-metric'>"
-        "<div class='pc-metric-label'>Open Challans</div>"
-        "<div class='pc-metric-value' style='color:#3b82f6'>{nc}</div>"
+        "<div class='pc-metric-label'>Opening / Orders</div>"
+        "<div class='pc-metric-value' style='color:#8b5cf6'>{other_due}</div>"
+        "<div class='pc-metric-sub'>opening + unbilled</div>"
         "</div>"
         "<div class='pc-metric'>"
-        "<div class='pc-metric-label'>On Account</div>"
-        "<div class='pc-metric-value' style='color:#8b5cf6'>{no}</div>"
+        "<div class='pc-metric-label'>Combined Due</div>"
+        "<div class='pc-metric-value' style='color:#f59e0b'>{combined}</div>"
+        "<div class='pc-metric-sub'>no covered challan double count</div>"
         "</div>"
         "</div>".format(
-            nt=_fc(net_total),
+            inv_due=_fc(due_break["invoice_due"]),
+            ch_due=_fc(due_break["challan_due"]),
+            other_due=_fc(due_break["other_due"]),
+            combined=_fc(due_break["combined_due"]),
             ni=len(ost["invoices"]),
             nc=len(ost["challans"]),
-            no=len(ost["orders"]),
         ),
         unsafe_allow_html=True
     )
 
-    # ── Document checklist ──────────────────────────────────────────────────
-    selected_docs, net_sel_balance = _render_doc_checklist(docs, covered, sk)
+    # ── Receipt allocation mode ─────────────────────────────────────────────
+    receipt_mode = st.radio(
+        "Receipt allocation",
+        ["On-account auto-clear", "Invoice-wise selection"],
+        horizontal=True,
+        key="pc_receipt_mode_" + sk,
+        help=(
+            "On-account clears opening first, then oldest pending invoices. "
+            "Invoice-wise lets you tick the exact invoices to collect."
+        ),
+    )
+
+    if receipt_mode == "Invoice-wise selection":
+        invoice_docs = [d for d in docs if d.get("doc_type") == "INVOICE"]
+        selected_docs, net_sel_balance = _render_doc_checklist(invoice_docs, covered, sk)
+    else:
+        selected_docs = [d for d in docs if not d.get("_covered_by_invoice")]
+        net_sel_balance = round(sum(float(d.get("balance_due") or 0) for d in selected_docs), 2)
+        st.info(
+            "On-account receipt will auto-clear: Opening Balance first, "
+            "then pending invoices by oldest date, then other outstanding documents."
+        )
 
     st.markdown("<hr class='pc-divider'>", unsafe_allow_html=True)
 
@@ -1794,12 +2109,16 @@ def _panel(shop: Dict, ptype: str):
     r1, r2, r3 = st.columns([1.2, 2, 1.5])
     pay_date = r1.date_input("Date", value=datetime.date.today(),
                              key="pc_dt_" + sk)
+    _amt_mode_key = "oa" if receipt_mode == "On-account auto-clear" else "inv"
     amount   = r2.number_input(
         "Amount ₹",
         min_value=0.0, step=1.0,
         value=float(net_sel_balance),
-        key="pc_amt_" + sk,
-        help="Auto-filled from selected documents. Edit for partial payment.",
+        key=f"pc_amt_{_amt_mode_key}_" + sk,
+        help=(
+            "Invoice-wise: auto-filled from checked invoices. "
+            "On-account: auto-filled from total outstanding; edit for partial receipt."
+        ),
     )
     mode = r3.selectbox("Mode", MODES, key="pc_mode_" + sk)
 
@@ -1839,12 +2158,27 @@ def _panel(shop: Dict, ptype: str):
     st.markdown("<hr class='pc-divider'>", unsafe_allow_html=True)
 
     if not selected_docs:
-        st.warning("Select at least one document above before recording.")
+        if receipt_mode == "Invoice-wise selection":
+            st.warning("Select at least one invoice above before recording.")
+        else:
+            st.warning("No outstanding document is available for on-account clearing.")
     elif amount <= 0 and discount <= 0:
         st.info("Enter a payment amount or discount to proceed.")
     else:
         if st.button("✅ Record Payment", type="primary",
                      key="pc_record_" + sk, width='stretch'):
+            from modules.core.date_guard import validate_payment_date
+            _ok_dt, _msg_dt = validate_payment_date(
+                pay_date,
+                payment_type="PAYMENT",
+                payment_mode=mode,
+                method=mode,
+                remarks=narration,
+                reference_no=ref_no,
+            )
+            if not _ok_dt:
+                st.error(_msg_dt)
+                return
             if not allocations:
                 allocations, excess = _allocate(selected_docs, amount, discount)
 
@@ -1862,6 +2196,37 @@ def _panel(shop: Dict, ptype: str):
             if "error" in result:
                 st.error("❌ Save failed: " + str(result["error"]))
             else:
+                # ── Re-allocate advance across partial billing docs ──────────
+                # _INV_UPDATE applies full order advance to each invoice
+                # (double-counts for partial billing). Override with sequential allocator.
+                try:
+                    from modules.db.advance_allocator import allocate_order_advance
+                    _alloc_order_ids = set()
+                    for _alloc_doc in (allocations or []):
+                        _d = _alloc_doc.get("doc") or {}
+                        _did = _d.get("id","")
+                        _dtype = _d.get("doc_type","")
+                        if _did and _dtype == "INVOICE":
+                            _oid_rows = _q(
+                                "SELECT order_ids[1]::text AS oid FROM invoices WHERE id=%(id)s::uuid LIMIT 1",
+                                {"id": _did}
+                            ) or []
+                        elif _did and _dtype == "CHALLAN":
+                            _oid_rows = _q(
+                                "SELECT order_ids[1]::text AS oid FROM challans WHERE id=%(id)s::uuid LIMIT 1",
+                                {"id": _did}
+                            ) or []
+                        else:
+                            _oid_rows = []
+                        if _oid_rows and _oid_rows[0].get("oid"):
+                            _alloc_order_ids.add(_oid_rows[0]["oid"])
+                    for _oid in _alloc_order_ids:
+                        allocate_order_advance(_oid)
+                except Exception as _alloc_e:
+                    import logging as _alloc_log
+                    _alloc_log.getLogger(__name__).warning(
+                        "[payment_collection] advance re-alloc failed: %s", _alloc_e
+                    )
                 st.session_state["_pc_result_" + sk]    = result
                 st.session_state["_pc_bal_after_" + sk] = bal_after
                 st.session_state["_pc_mob_" + sk]       = mobile
@@ -1878,7 +2243,14 @@ def _panel(shop: Dict, ptype: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ledger_section(pid: str, pname: str, mobile: str, shop: Dict, sk: str):
-    with st.expander("📒 Party Ledger  +  📲 Monthly Statement", expanded=False):
+    with st.expander("📒 Ledgers + 📲 Statements", expanded=False):
+        view = st.radio(
+            "View",
+            ["Combined", "Invoices", "Challans"],
+            horizontal=True,
+            key="pc_ledger_view_" + sk,
+            help="WhatsApp message and ledger table follow this selection.",
+        )
         st.markdown(
             "<div style='font-size:0.7rem;font-weight:700;color:#475569;"
             "text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px'>"
@@ -1886,12 +2258,23 @@ def _ledger_section(pid: str, pname: str, mobile: str, shop: Dict, sk: str):
             "</div>",
             unsafe_allow_html=True
         )
-        wa_msg, ost_now = _ledger_monthly_wa(pid, pname, mobile, shop)
-        mob_in   = st.text_input("Mobile", value=mobile,
-                                  key="pc_lmob_" + sk, placeholder="10-digit")
+        wa_msg, ost_now = _ledger_monthly_wa(pid, pname, mobile, shop, view)
+        try:
+            from modules.wa_contact_tools import render_mobile_field
+            mob_in = render_mobile_field(
+                "pc_lmob_" + sk,
+                name=pname,
+                mobile=mobile,
+                label="Mobile",
+            )
+        except Exception:
+            mob_in = st.text_input("Mobile", value=mobile,
+                                   key="pc_lmob_" + sk, placeholder="10-digit")
         stmt_key = "pc_stmt_" + sk
-        if stmt_key not in st.session_state:
+        stmt_src_key = "pc_stmt_src_" + sk
+        if stmt_key not in st.session_state or st.session_state.get(stmt_src_key) != view:
             st.session_state[stmt_key] = wa_msg
+            st.session_state[stmt_src_key] = view
         edited_stmt = st.text_area("Statement (edit if needed)",
                                    key=stmt_key, height=200)
         st.markdown(
@@ -1908,10 +2291,15 @@ def _ledger_section(pid: str, pname: str, mobile: str, shop: Dict, sk: str):
         st.markdown(
             "<div style='font-size:0.7rem;font-weight:700;color:#475569;"
             "text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px'>"
-            "Ledger — Last 60 Entries"
-            "</div>",
+            "{view} Ledger — Last 60 Entries"
+            "</div>".format(view=view),
             unsafe_allow_html=True
         )
+        type_filter = ""
+        if view == "Invoices":
+            type_filter = "AND entry_type IN ('INVOICE','PAYMENT','DISCOUNT')"
+        elif view == "Challans":
+            type_filter = "AND entry_type IN ('CHALLAN','PAYMENT','DISCOUNT')"
         rows = _q("""
             SELECT entry_date, entry_type, ref_no,
                    COALESCE(debit, 0)  AS debit,
@@ -1919,10 +2307,13 @@ def _ledger_section(pid: str, pname: str, mobile: str, shop: Dict, sk: str):
                    COALESCE(narration,'') AS narration,
                    COALESCE(created_by,'') AS created_by
             FROM party_ledger
-            WHERE party_id::text = %s
-               OR (party_id IS NULL AND party_name ILIKE %s)
+            WHERE (
+                party_id::text = %s
+                OR (party_id IS NULL AND party_name ILIKE %s)
+            )
+               {type_filter}
             ORDER BY entry_date ASC, id ASC LIMIT 120
-        """, (pid, "%" + pname + "%"))
+        """.format(type_filter=type_filter), (pid, "%" + pname + "%"))
 
         if rows:
             run   = 0.0   # running balance: debit - credit = outstanding
@@ -2086,6 +2477,18 @@ def _render_disbursement():
     if amount > 0 and payee:
         if st.button("💸 Record Disbursement", type="primary",
                      key="pd_rec", width='stretch'):
+            from modules.core.date_guard import validate_payment_date
+            _ok_dt, _msg_dt = validate_payment_date(
+                pay_date,
+                payment_type="DISBURSEMENT",
+                payment_mode=mode,
+                method=mode,
+                remarks=narration,
+                reference_no=ref_no,
+            )
+            if not _ok_dt:
+                st.error(_msg_dt)
+                return
             pno    = _gen_pno()
             pid_rec = str(uuid.uuid4())
             ok = _w("""

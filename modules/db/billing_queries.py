@@ -171,34 +171,67 @@ def get_invoices_by_order_refs(order_refs: List[str]) -> List[Dict]:
 
 
 def update_invoice_balance(invoice_id: str) -> bool:
-    """Recalculate invoice balance from payments FK. Call after every payment."""
+    """Recalculate invoice balance from direct payments + order advances."""
     return _w("""
+        WITH inv AS (
+            SELECT id, order_ids, COALESCE(grand_total,0) AS gt
+            FROM invoices
+            WHERE id = %(id)s::uuid
+        ),
+        paid AS (
+            SELECT
+                inv.id,
+                COALESCE((
+                    SELECT SUM(p.amount)
+                    FROM payments p
+                    WHERE p.invoice_id = inv.id
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM invoices i2
+                          JOIN payments cp ON cp.challan_id = i2.challan_id
+                          WHERE i2.id = inv.id
+                            AND NOT COALESCE(cp.is_deleted,FALSE)
+                            AND ABS(COALESCE(cp.amount,0) - COALESCE(p.amount,0)) <= 0.01
+                            AND cp.payment_date <= p.payment_date
+                      )
+                ), 0)
+                +
+                COALESCE((
+                    SELECT SUM(p.amount)
+                    FROM payments p
+                    JOIN invoices i2 ON i2.id = inv.id
+                    WHERE p.challan_id = i2.challan_id
+                      AND i2.challan_id IS NOT NULL
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0)
+                +
+                COALESCE((
+                    SELECT SUM(p.amount)
+                    FROM payments p
+                    WHERE p.advance_for_order_id::text = ANY(inv.order_ids::text[])
+                      AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0) AS amt
+            FROM inv
+        )
         UPDATE invoices SET
-            amount_paid = COALESCE((
-                SELECT SUM(p.amount) FROM payments p
-                WHERE p.invoice_id = %(id)s::uuid
-                  AND NOT COALESCE(p.is_deleted,FALSE)
-            ), 0),
-            balance_due = GREATEST(COALESCE(grand_total,0) - COALESCE((
-                SELECT SUM(p.amount) FROM payments p
-                WHERE p.invoice_id = %(id)s::uuid
-                  AND NOT COALESCE(p.is_deleted,FALSE)
-            ), 0), 0),
+            amount_paid = paid.amt,
+            balance_due = GREATEST(COALESCE(grand_total,0) - paid.amt, 0),
+            status = CASE
+                WHEN COALESCE(status,'') IN ('CANCELLED','VOID') THEN status
+                WHEN COALESCE(grand_total,0) - paid.amt <= 0.50 THEN 'PAID'
+                ELSE 'ACTIVE'
+            END,
             payment_status = CASE
-                WHEN GREATEST(COALESCE(grand_total,0) - COALESCE((
-                    SELECT SUM(p.amount) FROM payments p
-                    WHERE p.invoice_id = %(id)s::uuid
-                      AND NOT COALESCE(p.is_deleted,FALSE)
-                ), 0), 0) <= 0.01 THEN 'PAID'
-                WHEN COALESCE((
-                    SELECT SUM(p.amount) FROM payments p
-                    WHERE p.invoice_id = %(id)s::uuid
-                      AND NOT COALESCE(p.is_deleted,FALSE)
-                ), 0) > 0 THEN 'PARTIAL'
+                WHEN paid.amt - COALESCE(grand_total,0) > 0.50 THEN 'EXCESS'
+                WHEN COALESCE(grand_total,0) - paid.amt <= 0.50 THEN 'PAID'
+                WHEN paid.amt > 0 THEN 'PARTIAL'
                 ELSE 'UNPAID'
             END,
             updated_at = NOW()
-        WHERE id = %(id)s::uuid
+        FROM paid
+        WHERE invoices.id = paid.id
     """, {"id": invoice_id})
 
 
@@ -243,19 +276,55 @@ def get_open_challans_for_party(party_id: str) -> List[Dict]:
 
 
 def update_challan_balance(challan_id: str) -> bool:
-    """Recalculate challan balance from payments FK."""
+    """Recalculate challan balance from direct payments + order advances.
+
+    Challan retail payments can be recorded in two places:
+    - payments.challan_id for balance receipts
+    - payments.advance_for_order_id for punched advances
+
+    Keep amount_paid as actual received. balance_due is clamped to zero,
+    so overpayments remain visible as amount_paid - grand_total instead of
+    being hidden as a negative balance.
+    """
     return _w("""
+        WITH ch AS (
+            SELECT id, order_ids, COALESCE(grand_total,total_amount,0) AS gt
+            FROM challans
+            WHERE id = %(id)s::uuid
+        ),
+        paid AS (
+            SELECT
+                ch.id,
+                COALESCE((
+                    SELECT SUM(p.amount)
+                    FROM payments p
+                    WHERE p.challan_id = ch.id
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0)
+                +
+                COALESCE((
+                    SELECT SUM(p.amount)
+                    FROM payments p
+                    WHERE p.advance_for_order_id::text = ANY(ch.order_ids::text[])
+                      AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
+                      AND NOT COALESCE(p.is_deleted,FALSE)
+                ), 0) AS amt
+            FROM ch
+        )
         UPDATE challans SET
-            amount_paid = COALESCE((
-                SELECT SUM(p.amount) FROM payments p
-                WHERE p.challan_id = %(id)s::uuid
+            amount_paid = paid.amt,
+            advance_applied = COALESCE((
+                SELECT SUM(p.amount)
+                FROM payments p, ch
+                WHERE p.advance_for_order_id::text = ANY(ch.order_ids::text[])
+                  AND (COALESCE(p.is_advance,FALSE) OR UPPER(COALESCE(p.payment_type,''))='ADVANCE')
                   AND NOT COALESCE(p.is_deleted,FALSE)
             ), 0),
-            balance_due = GREATEST(COALESCE(grand_total,total_amount,0) - COALESCE((
-                SELECT SUM(p.amount) FROM payments p
-                WHERE p.challan_id = %(id)s::uuid
-                  AND NOT COALESCE(p.is_deleted,FALSE)
-            ), 0), 0),
+            balance_due = GREATEST(COALESCE(grand_total,total_amount,0) - paid.amt, 0),
+            payment_complete = CASE
+                WHEN COALESCE(grand_total,total_amount,0) - paid.amt <= 0.50 THEN TRUE
+                ELSE FALSE
+            END,
             status = CASE
                 WHEN EXISTS (
                     SELECT 1 FROM invoices inv
@@ -265,7 +334,8 @@ def update_challan_balance(challan_id: str) -> bool:
                 ELSE status
             END,
             updated_at = NOW()
-        WHERE id = %(id)s::uuid
+        FROM paid
+        WHERE challans.id = paid.id
     """, {"id": challan_id})
 
 
@@ -338,6 +408,18 @@ def get_party_payments(party_id: str, limit: int = 50) -> List[Dict]:
 
 
 def insert_payment(params: Dict) -> bool:
+    from modules.core.date_guard import validate_payment_date
+    _ok_dt, _msg_dt = validate_payment_date(
+        params.get("dt"),
+        payment_type=params.get("payment_type") or "PAYMENT",
+        payment_mode=params.get("mode") or params.get("payment_mode") or "",
+        method=params.get("method") or params.get("mode") or "",
+        remarks=params.get("nar") or params.get("remarks") or "",
+        reference_no=params.get("ref") or params.get("reference_no") or "",
+        allow_provisional_advance_cheque=bool(params.get("allow_provisional_advance_cheque")),
+    )
+    if not _ok_dt:
+        raise ValueError(_msg_dt)
     return _w("""
         INSERT INTO payments
             (id, payment_no, party_id, party_name,

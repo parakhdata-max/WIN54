@@ -434,8 +434,8 @@ class DiscountEngine:
     Usage:
         engine = DiscountEngine(rules)
         result = engine.calculate(item)
-        print(result.pretty())
-        print(result.margin_status)   # "ok" | "soft_warning" | "hard_stop"
+        logger.debug(result.pretty())
+        logger.debug(result.margin_status)   # "ok" | "soft_warning" | "hard_stop"
     """
 
     def __init__(

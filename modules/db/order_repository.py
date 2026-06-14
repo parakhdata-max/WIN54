@@ -35,6 +35,16 @@ def normalize_value(v):
     return v
 
 
+def _round_order_header_total(order_data: Dict) -> None:
+    """Round customer-facing retail order total without changing line GST values."""
+    try:
+        if str(order_data.get("order_type") or "").upper() != "RETAIL":
+            return
+        order_data["total_value"] = float(round(float(order_data.get("total_value") or 0)))
+    except Exception:
+        return
+
+
 # ============================================================================
 # MAIN SAVE FUNCTION
 # ============================================================================
@@ -97,13 +107,14 @@ def _ensure_pricing_columns(cursor) -> bool:
                     ADD COLUMN IF NOT EXISTS discount_amount  NUMERIC(12,2) DEFAULT 0
             """)
             logger.info("Pricing columns added to order_lines")
-        # Idempotent: add applied_rule_ids column if not yet present.
-        # TEXT — comma-separated rule UUIDs/names, e.g. "uuid1,uuid2".
-        # Added outside the `if not exists` block so it auto-applies even
-        # when gst_amount was already present (Phase 2A upgrade path).
+        # Idempotent: add audit/net columns even when gst_amount already exists.
+        # applied_rule_ids is TEXT because the active discount engine stamps a
+        # comma-separated rule id string; changing it to JSONB would break reads.
         cursor.execute("""
             ALTER TABLE order_lines
-            ADD COLUMN IF NOT EXISTS applied_rule_ids TEXT DEFAULT ''
+                ADD COLUMN IF NOT EXISTS billing_total NUMERIC(12,2),
+                ADD COLUMN IF NOT EXISTS discount_rule TEXT DEFAULT '',
+                ADD COLUMN IF NOT EXISTS applied_rule_ids TEXT DEFAULT ''
         """)
         _PRICING_COLS_EXIST = True
         return True
@@ -184,6 +195,8 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
     cursor = None
 
     try:
+        _round_order_header_total(order_data)
+
         conn = get_transaction_connection()
         cursor = conn.cursor()
 
@@ -223,8 +236,8 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
                     _otype = order_data.get("order_type", "RETAIL").upper()
                     order_data["order_no"] = format_doc_number(_otype, _display_no)
             except Exception as _seq_e:
-                logger.warning(f"[OrderRepo] number registry failed: {_seq_e}")
-                _display_no = 0
+                logger.error("[OrderRepo] number registry failed before order insert", exc_info=True)
+                raise RuntimeError(f"Order number allocation failed before order insert: {_seq_e}") from _seq_e
 
         order_sql = """
             INSERT INTO orders (
@@ -286,7 +299,7 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
                 quantity, unit_price, total_price,
                 gst_percent, gst_amount,
                 discount_percent, discount_amount,
-                applied_rule_ids,
+                billing_total, discount_rule, applied_rule_ids,
                 lens_params, boxing_params, suggested_allocation
                 {_svc_col_clause}
             )
@@ -296,10 +309,11 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
                 %s, %s, %s,
                 %s, %s,
                 %s, %s,
-                %s,
+                %s, %s, %s,
                 %s, %s, %s
                 {_svc_val_clause}
-            );
+            )
+            RETURNING id;
             """
         else:
             # Fallback: original columns only (no pricing columns)
@@ -317,16 +331,18 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
                 %s, %s, %s,
                 %s, %s, %s
                 {_svc_val_clause}
-            );
+            )
+            RETURNING id;
             """
 
         # Dedup guard: track (product_id, eye_side) already inserted this call
         _inserted_keys = set()
 
         # ── Apply discount rules ONCE before the line loop ───────────────────
-        # Zero-risk: if this fails, lines save with 0% discount. Never blocks save.
+        # Shared helper also restamps total_price/billing_total and GST on the
+        # net amount, so discount carries from punching through billing.
         try:
-            from modules.pricing.discount_engine import apply_discounts
+            from modules.pricing.discount_flow import apply_order_discounts
             _order_type_disc = str(order_data.get("order_type") or "wholesale")
 
             # party_id may be missing from order_data (wholesale flow only passes party_name).
@@ -351,7 +367,50 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
                     except Exception:
                         pass
 
-            apply_discounts(lines, party_id=_party_id_disc, order_type=_order_type_disc)
+            apply_order_discounts(lines, party_id=_party_id_disc, order_type=_order_type_disc)
+            try:
+                from modules.pricing.supplier_scheme_engine import apply_customer_scheme_to_line
+                for _idx, _line in enumerate(lines):
+                    lines[_idx] = apply_customer_scheme_to_line(
+                        _line, party_id=_party_id_disc, order_type=_order_type_disc
+                    )
+            except Exception as _scheme_e:
+                logger.debug("[OrderRepo] supplier scheme skipped: %s", _scheme_e)
+            try:
+                from modules.pricing.cart_scheme_engine import apply_cart_schemes
+                lines, _cart_result = apply_cart_schemes(
+                    lines, party_id=_party_id_disc, order_type=_order_type_disc
+                )
+                if getattr(_cart_result, "applied", False):
+                    logger.info("[OrderRepo] cart scheme applied: %s", getattr(_cart_result, "message", ""))
+            except Exception as _cart_e:
+                logger.debug("[OrderRepo] cart scheme skipped: %s", _cart_e)
+            try:
+                from modules.pricing.tax_engine import apply_taxes
+                apply_taxes({
+                    "order_type": _order_type_disc,
+                    "lines": lines,
+                    "net_value": sum(float(_l.get("billing_total") or _l.get("total_price") or 0) for _l in lines),
+                })
+            except Exception as _tax_e:
+                logger.debug("[OrderRepo] post-scheme tax restamp skipped: %s", _tax_e)
+
+            # Header total must follow the final line values after discounts,
+            # supplier schemes, cart/free offers, and tax restamping. The order
+            # row is already inserted in this transaction, so correct it before
+            # the same commit; otherwise reports/payment gates can read a stale
+            # punched total while order_lines carry the scheme-adjusted values.
+            _line_net_total = round(sum(
+                float(_l.get("billing_total") or _l.get("total_price") or 0)
+                for _l in lines
+            ), 2)
+            if str(_order_type_disc or "").upper() == "RETAIL":
+                _line_net_total = float(round(_line_net_total))
+            order_data["total_value"] = _line_net_total
+            cursor.execute(
+                "UPDATE orders SET total_value = %s WHERE id = %s",
+                (normalize_value(_line_net_total), order_id),
+            )
         except Exception as _disc_e:
             logger.warning(f"[OrderRepo] discount_engine skipped: {_disc_e}")
 
@@ -366,11 +425,6 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
                 continue
             _inserted_keys.add(_dup_key)
 
-            # Use billing_qty (pcs count from allocation) with fallback to quantity.
-            # Use billing_total (unit_price × qty, ex-GST) with fallback to total_price.
-            # Mirrors order_persistence.save_order_to_db which has the same pattern.
-            _quantity    = int(line.get("billing_qty") or line.get("quantity") or 0)
-            _total_price = float(line.get("billing_total") or line.get("total_price") or 0)
             # eye_side column is char(1) — map multi-char values to single char
             _eye_side_raw = str(line.get("eye_side") or "").upper().strip()
             # Expand any already-expanded values first, then compact for DB storage
@@ -379,8 +433,24 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
             _eye_side_map = {"R": "R", "L": "L", "B": "B", "O": "O", "S": "S"}
             _eye_side = _eye_side_map.get(_eye_side_pre, _eye_side_pre[:1] or "O")
 
-            # SERVICE lines (consultation fee): auto-allocated, ready immediately
-            _is_svc = (_eye_side == "S")
+            # SERVICE lines: courier/other bill directly; colouring/fitting are
+            # production services and must stay pending until their service job
+            # reaches billing readiness.
+            _is_svc = (_eye_side == "S") or bool(line.get("is_service_line"))
+            _lp_for_service = line.get("lens_params") if isinstance(line.get("lens_params"), dict) else {}
+            _svc_prod_route = str(_lp_for_service.get("service_production_type") or "").upper().strip()
+
+            # Use billing_qty (pcs count from allocation) with fallback to quantity.
+            # Product rows keep total_price and billing_total aligned as taxable/net.
+            # Wholesale service rows may carry billing_total as GST-inclusive payable,
+            # so preserve the source total_price instead of copying billing_total over it.
+            _quantity = int(line.get("billing_qty") or line.get("quantity") or 0)
+            _billing_total = float(line.get("billing_total") or line.get("total_price") or 0)
+            _total_price = float(
+                line.get("total_price")
+                if line.get("total_price") is not None
+                else _billing_total
+            )
 
             base_params = (
                 order_id,
@@ -400,6 +470,8 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
                     normalize_value(line.get("gst_amount", 0)),
                     normalize_value(line.get("discount_percent", 0)),
                     normalize_value(line.get("discount_amount", 0)),
+                    normalize_value(_billing_total),
+                    str(line.get("discount_rule") or ""),
                     str(line.get("applied_rule_ids") or ""),
                 )
             else:
@@ -426,14 +498,89 @@ def save_order(order_data: Dict, lines: List[Dict], user_name: str):
                 # is_service_line, allocated_qty, ready_qty, status
                 svc_params = (
                     _is_svc,
-                    _quantity if _is_svc else int(line.get("allocated_qty") or 0),
-                    _quantity if _is_svc else int(line.get("ready_qty") or 0),
-                    "READY" if _is_svc else "PENDING",
+                    (0 if _svc_prod_route else _quantity) if _is_svc else int(line.get("allocated_qty") or 0),
+                    (0 if _svc_prod_route else _quantity) if _is_svc else int(line.get("ready_qty") or 0),
+                    ("PENDING" if _svc_prod_route else "READY") if _is_svc else "PENDING",
                 )
             else:
                 svc_params = ("READY" if _is_svc else "PENDING",)
 
             cursor.execute(line_sql, base_params + pricing_params + json_params + svc_params)
+            _line_row = cursor.fetchone()
+            _saved_line_id = _line_row[0] if _line_row else None
+
+            # Stock rows are "seat booked" at order save. The line may be a
+            # frame SKU, contact-lens batch, or ophthalmic stock batch; in all
+            # cases the selected inventory row must be blocked immediately so
+            # the next order sees reduced availability.
+            try:
+                _lp_stock = line.get("lens_params") if isinstance(line.get("lens_params"), dict) else {}
+                _route_stock = str(
+                    line.get("manufacturing_route") or _lp_stock.get("manufacturing_route") or ""
+                ).upper()
+                _alloc_qty_total = int(line.get("allocated_qty") or 0)
+                if _route_stock == "STOCK" and _alloc_qty_total > 0 and _saved_line_id:
+                    _alloc_rows = (
+                        line.get("batch_allocation")
+                        or _lp_stock.get("batch_allocation")
+                        or line.get("suggested_allocation")
+                        or []
+                    )
+                    if isinstance(_alloc_rows, dict):
+                        _alloc_rows = [_alloc_rows]
+                    if not _alloc_rows:
+                        _stock_id = str(_lp_stock.get("stock_id") or _lp_stock.get("batch_id") or "").strip()
+                        _batch_no = str(_lp_stock.get("batch_no") or line.get("batch_no") or "").strip()
+                        _alloc_rows = [{
+                            "stock_id": _stock_id,
+                            "batch_id": _stock_id,
+                            "batch_no": _batch_no,
+                            "allocated_qty": _alloc_qty_total,
+                        }]
+
+                    _pid_stock = str(line.get("product_id") or "").strip()
+                    _reserved_total = 0
+                    for _ar in _alloc_rows:
+                        if not isinstance(_ar, dict):
+                            continue
+                        _ar_qty = int(_ar.get("allocated_qty") or _ar.get("qty") or 0)
+                        if _ar_qty <= 0:
+                            continue
+                        _ar_sid = str(_ar.get("stock_id") or _ar.get("batch_id") or "").strip()
+                        _ar_bno = str(_ar.get("batch_no") or "").strip()
+                        if not _ar_sid and (not _pid_stock or not _ar_bno):
+                            continue
+                        if _ar_sid:
+                            cursor.execute(
+                                """
+                                UPDATE inventory_stock
+                                   SET allocated_qty = COALESCE(allocated_qty, 0) + %s,
+                                       updated_at = NOW()
+                                 WHERE id = %s::uuid
+                                   AND GREATEST(0, COALESCE(quantity,0) - COALESCE(allocated_qty,0)) >= %s
+                                """,
+                                (_ar_qty, _ar_sid, _ar_qty),
+                            )
+                        else:
+                            cursor.execute(
+                                """
+                                UPDATE inventory_stock
+                                   SET allocated_qty = COALESCE(allocated_qty, 0) + %s,
+                                       updated_at = NOW()
+                                 WHERE product_id = %s::uuid
+                                   AND UPPER(TRIM(batch_no)) = UPPER(TRIM(%s))
+                                   AND GREATEST(0, COALESCE(quantity,0) - COALESCE(allocated_qty,0)) >= %s
+                                """,
+                                (_ar_qty, _pid_stock, _ar_bno, _ar_qty),
+                            )
+                        if cursor.rowcount != 1:
+                            raise ValueError("Selected stock row is no longer available")
+                        _reserved_total += _ar_qty
+
+                    if _reserved_total != _alloc_qty_total:
+                        raise ValueError("Stock allocation quantity mismatch during order save")
+            except Exception:
+                raise
 
         # ============================================================
         # INSERT STATUS HISTORY
@@ -523,6 +670,7 @@ def fetch_backoffice_orders(limit=None):
                 created_at
             FROM orders
             WHERE COALESCE(is_deleted, FALSE) = FALSE
+              AND UPPER(COALESCE(order_type, 'RETAIL')) != 'CONSULTATION'
             ORDER BY created_at DESC
         """
 

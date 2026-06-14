@@ -163,7 +163,24 @@ def save_purchase_invoice(po: dict, lines: list,
         )
         inv_total  = subtotal + gst_total
 
-        # ── 1. Invoice header ─────────────────────────────────────────────
+        # ── 1. Invoice header — invoice_no level idempotency gate ──────────
+        # PRIMARY GUARD: if this invoice_no already exists in purchase_invoices,
+        # stop immediately. Do NOT proceed to insert lines or inventory.
+        # This covers all paths: repeated saves, reruns, and direct API calls.
+        cur.execute(
+            "SELECT 1 FROM purchase_invoices WHERE invoice_no = %s LIMIT 1",
+            (inv_no,)
+        )
+        if cur.fetchone():
+            conn.rollback()
+            return (
+                False,
+                inv_no,
+                f"Invoice {inv_no} already exists in purchase_invoices. "
+                "No lines or inventory were inserted. "
+                "Use a different invoice number or void the existing record first."
+            )
+
         cur.execute("""
             INSERT INTO purchase_invoices (
                 invoice_no, supplier_order_id,
@@ -182,7 +199,7 @@ def save_purchase_invoice(po: dict, lines: list,
                 %s,'UNPAID',
                 %s,%s,%s,%s
             )
-            ON CONFLICT (invoice_no) DO NOTHING
+            RETURNING invoice_no
         """, (
             inv_no,                          po["supplier_order_id"],
             po.get("supplier_id",""),        po.get("supplier_name",""),
@@ -194,6 +211,16 @@ def save_purchase_invoice(po: dict, lines: list,
             invoice_meta.get("notes",""),
             "purchase_invoice",              now,          now,
         ))
+        # RETURNING safety net — if somehow ON CONFLICT fires (race condition),
+        # the RETURNING clause returns nothing and we abort before lines/inventory.
+        if not cur.fetchone():
+            conn.rollback()
+            return (
+                False,
+                inv_no,
+                f"Invoice {inv_no} already exists (race condition detected). "
+                "No lines or inventory were inserted."
+            )
 
         # ── 2–4. Per line: invoice line + stock update + inventory ────────
         all_received = True
@@ -265,8 +292,35 @@ def save_purchase_invoice(po: dict, lines: list,
             if already + rqty < ordered:
                 all_received = False
 
-            # 4. Add to inventory_stock
-            if rqty > 0 and line.get("product_id"):
+            # 4. Add to inventory_stock — idempotency guard.
+            # Rule: inventory is posted ONCE at goods receipt
+            # (purchase_acknowledgements.inventory_posted_at stage).
+            # When a supplier challan is converted to a purchase invoice,
+            # this is an ACCOUNTING operation — no second stock insert.
+            #
+            # Guard logic:
+            #   a) If a PA row exists for this batch/product with inventory_posted_at
+            #      already set → skip insert entirely.
+            #   b) If no PA row exists (direct purchase_invoice path, no PA) →
+            #      insert inventory AND stamp purchase_invoices.inventory_posted_at
+            #      so repeated saves cannot insert again.
+            _skip_inv = False
+            _prod_id  = str(line.get("product_id") or "")
+            _batch_no = str(line.get("batch_no") or "")
+            if _prod_id:
+                # Check PA idempotency marker
+                cur.execute("""
+                    SELECT 1 FROM purchase_acknowledgements
+                    WHERE our_product_id = %s::uuid
+                      AND (%s = '' OR batch_no = %s)
+                      AND inventory_posted_at IS NOT NULL
+                    LIMIT 1
+                """, (_prod_id, _batch_no, _batch_no))
+                if cur.fetchone():
+                    _skip_inv = True
+
+            if rqty > 0 and _prod_id and not _skip_inv:
+                _batch_key = _batch_no or f"GRN-{inv_no}-{item_no}"
                 cur.execute("""
                     INSERT INTO inventory_stock (
                         product_id,
@@ -292,19 +346,29 @@ def save_purchase_invoice(po: dict, lines: list,
                         true,
                         %s,%s
                     )
+                    ON CONFLICT DO NOTHING
                 """, (
-                    line["product_id"],
+                    _prod_id,
                     line.get("sph"),   line.get("cyl"),
                     line.get("axis"),  line.get("add_power"),
                     line.get("eye_side", "OTHER"),
-                    line.get("batch_no") or f"GRN-{inv_no}-{item_no}",
+                    _batch_key,
                     line.get("expiry_date"),
                     rqty,
                     aprice,
-                    line.get("selling_price", aprice * 1.3),  # 30% markup default
+                    line.get("selling_price", aprice * 1.3),
                     line.get("mrp", aprice * 1.5),
                     now, now,
                 ))
+                # Stamp idempotency marker on PA rows for this product+batch
+                # so future invoice conversions know stock is already posted.
+                cur.execute("""
+                    UPDATE purchase_acknowledgements
+                    SET inventory_posted_at = NOW()
+                    WHERE our_product_id = %s::uuid
+                      AND (%s = '' OR batch_no = %s)
+                      AND inventory_posted_at IS NULL
+                """, (_prod_id, _batch_key, _batch_key))
 
         # ── 4b. Stamp purchase_rate as cost_price on open order_lines ────────
         # When we receive stock at actual_price, backfill cost_price on
@@ -369,16 +433,8 @@ def generate_invoice_no() -> str:
     if not DB_CONNECTED:
         import random
         return f"PINV-{now.strftime('%Y%m%d')}-{random.randint(1000,9999)}"
-    try:
-        conn = get_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT nextval('seq_purchase_invoice')")
-            n = cur.fetchone()[0]
-        conn.close()
-        return f"PINV-{now.strftime('%Y%m%d')}-{n:04d}"
-    except Exception:
-        import random
-        return f"PINV-{now.strftime('%Y%m%d')}-{random.randint(1000,9999)}"
+    import random
+    return f"PINV-ERR-{now.strftime('%Y%m%d')}-{random.randint(1000,9999)}"
 
 
 _TABLES_CREATED = False   # module-level guard — runs once per process, never again
@@ -407,6 +463,7 @@ def _ensure_invoice_tables_once():
             invoice_total       NUMERIC(12,2) DEFAULT 0,
             payment_terms       TEXT DEFAULT 'NET30',
             payment_status      TEXT DEFAULT 'UNPAID',
+            is_deleted          BOOLEAN DEFAULT FALSE,
             notes               TEXT,
             created_by          TEXT DEFAULT 'system',
             created_at          TIMESTAMPTZ DEFAULT NOW(),
@@ -1058,3 +1115,597 @@ def render_purchase_invoice():
                                     st.error(f"Update failed: {e}")
                             load_invoice_history.clear()
                             st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STEP 1 — PA → purchase_invoice conversion
+# ═══════════════════════════════════════════════════════════════════════════
+
+def convert_acknowledgement_to_invoice(order_no: str) -> dict:
+    """
+    Convert purchase_acknowledgements rows for an order into a formal
+    purchase_invoices + purchase_invoice_lines record.
+
+    Rules:
+    - Gate: only runs if ALL PA rows for the order have
+      purchase_invoice_id IS NULL (prevents double-posting).
+    - supplier_order_id: uses challan_no or invoice_no from PA.
+      If neither present, mints synthetic ref 'ACK-<order_no>'.
+    - Uses real PA columns confirmed in DB:
+        supplier_id, supplier_name, challan_no, invoice_no (as challan ref),
+        document_date, purchase_price, received_qty, order_line_id,
+        billing_status.
+    - Joins order_lines for product_id, eye_side, sph, cyl, axis,
+      add_power, gst_percent, product_name (via products).
+
+    Returns dict with keys: ok (bool), invoice_no (str), message (str)
+    """
+    if not DB_CONNECTED:
+        return {"ok": False, "invoice_no": "", "message": "DB not connected"}
+
+    try:
+        conn = get_transaction_connection()
+    except Exception as e:
+        return {"ok": False, "invoice_no": "", "message": f"DB connection failed: {e}"}
+
+    try:
+        with conn.cursor() as cur:
+
+            # ── 1. Load all PA rows for this order ────────────────────────
+            cur.execute("""
+                SELECT
+                    pa.id::text             AS pa_id,
+                    pa.order_line_id::text  AS order_line_id,
+                    pa.order_no,
+                    pa.supplier_id::text    AS supplier_id,
+                    pa.supplier_name,
+                    pa.challan_no,
+                    pa.invoice_no           AS pa_invoice_ref,
+                    pa.document_date,
+                    pa.purchase_price,
+                    pa.received_qty,
+                    pa.billing_status,
+                    pa.purchase_invoice_id,
+                    -- order_line fields
+                    ol.product_id::text     AS product_id,
+                    ol.eye_side,
+                    ol.sph, ol.cyl, ol.axis, ol.add_power,
+                    COALESCE(ol.gst_percent, p.gst_percent, 18) AS gst_percent,
+                    COALESCE(p.product_name, 'Unknown Product') AS product_name,
+                    COALESCE(p.brand, '')   AS brand
+                FROM purchase_acknowledgements pa
+                LEFT JOIN order_lines ol
+                    ON ol.id = pa.order_line_id
+                LEFT JOIN products p
+                    ON p.id = ol.product_id
+                WHERE LOWER(pa.order_no) = LOWER(%s)
+                  AND COALESCE(pa.purchase_price, 0) > 0
+                ORDER BY pa.acknowledged_at
+            """, (order_no,))
+            cols = [d[0] for d in cur.description]
+            pa_rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+        if not pa_rows:
+            conn.close()
+            return {
+                "ok": False,
+                "invoice_no": "",
+                "message": f"No procurement records found for order {order_no}",
+            }
+
+        # ── 2. Double-post gate ───────────────────────────────────────────
+        # purchase_invoice_id is uuid — can't store text inv_no there.
+        # Gate on billing_status='INVOICED' instead (set by this function).
+        already_posted = [
+            r for r in pa_rows
+            if str(r.get("billing_status","")).upper() == "INVOICED"
+        ]
+        if already_posted:
+            # Try to find the existing invoice ref from notes
+            _existing_ref = ""
+            for _ar in already_posted:
+                _notes = str(_ar.get("notes") or "")
+                if "invoice:" in _notes:
+                    _existing_ref = _notes.split("invoice:")[-1].split("|")[0].strip()
+                    break
+            conn.close()
+            return {
+                "ok": False,
+                "invoice_no": _existing_ref or "already posted",
+                "message": (
+                    f"Order {order_no} is already posted as purchase invoice "
+                    f"{_existing_ref or '(see Purchase Register)'}. Cannot double-post."
+                ),
+            }
+
+        # ── 3. Derive header values ───────────────────────────────────────
+        ref_pa = pa_rows[0]
+
+        # supplier_order_id: challan_no → pa_invoice_ref → synthetic
+        supplier_order_id = (
+            (ref_pa.get("challan_no") or "").strip()
+            or (ref_pa.get("pa_invoice_ref") or "").strip()
+            or f"ACK-{order_no}"
+        )
+
+        supplier_id   = ref_pa.get("supplier_id") or None
+        supplier_name = ref_pa.get("supplier_name") or "Unknown Supplier"
+        invoice_date  = ref_pa.get("document_date") or __import__("datetime").date.today()
+        from modules.core.date_guard import validate_not_future
+        _ok_dt, _msg_dt = validate_not_future(invoice_date, "Purchase invoice date")
+        if not _ok_dt:
+            conn.close()
+            return {"ok": False, "invoice_no": "", "message": _msg_dt}
+
+        # Totals
+        subtotal    = round(sum(
+            float(r.get("purchase_price") or 0) * int(r.get("received_qty") or 1)
+            for r in pa_rows
+        ), 2)
+        gst_total   = round(sum(
+            float(r.get("purchase_price") or 0) * int(r.get("received_qty") or 1)
+            * float(r.get("gst_percent") or 0) / 100
+            for r in pa_rows
+        ), 2)
+        inv_total   = round(subtotal + gst_total, 2)
+        total_qty   = sum(int(r.get("received_qty") or 1) for r in pa_rows)
+
+        # Invoice number: PINV-<order_no>
+        inv_no = f"PINV-{order_no}"
+
+        # ── 4. Insert in a single transaction ────────────────────────────
+        with conn.cursor() as cur:
+
+            # 4a. Header — invoice_no level guard (pre-check + RETURNING)
+            cur.execute(
+                "SELECT 1 FROM purchase_invoices WHERE invoice_no = %s LIMIT 1",
+                (inv_no,)
+            )
+            if cur.fetchone():
+                conn.rollback()
+                return False, inv_no, f"Invoice {inv_no} already exists. No lines inserted."
+
+            cur.execute("""
+                INSERT INTO purchase_invoices (
+                    invoice_no, supplier_order_id,
+                    supplier_id, supplier_name,
+                    supplier_invoice_no,
+                    invoice_date,
+                    total_items, total_qty_received,
+                    subtotal, gst_amount, invoice_total,
+                    payment_terms, payment_status,
+                    notes, created_by, created_at, updated_at
+                ) VALUES (
+                    %s, %s,
+                    %s, %s,
+                    %s,
+                    %s,
+                    %s, %s,
+                    %s, %s, %s,
+                    'NET30', 'UNPAID',
+                    %s, 'procurement_queue', NOW(), NOW()
+                )
+                RETURNING invoice_no
+            """, (
+                inv_no, supplier_order_id,
+                supplier_id, supplier_name,
+                supplier_order_id,
+                invoice_date,
+                len(pa_rows), total_qty,
+                subtotal, gst_total, inv_total,
+                f"Posted from PA — order {order_no}",
+            ))
+            if not cur.fetchone():
+                conn.rollback()
+                return False, inv_no, f"Invoice {inv_no} conflict on insert. No lines inserted."
+
+            # 4b. Lines
+            for item_no, r in enumerate(pa_rows, start=1):
+                price   = float(r.get("purchase_price") or 0)
+                qty     = int(r.get("received_qty") or 1)
+                gst_pct = float(r.get("gst_percent") or 0)
+                ltotal  = round(price * qty * (1 + gst_pct / 100), 2)
+
+                cur.execute("""
+                    INSERT INTO purchase_invoice_lines (
+                        invoice_no, item_no,
+                        supplier_order_id, supplier_order_item_no,
+                        product_id, product_name, brand,
+                        eye_side, sph, cyl, axis, add_power,
+                        ordered_qty, received_qty,
+                        actual_price, gst_percent, line_total,
+                        created_at
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        NOW()
+                    )
+                """, (
+                    inv_no, item_no,
+                    supplier_order_id, item_no,
+                    r.get("product_id"),
+                    r.get("product_name", "Unknown Product"),
+                    r.get("brand", ""),
+                    r.get("eye_side"),
+                    r.get("sph"), r.get("cyl"),
+                    r.get("axis"), r.get("add_power"),
+                    qty, qty,
+                    price, gst_pct, ltotal,
+                ))
+
+            # 4c. Link PA rows → invoice via billing_status + notes
+            # Note: purchase_invoice_id is uuid type; PINV-<order_no> is text.
+            # We store the invoice reference in billing_status='INVOICED' and
+            # use notes to hold the inv_no text ref. The double-post gate reads
+            # purchase_invoice_id IS NULL — we set it only if a uuid is available,
+            # otherwise we gate on billing_status='INVOICED'.
+            cur.execute("""
+                UPDATE purchase_acknowledgements
+                SET billing_status = 'INVOICED',
+                    notes = CASE
+                        WHEN notes IS NULL OR notes = ''
+                        THEN %s
+                        ELSE notes || ' | ' || %s
+                    END
+                WHERE LOWER(order_no) = LOWER(%s)
+                  AND COALESCE(billing_status,'') != 'INVOICED'
+            """, (f"invoice:{inv_no}", f"invoice:{inv_no}", order_no))
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "ok": True,
+            "invoice_no": inv_no,
+            "message": (
+                f"✅ Posted: {inv_no} · ₹{inv_total:,.2f} "
+                f"({len(pa_rows)} line(s)) — now appears in Purchase Register"
+            ),
+        }
+
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        import traceback as _tb
+        return {
+            "ok": False,
+            "invoice_no": "",
+            "message": f"Post failed: {e}\n{_tb.format_exc()}",
+        }
+
+
+def convert_acknowledgements_to_invoice_multi(
+    order_nos: list,
+    challan_groups: list,
+    custom_inv_no: str = None,
+    invoice_date=None,
+    supplier_id: str = None,
+    supplier_name: str = None,
+) -> dict:
+    """
+    Convert multiple challan groups (each group = one challan, one or more PA rows)
+    from possibly different orders into ONE combined purchase_invoice.
+
+    challan_groups: list of dicts, each with keys:
+        supplier, challan, rows (list of PA row dicts), orders (list of order_no)
+    custom_inv_no: supplier invoice number / register invoice number. Required.
+
+    Double-post gate: skips any PA row already billing_status='INVOICED'.
+    Returns dict with ok, invoice_no, message.
+    """
+    import datetime as _dt
+    if not DB_CONNECTED:
+        return {"ok": False, "invoice_no": "", "message": "DB not connected"}
+
+    if not challan_groups:
+        return {"ok": False, "invoice_no": "", "message": "No challan groups selected"}
+
+    inv_no = str(custom_inv_no or "").strip()
+    if not inv_no:
+        return {
+            "ok": False,
+            "invoice_no": "",
+            "message": "Enter supplier invoice number before moving challan to Purchase Register.",
+        }
+    try:
+        inv_date = invoice_date or _dt.date.today()
+        if isinstance(inv_date, str):
+            inv_date = _dt.date.fromisoformat(inv_date[:10])
+    except Exception:
+        inv_date = _dt.date.today()
+    from modules.core.date_guard import validate_not_future
+    _ok_dt, _msg_dt = validate_not_future(inv_date, "Purchase invoice date")
+    if not _ok_dt:
+        return {"ok": False, "invoice_no": inv_no, "message": _msg_dt}
+
+    # ── Derive header values from first group ─────────────────────────────
+    ref_group   = challan_groups[0]
+    supplier_name = supplier_name or ref_group["supplier"]
+    supplier_id   = supplier_id or None
+
+    # Try to get supplier_id from one of the PA rows
+    if not supplier_id:
+        for _cg in challan_groups:
+            for _row in _cg.get("rows", []):
+                _sid = (_row.get("supplier_id") or "").strip()
+                if _sid:
+                    supplier_id = _sid
+                    break
+            if supplier_id:
+                break
+
+    # supplier_order_id: join all challan refs
+    _challan_refs = [
+        _cg["challan"] for _cg in challan_groups
+        if _cg["challan"] and _cg["challan"] != "NO_CHALLAN"
+    ]
+    supplier_order_id = (
+        " | ".join(_challan_refs)
+        or ("ACK-" + "-".join(order_nos[:3]))
+        or "ACK-MULTI"
+    )
+
+    # Collect all PA rows (filter already-INVOICED)
+    all_pa_rows = []
+    for _cg in challan_groups:
+        for _row in _cg.get("rows", []):
+            if str(_row.get("billing_status","")).upper() != "INVOICED":
+                all_pa_rows.append(_row)
+
+    if not all_pa_rows:
+        return {
+            "ok": False, "invoice_no": "",
+            "message": "All selected lines are already posted to an invoice.",
+        }
+
+    # ── Compute totals ─────────────────────────────────────────────────────
+    subtotal  = round(sum(
+        float(r.get("purchase_price") or 0) * int(r.get("qty") or r.get("received_qty") or 1)
+        for r in all_pa_rows
+    ), 2)
+    gst_total = round(sum(
+        float(r.get("purchase_price") or 0)
+        * int(r.get("qty") or r.get("received_qty") or 1)
+        * float(r.get("gst_percent") or 0) / 100
+        for r in all_pa_rows
+    ), 2)
+    inv_total = round(subtotal + gst_total, 2)
+    total_qty = sum(int(r.get("qty") or r.get("received_qty") or 1) for r in all_pa_rows)
+
+    try:
+        conn = get_transaction_connection()
+    except Exception as e:
+        return {"ok": False, "invoice_no": "", "message": f"DB connection failed: {e}"}
+
+    try:
+        with conn.cursor() as cur:
+            # ── 1. Header gate ──────────────────────────────────────────
+            # Existing UNPAID invoice is an edit/append workflow: staff may
+            # rollback a challan, correct the invoice number/date, then add
+            # more challans to the same supplier invoice.
+            cur.execute(
+                """
+                SELECT invoice_no, COALESCE(payment_status,'UNPAID') AS payment_status
+                FROM purchase_invoices
+                WHERE LOWER(invoice_no) = LOWER(%s)
+                LIMIT 1
+                """,
+                (inv_no,)
+            )
+            _existing = cur.fetchone()
+            _appending_existing = False
+            if _existing:
+                _pst = str(_existing[1] or "UNPAID").upper()
+                if _pst == "VOIDED":
+                    cur.execute(
+                        "SELECT COUNT(*) FROM purchase_invoice_lines WHERE LOWER(invoice_no)=LOWER(%s)",
+                        (inv_no,),
+                    )
+                    _void_line_count = int((cur.fetchone() or [0])[0] or 0)
+                    if _void_line_count > 0:
+                        conn.rollback()
+                        return {
+                            "ok": False,
+                            "invoice_no": inv_no,
+                            "message": (
+                                f"Invoice {inv_no} is VOIDED but still has {_void_line_count} line(s). "
+                                "Use a new invoice number or clean the voided invoice first."
+                            ),
+                        }
+                    _appending_existing = True
+                    cur.execute("""
+                        UPDATE purchase_invoices
+                        SET payment_status = 'UNPAID',
+                            supplier_invoice_no = %s,
+                            invoice_date = %s,
+                            supplier_order_id = %s,
+                            supplier_id = COALESCE(%s::uuid, supplier_id),
+                            supplier_name = COALESCE(NULLIF(%s,''), supplier_name),
+                            notes = TRIM(BOTH ' |' FROM (
+                                REGEXP_REPLACE(COALESCE(notes,''), '\\[VOIDED\\]', '', 'g')
+                                || ' | reactivated from void for: ' || %s
+                            )),
+                            updated_at = NOW()
+                        WHERE LOWER(invoice_no) = LOWER(%s)
+                    """, (
+                        inv_no, inv_date, supplier_order_id,
+                        supplier_id, supplier_name, supplier_order_id, inv_no,
+                    ))
+                elif _pst in ("PAID", "CANCELLED"):
+                    conn.rollback()
+                    return {
+                        "ok": False,
+                        "invoice_no": inv_no,
+                        "message": (
+                            f"Invoice {inv_no} already exists with status {_pst}. "
+                            "Rollback/payment correction is required before adding lines."
+                        ),
+                    }
+                else:
+                    _appending_existing = True
+                    cur.execute("""
+                        UPDATE purchase_invoices
+                        SET supplier_invoice_no = %s,
+                            invoice_date = %s,
+                            notes = TRIM(BOTH ' |' FROM (
+                                COALESCE(notes,'') || ' | appended challans: ' || %s
+                            )),
+                            updated_at = NOW()
+                        WHERE LOWER(invoice_no) = LOWER(%s)
+                    """, (inv_no, inv_date, supplier_order_id, inv_no))
+            else:
+                cur.execute("""
+                    INSERT INTO purchase_invoices (
+                        invoice_no, supplier_order_id,
+                        supplier_id, supplier_name,
+                        supplier_invoice_no,
+                        invoice_date,
+                        total_items, total_qty_received,
+                        subtotal, gst_amount, invoice_total,
+                        payment_terms, payment_status,
+                        notes, created_by, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        'NET30', 'UNPAID',
+                        %s, 'purchase_register', NOW(), NOW()
+                    )
+                    RETURNING invoice_no
+                """, (
+                    inv_no, supplier_order_id,
+                    supplier_id, supplier_name,
+                    inv_no,
+                    inv_date,
+                    0, 0,
+                    0, 0, 0,
+                    f"Multi-challan: {supplier_order_id} · Orders: {', '.join(order_nos)}",
+                ))
+                if not cur.fetchone():
+                    conn.rollback()
+                    return {"ok": False, "invoice_no": inv_no,
+                            "message": f"Invoice {inv_no} conflict on insert. No lines inserted."}
+
+            # ── 2. Insert lines ───────────────────────────────────────────
+            for item_no, r in enumerate(all_pa_rows, start=1):
+                price   = float(r.get("purchase_price") or 0)
+                qty     = int(r.get("qty") or r.get("received_qty") or 1)
+                gst_pct = float(r.get("gst_percent") or 0)
+                ltotal  = round(price * qty * (1 + gst_pct / 100), 2)
+                cur.execute("""
+                    INSERT INTO purchase_invoice_lines (
+                        invoice_no, item_no,
+                        supplier_order_id, supplier_order_item_no,
+                        product_id, product_name, brand,
+                        eye_side, sph, cyl, axis, add_power,
+                        ordered_qty, received_qty,
+                        actual_price, gst_percent, line_total, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, NOW()
+                    )
+                """, (
+                    inv_no, item_no,
+                    r.get("challan_no") or supplier_order_id, item_no,
+                    r.get("product_id"),
+                    r.get("product_name") or r.get("our_product_name") or "Unknown",
+                    r.get("brand",""),
+                    r.get("eye_side"),
+                    r.get("sph"), r.get("cyl"),
+                    r.get("axis"), r.get("add_power"),
+                    qty, qty,
+                    price, gst_pct, ltotal,
+                ))
+
+            # ── 3. Stamp all PA rows as INVOICED ─────────────────────────
+            _pa_ids = [str(r["pa_id"]) for r in all_pa_rows if r.get("pa_id")]
+            if _pa_ids:
+                cur.execute(
+                    """
+                    UPDATE purchase_acknowledgements
+                    SET billing_status = 'INVOICED',
+                        invoice_no = %s,
+                        supplier_id = COALESCE(%s::uuid, supplier_id),
+                        supplier_name = COALESCE(NULLIF(%s,''), supplier_name),
+                        notes = CASE
+                            WHEN notes IS NULL OR notes = ''
+                            THEN %s
+                            ELSE notes || ' | ' || %s
+                        END
+                    WHERE id = ANY(%s::uuid[])
+                      AND COALESCE(billing_status,'') != 'INVOICED'
+                    """,
+                    (
+                        inv_no,
+                        supplier_id,
+                        supplier_name or "",
+                        f"invoice:{inv_no}",
+                        f"invoice:{inv_no}",
+                        _pa_ids,
+                    ),
+                )
+
+            # ── 4. Recalculate invoice header after append/insert ────────
+            cur.execute("""
+                UPDATE purchase_invoices
+                SET total_items = (
+                        SELECT COUNT(*) FROM purchase_invoice_lines
+                        WHERE LOWER(invoice_no)=LOWER(%s)
+                    ),
+                    total_qty_received = (
+                        SELECT COALESCE(SUM(received_qty),0)
+                        FROM purchase_invoice_lines
+                        WHERE LOWER(invoice_no)=LOWER(%s)
+                    ),
+                    subtotal = (
+                        SELECT COALESCE(SUM(actual_price * received_qty),0)
+                        FROM purchase_invoice_lines
+                        WHERE LOWER(invoice_no)=LOWER(%s)
+                    ),
+                    gst_amount = (
+                        SELECT COALESCE(SUM(actual_price * received_qty * gst_percent/100),0)
+                        FROM purchase_invoice_lines
+                        WHERE LOWER(invoice_no)=LOWER(%s)
+                    ),
+                    invoice_total = (
+                        SELECT COALESCE(SUM(line_total),0)
+                        FROM purchase_invoice_lines
+                        WHERE LOWER(invoice_no)=LOWER(%s)
+                    ) + COALESCE(courier_amount,0)
+                      + COALESCE(courier_gst,0)
+                      + COALESCE(gst_adjustment_amount,0)
+                      + COALESCE(round_off_amount,0),
+                    updated_at = NOW()
+                WHERE LOWER(invoice_no)=LOWER(%s)
+            """, (inv_no, inv_no, inv_no, inv_no, inv_no, inv_no))
+
+        conn.commit()
+        conn.close()
+        return {
+            "ok": True,
+            "invoice_no": inv_no,
+            "message": (
+                f"✅ Invoice {inv_no} {'updated' if _appending_existing else 'created'} · ₹{inv_total:,.2f} "
+                f"({len(all_pa_rows)} line(s) from {len(challan_groups)} challan(s)) "
+                f"— Purchase Register Done"
+            ),
+        }
+
+    except Exception as e:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        import traceback as _tb
+        return {
+            "ok": False, "invoice_no": "",
+            "message": f"Post failed: {e}\n{_tb.format_exc()}",
+        }

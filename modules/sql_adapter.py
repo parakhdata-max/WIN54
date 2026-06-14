@@ -15,6 +15,18 @@ from psycopg2.extras import RealDictCursor
 from typing import Optional, Union, Tuple, List, Dict, Any
 from functools import wraps
 import time
+import uuid as _uuid
+
+try:
+    import streamlit as _st
+    _cache_data = _st.cache_data
+except Exception:
+    def _cache_data(*dargs, **dkwargs):
+        def _decorator(fn):
+            return fn
+        if dargs and callable(dargs[0]) and len(dargs) == 1 and not dkwargs:
+            return dargs[0]
+        return _decorator
 
 # -------------------------------------------------
 # LOGGING
@@ -29,13 +41,51 @@ logger = logging.getLogger(__name__)
 # Slow query threshold — operations above this log a warning
 _SLOW_QUERY_MS = 500
 
+
+def _sql_perf_label(sql: str, prefix: str = "sql") -> str:
+    try:
+        text = " ".join(str(sql or "").split())
+        low = text.lower()
+        target = ""
+        for token in (" from ", " update ", " into ", " join "):
+            if token in low:
+                tail = text[low.index(token) + len(token):].strip()
+                target = tail.split()[0].strip(",;")
+                break
+        return f"{prefix}:{target or text[:50] or 'query'}"
+    except Exception:
+        return f"{prefix}:query"
+
+
+def _record_sql_perf(label: str, elapsed_sec: float, sql: str = "") -> None:
+    try:
+        from modules.core.system_observer import add_perf_step
+        add_perf_step(label, elapsed_sec, category="db", detail=" ".join(str(sql or "").split())[:220])
+    except Exception:
+        pass
+
 # -------------------------------------------------
 # EXCEPTIONS
 # -------------------------------------------------
 
 class DatabaseError(Exception): pass
 class ConnectionError(DatabaseError): pass
-class QueryError(DatabaseError): pass
+class QueryError(DatabaseError):
+    def __init__(self, exc):
+        self.original = exc
+        try:
+            from modules.core.operator_alerts import (
+                build_operator_alert,
+                record_issue_comment,
+            )
+            alert = build_operator_alert(exc, context="Database")
+            try:
+                record_issue_comment(alert, context="Database")
+            except Exception:
+                pass
+            super().__init__(alert.as_text())
+        except Exception:
+            super().__init__(str(exc))
 class DataValidationError(DatabaseError): pass
 
 # -------------------------------------------------
@@ -55,9 +105,13 @@ def _get_db_url() -> str:
             return url
     except Exception:
         pass
-    url = _os.getenv("DATABASE_TEST")
-    if url:
-        return url
+    try:
+        from modules.core.environment import db_url as _env_db_url
+        url = _env_db_url()
+        if url:
+            return url
+    except Exception:
+        pass
     return "postgresql://postgres:newpassword123@localhost:5432/dv_optical_test"
 
 def _parse_db_url(url: str) -> dict:
@@ -105,7 +159,8 @@ def _sanitize_value(v):
     try:
         if pd.isna(v):
             return None
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         pass
 
     # Convert empty strings for numeric fields to None
@@ -128,8 +183,31 @@ def _sanitize_params(params):
     
     if isinstance(params, (list, tuple)):
         return tuple(_sanitize_value(p) for p in params)
-    
+
     return params
+
+
+def _sanitize_uuid_composite_params(sql: str, params):
+    """
+    UI cards sometimes pass composite values like
+    "<uuid>:R/2627/0017". If the SQL explicitly casts a parameter to ::uuid,
+    keep only the UUID side before PostgreSQL validates the value.
+    """
+    if params is None or "::uuid" not in str(sql or "").lower():
+        return params
+
+    def _fix(v):
+        if isinstance(v, str) and ":" in v:
+            left = v.split(":", 1)[0].strip()
+            if as_uuid_or_none(left):
+                return left
+        return v
+
+    if isinstance(params, dict):
+        return {k: _fix(v) for k, v in params.items()}
+    if isinstance(params, (list, tuple)):
+        return tuple(_fix(v) for v in params)
+    return _fix(params)
 
 
 def _sanitize_sql_for_legacy_nan(sql: str) -> str:
@@ -148,6 +226,89 @@ def _sanitize_sql_for_legacy_nan(sql: str) -> str:
         sql = re.sub(r"<>\s*NaN\b", "IS NOT NULL", sql, flags=re.IGNORECASE)
         logger.warning("⚠️ Legacy NaN detected in SQL - auto-fixed to IS NULL/IS NOT NULL")
     return sql
+
+
+def as_uuid_or_none(value) -> Optional[str]:
+    """
+    Return canonical UUID text or None.
+
+    Use before any query that casts a caller-provided value to ::uuid. This
+    prevents user-facing document numbers like R/2627/0009 or INV/2627/0001
+    from reaching Postgres as invalid uuid input.
+    """
+    if value is None:
+        return None
+    try:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        # Streamlit production cards may pass composite keys like
+        # "<orders.id>:R/2627/0010". Treat the left side as the UUID instead
+        # of letting the full string reach Postgres as an invalid ::uuid cast.
+        if ":" in raw:
+            left = raw.split(":", 1)[0].strip()
+            if left:
+                raw = left
+        return str(_uuid.UUID(raw))
+    except Exception:
+        return None
+
+
+def is_uuid(value) -> bool:
+    return as_uuid_or_none(value) is not None
+
+
+def resolve_order_uuid(order_ref) -> Optional[str]:
+    """
+    Resolve an order reference to orders.id UUID text.
+
+    Accepts either a real UUID or a user-facing order number like R/2627/0009.
+    Returns None when unresolved. Use before any UI/session value reaches
+    `order_id = ...::uuid`.
+    """
+    oid = as_uuid_or_none(order_ref)
+    if oid:
+        return oid
+    ref = str(order_ref or "").strip()
+    if not ref:
+        return None
+    # Production cards sometimes use composite UI keys such as
+    # "<orders.id>:R/2627/0010-F".  The left side is the real UUID.
+    if ":" in ref:
+        left, right = ref.split(":", 1)
+        oid = as_uuid_or_none(left)
+        if oid:
+            return oid
+        ref = right.strip() or ref
+    queries = [
+        """
+        SELECT id::text AS id
+        FROM orders
+        WHERE order_no = %(ref)s
+           OR display_order_no::text = %(ref)s
+           OR EXISTS (
+               SELECT 1 FROM order_lines ol
+               WHERE ol.order_id = orders.id
+                 AND ol.production_ref = %(ref)s
+                 AND COALESCE(ol.is_deleted, FALSE) = FALSE
+           )
+        LIMIT 1
+        """,
+        """
+        SELECT id::text AS id
+        FROM orders
+        WHERE order_no = %(ref)s
+        LIMIT 1
+        """,
+    ]
+    for sql in queries:
+        try:
+            rows = run_query(sql, {"ref": ref}) or []
+            if rows:
+                return str(rows[0]["id"])
+        except Exception:
+            continue
+    return None
 
 # ==========================================================
 # SECURITY: READ-ONLY MODE FOR CERTAIN TAGS
@@ -206,6 +367,138 @@ def close_connection(conn):
     if conn and not conn.closed:
         conn.close()
 
+
+def _db_error_text(exc: Exception) -> str:
+    original = getattr(exc, "original", None)
+    parts = [str(exc or "")]
+    if original is not None:
+        parts.append(str(original))
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        parts.append(str(cause))
+    return "\n".join(p for p in parts if p)
+
+
+def _looks_schema_mismatch(exc: Exception) -> bool:
+    low = _db_error_text(exc).lower()
+    return (
+        ("column" in low and "does not exist" in low)
+        or ("relation" in low and "does not exist" in low)
+        or ("undefinedcolumn" in low)
+        or ("undefinedtable" in low)
+        or ("schema" in low and "mismatch" in low)
+    )
+
+
+def _try_schema_self_heal(context: str, exc: Exception) -> list[str]:
+    if not _looks_schema_mismatch(exc):
+        return []
+    try:
+        from modules.db.migrations.runner import run_pending_migrations
+        applied = run_pending_migrations() or []
+        try:
+            import streamlit as _st
+            if applied:
+                _st.info(
+                    "Unusual database schema pattern noticed. "
+                    f"Self-heal applied: {', '.join(applied)}. Retrying save..."
+                )
+            else:
+                _st.info(
+                    "Unusual database schema pattern noticed. "
+                    "Self-heal check ran; no pending migration was found. Retrying save..."
+                )
+        except Exception:
+            pass
+        logger.warning("[DB self-heal:%s] migrations applied: %s", context, applied)
+        return applied
+    except Exception as heal_exc:
+        logger.warning("[DB self-heal:%s] failed: %s", context, heal_exc)
+        return []
+
+
+def _publish_db_write_alert(exc: Exception, context: str, sql: str = "", params: Any = None, healed: list[str] = None) -> None:
+    technical = (
+        f"{_db_error_text(exc)}\n\n"
+        f"Context: {context}\n"
+        f"Heal applied: {', '.join(healed or []) if healed else 'none'}\n\n"
+        f"SQL:\n{str(sql or '')[:2500]}\n\n"
+        f"Params:\n{str(params or '')[:1500]}"
+    )
+    try:
+        from modules.core.operator_alerts import OperatorAlert, record_issue_comment, build_operator_alert
+        alert = build_operator_alert(exc, context=context)
+        alert.message = (
+            "The save/write did not commit. The transaction was rolled back, "
+            "so partial data should not be posted."
+        )
+        alert.action = (
+            "The internal auditor recorded this issue. If self-heal did not finish the save, "
+            "do not press the button repeatedly; check the issue note and retry after correction."
+        )
+        alert.technical = technical
+        note_path = record_issue_comment(alert, context=f"db_write:{context}")
+    except Exception:
+        note_path = ""
+    try:
+        import streamlit as _st
+        _st.session_state["_last_db_write_failure"] = {
+            "context": context,
+            "error": _db_error_text(exc),
+            "issue_note": note_path,
+            "healed": healed or [],
+            "at": time.time(),
+        }
+        _st.error(
+            "**Database save blocked**\n\n"
+            "The write did not commit. The system rolled back the transaction and recorded the cause."
+        )
+        if healed:
+            _st.warning(
+                "Self-heal ran, but the retry still failed. "
+                "This item is now in the issue list with the exact cause."
+            )
+        if note_path:
+            _st.caption(f"Issue note saved: {note_path}")
+    except Exception:
+        pass
+
+
+_COLUMN_EXISTS_CACHE = {}
+
+def _column_exists(table_name: str, column_name: str) -> bool:
+    """Schema compatibility helper for mixed test/prod DBs."""
+    key = (str(table_name), str(column_name))
+    if key in _COLUMN_EXISTS_CACHE:
+        return _COLUMN_EXISTS_CACHE[key]
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+              AND column_name = %s
+            LIMIT 1
+            """,
+            (table_name, column_name),
+        )
+        exists = cur.fetchone() is not None
+        _COLUMN_EXISTS_CACHE[key] = exists
+        return exists
+    except Exception:
+        _COLUMN_EXISTS_CACHE[key] = False
+        return False
+    finally:
+        close_connection(conn)
+
+def _inventory_alloc_expr(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return f"COALESCE({prefix}allocated_qty, 0)" if _column_exists("inventory_stock", "allocated_qty") else "0"
+
 def get_transaction_connection():
     conn = psycopg2.connect(**_get_db_config())
     conn.autocommit = False   # IMPORTANT
@@ -246,6 +539,7 @@ def execute_query(
         ✅ Comprehensive error logging
     """
     conn = None
+    _perf_t0 = time.perf_counter()
     try:
         # Security check for read-only contexts
         _check_read_only_safety(sql, tag)
@@ -258,7 +552,7 @@ def execute_query(
         cur = conn.cursor()
         
         # Sanitize parameters (NaN → None)
-        safe_params = _sanitize_params(params)
+        safe_params = _sanitize_uuid_composite_params(sql, _sanitize_params(params))
         
         # Legacy NaN auto-healing for raw SQL
         if safe_params is None:
@@ -290,6 +584,7 @@ def execute_query(
         logger.error(f"Params: {params}")
         raise QueryError(e)
     finally:
+        _record_sql_perf(_sql_perf_label(sql, f"sql:{tag}" if tag else "sql_df"), time.perf_counter() - _perf_t0, sql)
         close_connection(conn)
 
 
@@ -305,15 +600,25 @@ def run_query(sql: str, params=None) -> list:
     """
     conn = None
     cursor = None
+    _perf_t0 = time.perf_counter()
     try:
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
+        safe_params = _sanitize_uuid_composite_params(sql, _sanitize_params(params))
+
         # Only pass params if there are actual params to pass
-        if params:
-            cursor.execute(sql, params)
+        if safe_params:
+            cursor.execute(sql, safe_params)
         else:
             cursor.execute(sql)
+
+        if not cursor.description:
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            return []
 
         rows = cursor.fetchall()
 
@@ -336,6 +641,7 @@ def run_query(sql: str, params=None) -> list:
         logger.error(f"Params: {params}")
         raise QueryError(e)
     finally:
+        _record_sql_perf(_sql_perf_label(sql, "sql"), time.perf_counter() - _perf_t0, sql)
         if cursor:
             cursor.close()
         close_connection(conn)
@@ -360,7 +666,7 @@ def run_scalar(sql: str, params: dict = None):
         cursor = conn.cursor()
         
         # Sanitize dict params
-        safe_params = _sanitize_params(params)
+        safe_params = _sanitize_uuid_composite_params(sql, _sanitize_params(params))
         
         if safe_params:
             cursor.execute(sql, safe_params)
@@ -395,67 +701,111 @@ def run_write(sql: str, params: dict = None) -> bool:
     
     ✅ NaN-safe
     """
-    conn = None
-    cursor = None
+    def _attempt() -> bool:
+        conn = None
+        cursor = None
+        _perf_t0 = time.perf_counter()
+        try:
+            conn = get_transaction_connection()
+            cursor = conn.cursor()
+            safe_params = _sanitize_uuid_composite_params(sql, _sanitize_params(params))
+            if safe_params:
+                cursor.execute(sql, safe_params)
+            else:
+                cursor.execute(sql)
+            conn.commit()
+            return True
+        except Exception:
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            _record_sql_perf(_sql_perf_label(sql, "write"), time.perf_counter() - _perf_t0, sql)
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+
     try:
-        conn = get_transaction_connection()
-        cursor = conn.cursor()
-        
-        # Sanitize dict params
-        safe_params = _sanitize_params(params)
-        
-        if safe_params:
-            cursor.execute(sql, safe_params)
-        else:
-            cursor.execute(sql)
-            
-        conn.commit()
-        return True
-        
+        return _attempt()
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"run_write failed: {e}")
         logger.error(f"SQL: {sql}")
         logger.error(f"Params: {params}")
+        healed = _try_schema_self_heal("run_write", e)
+        if healed or _looks_schema_mismatch(e):
+            try:
+                ok = _attempt()
+                try:
+                    import streamlit as _st
+                    _st.success(
+                        "Database self-heal completed and the save was retried successfully."
+                    )
+                except Exception:
+                    pass
+                return ok
+            except Exception as retry_e:
+                _publish_db_write_alert(retry_e, "run_write_retry", sql, params, healed)
+                raise QueryError(retry_e)
+        _publish_db_write_alert(e, "run_write", sql, params, healed)
         raise QueryError(e)
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
 
 def run_transaction(steps: list) -> bool:
     """
     Execute multiple SQL statements in a single atomic transaction.
     All steps succeed or all are rolled back — no partial commits.
     """
-    conn   = None
-    cursor = None
+    def _attempt() -> bool:
+        conn = None
+        cursor = None
+        try:
+            conn = get_transaction_connection()
+            cursor = conn.cursor()
+            for sql, params in steps:
+                safe_params = _sanitize_uuid_composite_params(sql, _sanitize_params(params)) if params else None
+                if safe_params:
+                    cursor.execute(sql, safe_params)
+                else:
+                    cursor.execute(sql)
+            conn.commit()
+            return True
+        except Exception:
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+
     try:
-        conn   = get_transaction_connection()
-        cursor = conn.cursor()
-
-        for sql, params in steps:
-            safe_params = _sanitize_params(params) if params else None
-            if safe_params:
-                cursor.execute(sql, safe_params)
-            else:
-                cursor.execute(sql)
-
-        conn.commit()
-        return True
-
+        return _attempt()
     except Exception as e:
-        if conn:
-            conn.rollback()
         logger.error(f"run_transaction failed — rolled back: {e}")
+        healed = _try_schema_self_heal("run_transaction", e)
+        if healed or _looks_schema_mismatch(e):
+            try:
+                ok = _attempt()
+                try:
+                    import streamlit as _st
+                    _st.success(
+                        "Database self-heal completed and the transaction was retried successfully."
+                    )
+                except Exception:
+                    pass
+                return ok
+            except Exception as retry_e:
+                _publish_db_write_alert(
+                    retry_e,
+                    "run_transaction_retry",
+                    "\n\n".join(str(s[0]) for s in (steps or [])[:5]),
+                    None,
+                    healed,
+                )
+                raise QueryError(retry_e)
+        _publish_db_write_alert(e, "run_transaction", "\n\n".join(str(s[0]) for s in (steps or [])[:5]), None, healed)
         raise QueryError(e)
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
 
 
 def run_transaction_fn(fn) -> any:
@@ -490,6 +840,8 @@ def run_transaction_fn(fn) -> any:
         if conn:
             conn.rollback()
         logger.error(f"run_transaction_fn failed — rolled back: {e}")
+        healed = _try_schema_self_heal("run_transaction_fn", e)
+        _publish_db_write_alert(e, "run_transaction_fn", getattr(fn, "__name__", "transaction_fn"), None, healed)
         raise QueryError(e)
     finally:
         if cursor:
@@ -676,7 +1028,7 @@ def stock_allocate_atomic(order_line_id: str, batch_no: str,
 
         # Lock the batch row
         cursor.execute("""
-            SELECT COALESCE(physical_qty, quantity, 0)       AS physical_qty,
+            SELECT COALESCE(quantity, 0)                     AS physical_qty,
                    COALESCE(allocated_qty, 0)                AS allocated_qty,
                    COALESCE(reserved_qty, 0)                 AS reserved_qty
             FROM   inventory_stock
@@ -847,6 +1199,7 @@ def add_power_filters(
 # PRODUCT MASTER (mapped to 'products' table)
 # -------------------------------------------------
 
+@_cache_data(ttl=10, show_spinner=False)
 def read_product_master() -> pd.DataFrame:
     """
     Reads from 'products' table in PostgreSQL.
@@ -1079,13 +1432,16 @@ def read_inventory_stock() -> pd.DataFrame:
     Reads from 'inventory_stock' table
     Returns current stock levels for all products
     """
+    _alloc_expr = _inventory_alloc_expr()
+    _batch_expr = "batch_id" if _column_exists("inventory_stock", "batch_id") else "NULL::uuid"
+    _bin_expr = "bin_no" if _column_exists("inventory_stock", "bin_no") else "NULL::text"
 
-    sql = """
+    sql = f"""
         SELECT
             id as stock_id,
 
             product_id,
-            batch_id,
+            {_batch_expr} AS batch_id,
 
             sph,
             cyl,
@@ -1094,10 +1450,12 @@ def read_inventory_stock() -> pd.DataFrame:
 
             eye_side,
 
-            quantity,
+            COALESCE(quantity, 0) AS physical_qty,
+            {_alloc_expr} AS allocated_qty,
+            GREATEST(0, COALESCE(quantity, 0) - {_alloc_expr}) AS quantity,
 
             location,
-            bin_no,
+            {_bin_expr} AS bin_no,
 
             COALESCE(is_active, true) as is_active,
 
@@ -1143,7 +1501,9 @@ def read_inventory_transactions(
 
             eye_side,
 
-            quantity,
+            COALESCE(quantity, 0) AS physical_qty,
+            COALESCE(allocated_qty, 0) AS allocated_qty,
+            GREATEST(0, COALESCE(quantity, 0) - COALESCE(allocated_qty, 0)) AS quantity,
             unit_price,
 
             reference_type,
@@ -1710,7 +2070,18 @@ def fetch_orders_with_lines(order_nos: list):
                 p.main_group,
                 p.product_name,
                 p.brand,
-                p.gst_percent AS product_gst_percent
+                p.gst_percent AS product_gst_percent,
+
+                pa.id::text AS procurement_pa_id,
+                pa.supplier_name AS procurement_supplier_name,
+                pa.invoice_no AS procurement_invoice_no,
+                pa.challan_no AS procurement_challan_no,
+                pa.document_date::text AS procurement_document_date,
+                pa.acknowledged_at::text AS procurement_acknowledged_at,
+                pa.supplier_order_ref AS procurement_supplier_order_ref,
+                pa.audit_status AS procurement_audit_status,
+                pa.billing_status AS procurement_billing_status,
+                pa.total_value AS procurement_total_value
 
             FROM orders o
 
@@ -1720,6 +2091,25 @@ def fetch_orders_with_lines(order_nos: list):
 
             LEFT JOIN products p
                 ON l.product_id = p.id
+
+            LEFT JOIN LATERAL (
+                SELECT
+                    pa.id,
+                    pa.supplier_name,
+                    pa.invoice_no,
+                    pa.challan_no,
+                    pa.document_date,
+                    pa.acknowledged_at,
+                    pa.supplier_order_ref,
+                    pa.audit_status,
+                    pa.billing_status,
+                    pa.total_value
+                FROM purchase_acknowledgements pa
+                WHERE pa.order_line_id = l.id
+                  AND COALESCE(pa.billing_status, '') NOT IN ('VOID', 'CANCELLED')
+                ORDER BY pa.acknowledged_at DESC NULLS LAST, pa.document_date DESC NULLS LAST
+                LIMIT 1
+            ) pa ON TRUE
 
             WHERE o.order_no = ANY(%s)
 
@@ -1823,16 +2213,18 @@ def search_patients(search_term: str) -> pd.DataFrame:
             id              AS patient_id,
             master_name     AS patient_name,
             mobile,
-            COALESCE(relation,'Self')   AS relation,
-            COALESCE(gender,'')         AS gender,
+            'Self'::text                AS relation,
+            ''::text                    AS gender,
             COALESCE(ref_mobile,'')     AS ref_mobile,
+            COALESCE(barcode,'')        AS barcode,
+            dob::text                   AS dob,
             record_no
         FROM patients
         WHERE master_name ILIKE %s
-           OR mobile ILIKE %s
-           OR ref_mobile ILIKE %s
-           OR barcode ILIKE %s
-           OR record_no ILIKE %s
+           OR COALESCE(mobile,'') ILIKE %s
+           OR COALESCE(ref_mobile,'') ILIKE %s
+           OR COALESCE(barcode,'') ILIKE %s
+           OR COALESCE(record_no,'') ILIKE %s
         ORDER BY master_name
         LIMIT 30
     """
@@ -1920,8 +2312,9 @@ def read_ophthalmic_stock() -> pd.DataFrame:
     - Wholesale pricing
     - Last nail fallback
     """
+    _alloc_expr = _inventory_alloc_expr()
 
-    sql = """
+    sql = f"""
         SELECT
             id,
             product_id,
@@ -1931,7 +2324,9 @@ def read_ophthalmic_stock() -> pd.DataFrame:
             axis,
             add_power,
             eye_side,
-            quantity,
+            COALESCE(quantity, 0) AS physical_qty,
+            {_alloc_expr} AS allocated_qty,
+            GREATEST(0, COALESCE(quantity, 0) - {_alloc_expr}) AS quantity,
 
             -- 🔥 PRICE FIELDS (CRITICAL)
             -- selling_price = W/S trade price
@@ -2030,13 +2425,16 @@ def read_frame_sku() -> pd.DataFrame:
     mrp   = retail counter price (COALESCED so retail pricing always works)
     selling_price = W/S trade price
     """
-    sql = """
+    _alloc_expr = _inventory_alloc_expr("s")
+    sql = f"""
         SELECT
             s.id,
             s.product_id,
             s.batch_no,
             s.eye_side,
-            s.quantity,
+            COALESCE(s.quantity, 0) AS physical_qty,
+            {_alloc_expr} AS allocated_qty,
+            GREATEST(0, COALESCE(s.quantity, 0) - {_alloc_expr}) AS quantity,
             COALESCE(s.selling_price, 0)               AS selling_price,
             COALESCE(s.mrp, s.selling_price, 0)        AS mrp,
             COALESCE(s.purchase_rate, 0)               AS purchase_rate,
@@ -2067,6 +2465,7 @@ def fetch_backoffice_orders(
     limit: int = 10,
     offset: int = 0,
     include_closed: bool = False,
+    order_no: str = None,
 ):
     """
     Fetch orders for backoffice display — headers ONLY (no JOIN to lines).
@@ -2104,6 +2503,10 @@ def fetch_backoffice_orders(
         sql += " AND o.status NOT IN ('CLOSED', 'DELIVERED', 'CANCELLED', 'RETURNED')"
 
     sql += " AND UPPER(COALESCE(o.order_type,'')) != 'CONSULTATION'"
+
+    if order_no:
+        sql += " AND o.order_no = %s"
+        params.append(order_no)
 
     if start_date:
         sql += " AND o.created_at >= %s"
@@ -2143,6 +2546,37 @@ def get_database_info():
         conn_df = execute_query("SELECT COUNT(*) FROM pg_stat_activity", "db_info")
         info["active_connections"] = int(conn_df.iloc[0, 0]) if not conn_df.empty else 0
 
+        max_conn_df = execute_query("SHOW max_connections", "db_info")
+        info["max_connections"] = int(max_conn_df.iloc[0, 0]) if not max_conn_df.empty else 0
+
+        server_df = execute_query(
+            """
+            SELECT
+                inet_server_addr()::text AS server_addr,
+                inet_server_port()       AS server_port,
+                pg_is_in_recovery()      AS standby,
+                pg_database_size(current_database()) AS db_size_bytes,
+                (SELECT COUNT(*) FROM pg_locks WHERE NOT granted) AS waiting_locks
+            """,
+            "db_info",
+        )
+        if not server_df.empty:
+            row = server_df.iloc[0]
+            info["server_addr"] = str(row.get("server_addr") or DB_CONFIG.get("host") or "")
+            info["server_port"] = int(row.get("server_port") or DB_CONFIG.get("port") or 0)
+            info["standby"] = bool(row.get("standby"))
+            info["db_size_bytes"] = int(row.get("db_size_bytes") or 0)
+            info["waiting_locks"] = int(row.get("waiting_locks") or 0)
+
+        host = str(DB_CONFIG.get("host") or "").lower()
+        info["host"] = DB_CONFIG.get("host")
+        if host in ("localhost", "127.0.0.1", "::1"):
+            info["deployment_mode"] = "LOCAL"
+        elif host.startswith(("192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")):
+            info["deployment_mode"] = "LAN"
+        else:
+            info["deployment_mode"] = "CLOUD/REMOTE"
+
         info["status"] = "ok"        # ✅ UI expects this
         info["connected"] = True    # ✅ extra compatibility
 
@@ -2162,6 +2596,7 @@ def read_blank_inventory(
     material: str = None,
     brand: str = None,
     add_power: float = None,
+    base_curve: float = None,
     active_only: bool = True,
 ) -> pd.DataFrame:
     """
@@ -2172,6 +2607,7 @@ def read_blank_inventory(
       material    → exact match (case-insensitive)
       brand       → exact match (case-insensitive)
       add_power   → exact match OR NULL/0 rows included (0.25 tolerance)
+      base_curve  → recommended inventory base match (0.05 tolerance)
       active_only → WHERE COALESCE(is_active, true) = true
 
     Returns a DataFrame with all blank_inventory columns.
@@ -2189,8 +2625,28 @@ def read_blank_inventory(
             clauses.append("COALESCE(is_active, true) = true")
 
         if category is not None:
-            clauses.append("LOWER(category) = LOWER(%(category)s)")
-            params["category"] = category
+            cat_norm = str(category or "").strip().upper()
+            category_aliases = {
+                "PROGRESSIVE": ["Progressive", "V2", "PAL"],
+                "PAL": ["Progressive", "V2", "PAL"],
+                "V2": ["Progressive", "V2", "PAL"],
+                "SINGLE VISION": ["Single Vision", "SV"],
+                "SINGLE_VISION": ["Single Vision", "SV"],
+                "SV": ["Single Vision", "SV"],
+                "KRYPTOK": ["Kryptok", "KT"],
+                "KT": ["Kryptok", "KT"],
+                "KT BIFOCAL": ["Kryptok", "KT"],
+                "KT BIFOCALS": ["Kryptok", "KT"],
+                "D BIFOCAL": ["D Bifocal", "D BIFOCAL"],
+                "D-BIFOCAL": ["D Bifocal", "D BIFOCAL"],
+            }
+            aliases = category_aliases.get(cat_norm)
+            if aliases:
+                clauses.append("UPPER(category) = ANY(%(category_aliases)s::text[])")
+                params["category_aliases"] = [a.upper() for a in aliases]
+            else:
+                clauses.append("LOWER(category) = LOWER(%(category)s)")
+                params["category"] = category
 
         if material is not None:
             clauses.append("LOWER(material) = LOWER(%(material)s)")
@@ -2208,6 +2664,13 @@ def read_blank_inventory(
                 " OR ABS(add_power - %(add_power)s) < 0.01)"
             )
             params["add_power"] = float(add_power)
+
+        if base_curve is not None:
+            clauses.append(
+                "base_recommended IS NOT NULL "
+                "AND ABS(base_recommended - %(base_curve)s) < 0.05"
+            )
+            params["base_curve"] = float(base_curve)
 
         where = " AND ".join(clauses)
         sql = f"""
@@ -2236,7 +2699,7 @@ def read_blank_inventory(
                 updated_at
             FROM blank_inventory
             WHERE {where}
-            ORDER BY brand, material, add_power NULLS LAST
+            ORDER BY brand, material, add_power NULLS LAST, base_recommended NULLS LAST
         """
         return execute_query(sql, "blank_inventory", params=params or None)
 

@@ -5,6 +5,7 @@ All reports using only tables that exist in the DB.
 import streamlit as st
 import pandas as pd
 from datetime import date, timedelta
+from urllib.parse import quote_plus
 
 
 def _q(sql, params=None):
@@ -43,9 +44,22 @@ def _date_filter(key="r"):
         "All time":      (date(2020,1,1), date.today()),
     }
     c1,c2,c3 = st.columns([1,1,2])
-    preset = c3.selectbox("Period", list(presets.keys()), index=2, key=f"{key}_pre")
+    pre_key = f"{key}_pre"
+    prev_key = f"{key}_pre_prev"
+    preset = c3.selectbox("Period", list(presets.keys()), index=2, key=pre_key)
     df,dt = presets[preset]
+    if st.session_state.get(prev_key) != preset:
+        st.session_state[f"{key}_fd"] = df
+        st.session_state[f"{key}_td"] = dt
+        st.session_state[prev_key] = preset
     return c1.date_input("From",value=df,key=f"{key}_fd"), c2.date_input("To",value=dt,key=f"{key}_td")
+
+
+def _wa_link(mobile: str, message: str) -> str:
+    digits = "".join(ch for ch in str(mobile or "") if ch.isdigit())
+    if len(digits) == 10:
+        digits = "91" + digits
+    return "https://wa.me/{}?text={}".format(digits, quote_plus(message or ""))
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -60,19 +74,92 @@ def _party_picker(key="r"):
     return st.selectbox("Party", names, key=f"{key}_pty")
 
 
+def _party_detail_by_name(party_name: str) -> dict:
+    if not party_name or party_name == "All Parties":
+        return {}
+    rows = _q("""
+        SELECT party_name, COALESCE(mobile,'') AS mobile
+        FROM parties
+        WHERE party_name=%(pn)s
+        LIMIT 1
+    """, {"pn": party_name})
+    return rows[0] if rows else {}
+
+
+def _qty_display_for_report(row) -> str:
+    try:
+        qty = float(row.get("Qty") or 0)
+    except Exception:
+        qty = 0.0
+    qty_i = int(round(qty))
+    product_text = " ".join(str(row.get(k) or "") for k in ["Category", "Product", "Unit"]).lower()
+    try:
+        box_size = int(float(row.get("_Box Size") or 1))
+    except Exception:
+        box_size = 1
+    if box_size > 1:
+        boxes = qty_i // box_size
+        pcs = qty_i % box_size
+        if boxes and pcs:
+            return f"{boxes} box + {pcs} pcs ({qty_i} pcs)"
+        if boxes:
+            return f"{boxes} box ({qty_i} pcs)"
+        return f"{qty_i} pcs"
+    if "ophthalmic" in product_text or ("lens" in product_text and "contact" not in product_text):
+        pairs = qty_i // 2
+        pcs = qty_i % 2
+        if pairs and pcs:
+            return f"{pairs} pair + {pcs} pc ({qty_i} pcs)"
+        if pairs:
+            return f"{pairs} pair ({qty_i} pcs)"
+        return f"{qty_i} pc"
+    return f"{qty_i} pcs" if abs(qty - qty_i) < 0.0001 else f"{qty:g} pcs"
+
+
 def _print_btn(df, title, key):
-    c1,c2 = st.columns(2)
+    c1,c2,c3,c4 = st.columns(4)
     with c1:
-        st.download_button("\u2b07 Export CSV",
+        st.download_button("⬇ CSV",
             df.to_csv(index=False).encode(),
             file_name=f"{title[:30].replace(' ','_')}.csv",
             mime="text/csv", key=f"{key}_csv", use_container_width=True)
     with c2:
-        if st.button("\U0001f5a8 Print", key=f"{key}_prt", use_container_width=True):
+        try:
+            from modules.reports.registers import _df_to_excel_bytes
+            st.download_button(
+                "⬇ Excel",
+                _df_to_excel_bytes(df, title),
+                file_name=f"{title[:30].replace(' ','_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"{key}_xlsx",
+                use_container_width=True,
+            )
+        except Exception as exc:
+            st.button("⬇ Excel", disabled=True, key=f"{key}_xlsx_dis",
+                      help=str(exc), use_container_width=True)
+    with c3:
+        if st.button("🖨 Direct", key=f"{key}_direct", use_container_width=True):
+            try:
+                from modules.printing.direct_print import spool_html_to_printer
+                from modules.printing.print_opener import open_html_print
+                from modules.printing.printer_config import load_printer_settings
+                html = _do_print(df, title, return_html=True)
+                ok, msg = spool_html_to_printer(html, job_name=title[:50])
+                if ok:
+                    st.success(msg)
+                else:
+                    st.warning(f"Direct print unavailable: {msg}")
+                    if bool(load_printer_settings().get("html_fallback", True)):
+                        path = open_html_print(html, f"{title[:30].replace(' ','_')}.html")
+                        st.info(f"Opened HTML standby: {path}")
+            except Exception as exc:
+                st.error(f"Direct print failed: {exc}")
+    with c4:
+        if st.button("Browser Print", key=f"{key}_prt", use_container_width=True):
             _do_print(df, title)
 
 
-def _do_print(df, title):
+def _do_print(df, title, return_html=False):
     import streamlit.components.v1 as components
     sh = _shop()
     hdr = "".join(f'<th style="padding:5px 8px;background:#1e3a5f;color:#fff;font-size:11px">{c}</th>' for c in df.columns)
@@ -92,16 +179,40 @@ def _do_print(df, title):
     <table style="width:100%;border-collapse:collapse">
       <thead><tr>{hdr}</tr></thead><tbody>{bdy}</tbody></table>
     <script>window.onload=function(){{window.print()}}</script></body></html>"""
+    if return_html:
+        return html
     components.html(html, height=700, scrolling=True)
 
 
 # ── TAB 1: LEDGER ─────────────────────────────────────────────────────────────
 def _tab_ledger():
+    try:
+        from modules.reports.registers import render_party_ledger
+        st.caption("Uses the same settled Party Ledger from Registers: opening balance, covered challans, print, WhatsApp, and email share.")
+        render_party_ledger()
+        return
+    except Exception as exc:
+        st.warning(f"Shared Registers ledger could not load, showing legacy Reports ledger. Error: {exc}")
+
     st.caption("Party account statement — invoices issued vs payments received")
-    c1,c2 = st.columns([2,1])
+    c1,c2,c3 = st.columns([2,1,1])
     with c1: fd,td = _date_filter("ldg")
     with c2: pty = _party_picker("ldg")
-    pf = "" if pty=="All Parties" else "AND p.party_name=%(pty)s"
+    with c3:
+        view = st.selectbox("Ledger View", ["Combined", "Invoices", "Challans"], key="ldg_view")
+
+    party_row = {}
+    if pty != "All Parties":
+        pr = _q("""
+            SELECT id::text, party_name, COALESCE(mobile,'') AS mobile,
+                   COALESCE(opening_balance,0) AS opening_balance,
+                   UPPER(COALESCE(balance_type,'DR')) AS balance_type
+            FROM parties
+            WHERE party_name=%(pty)s
+            LIMIT 1
+        """, {"pty": pty})
+        party_row = pr[0] if pr else {}
+    pty_filter = "" if pty == "All Parties" else "AND party_name = %(pty)s"
 
     # DEBUG — check what tables exist
     if st.checkbox("Show debug info", key="ldg_debug"):
@@ -117,95 +228,288 @@ def _tab_ledger():
                  f"Challans: {chal_count[0]['n'] if chal_count else 'error'} | "
                  f"Orders: {order_count[0]['n'] if order_count else 'error'}")
 
-    # Invoices as Dr entries
-    inv_rows = _q(f"""
-        SELECT i.invoice_date::text AS "Date",
-               'INVOICE'          AS "Type",
-               p.party_name         AS "Party",
-               
-               i.invoice_no         AS "Document",
-               i.grand_total        AS "Dr (\u20b9)",
-               0                    AS "Cr (\u20b9)",
-               i.payment_status     AS "Remarks"
-        FROM invoices i
-        JOIN parties p ON p.id=i.party_id
-        WHERE i.invoice_date BETWEEN %(fd)s AND %(td)s
-          AND i.status!='CANCELLED' {pf}
-    """, {"fd":fd,"td":td,"pty":pty})
+    rows = _q(f"""
+        WITH inv AS (
+            SELECT i.invoice_date::date AS entry_date,
+                   'INVOICE'::text AS entry_type,
+                   COALESCE(p.party_name, ox.party_name, ox.patient_name, 'Unknown') AS party_name,
+                   i.invoice_no AS ref_no,
+                   COALESCE(i.grand_total,0) AS debit,
+                   0::numeric AS credit,
+                   COALESCE(i.payment_status, i.status, '') AS remarks,
+                   FALSE AS covered_challan
+            FROM invoices i
+            LEFT JOIN parties p ON p.id=i.party_id
+            LEFT JOIN LATERAL (
+                SELECT o.party_name, o.patient_name
+                FROM orders o
+                WHERE o.id::text = ANY(COALESCE(i.order_ids::text[], ARRAY[]::text[]))
+                LIMIT 1
+            ) ox ON TRUE
+            WHERE i.invoice_date BETWEEN %(fd)s AND %(td)s
+              AND UPPER(COALESCE(i.status,'')) != 'CANCELLED'
+        ),
+        ch AS (
+            SELECT c.challan_date::date AS entry_date,
+                   'CHALLAN'::text AS entry_type,
+                   COALESCE(p.party_name, ox.party_name, ox.patient_name, 'Unknown') AS party_name,
+                   c.challan_no AS ref_no,
+                   COALESCE(c.grand_total,c.total_amount,0) AS debit,
+                   0::numeric AS credit,
+                   COALESCE(c.status,'') AS remarks,
+                   EXISTS (
+                       SELECT 1 FROM invoices i2
+                       WHERE i2.challan_id = c.id
+                         AND COALESCE(i2.is_deleted,FALSE) = FALSE
+                   ) AS covered_challan
+            FROM challans c
+            LEFT JOIN parties p ON p.id=c.party_id
+            LEFT JOIN LATERAL (
+                SELECT o.party_name, o.patient_name
+                FROM orders o
+                WHERE o.id::text = ANY(COALESCE(c.order_ids::text[], ARRAY[]::text[]))
+                LIMIT 1
+            ) ox ON TRUE
+            WHERE c.challan_date BETWEEN %(fd)s AND %(td)s
+              AND UPPER(COALESCE(c.status,'')) != 'CANCELLED'
+        ),
+        pay AS (
+            SELECT p.payment_date::date AS entry_date,
+                   'PAYMENT'::text AS entry_type,
+                   COALESCE(pp.party_name, p.party_name, ip.party_name, cp.party_name, op.party_name, 'Unknown') AS party_name,
+                   COALESCE(p.payment_no, p.id::text) AS ref_no,
+                   0::numeric AS debit,
+                   COALESCE(p.amount,0) AS credit,
+                   COALESCE(p.remarks, p.payment_mode, p.method, '') AS remarks,
+                   FALSE AS covered_challan
+            FROM payments p
+            LEFT JOIN parties pp ON pp.id=p.party_id
+            LEFT JOIN invoices i ON i.id=p.invoice_id
+            LEFT JOIN parties ip ON ip.id=i.party_id
+            LEFT JOIN challans c ON c.id=p.challan_id
+            LEFT JOIN parties cp ON cp.id=c.party_id
+            LEFT JOIN orders o ON o.id=COALESCE(p.order_id, p.advance_for_order_id)
+            LEFT JOIN parties op ON op.id=o.party_id
+            WHERE p.payment_date BETWEEN %(fd)s AND %(td)s
+              AND NOT COALESCE(p.is_deleted,FALSE)
+              AND COALESCE(NULLIF(p.payment_type,''), 'PAYMENT')
+                  IN ('PAYMENT','RECEIPT','ADVANCE','OPENING')
+        ),
+        base AS (
+            SELECT * FROM inv
+            UNION ALL SELECT * FROM ch
+            UNION ALL SELECT * FROM pay
+        )
+        SELECT entry_date::text AS "Date",
+               entry_type AS "Type",
+               party_name AS "Party",
+               ref_no AS "Document",
+               ROUND(debit,2) AS "Dr (\u20b9)",
+               ROUND(credit,2) AS "Cr (\u20b9)",
+               CASE
+                   WHEN covered_challan THEN CONCAT(remarks, ' · covered by invoice')
+                   ELSE remarks
+               END AS "Remarks",
+               covered_challan AS "_covered_challan"
+        FROM base
+        WHERE 1=1 {pty_filter}
+        ORDER BY party_name, entry_date, ref_no
+    """, {"fd":fd, "td":td, "pty":pty})
 
-    # Challans as reference
-    chal_rows = _q(f"""
-        SELECT c.challan_date::text AS "Date",
-               'CHALLAN'          AS "Type",
-               p.party_name         AS "Party",
-               
-               c.challan_no         AS "Document",
-               c.grand_total        AS "Dr (\u20b9)",
-               0                    AS "Cr (\u20b9)",
-               c.status             AS "Remarks"
-        FROM challans c
-        JOIN parties p ON p.id=c.party_id
-        WHERE c.challan_date BETWEEN %(fd)s AND %(td)s
-          AND c.status!='CANCELLED' {pf}
-    """, {"fd":fd,"td":td,"pty":pty})
+    all_rows = rows or []
+    if pty != "All Parties" and party_row:
+        opening = float(party_row.get("opening_balance") or 0)
+        btype = str(party_row.get("balance_type") or "DR").upper()
+        if opening > 0 and btype not in ("CR", "CREDIT"):
+            all_rows.insert(0, {
+                "Date": str(fd),
+                "Type": "OPENING",
+                "Party": pty,
+                "Document": "Opening Balance",
+                "Dr (\u20b9)": opening,
+                "Cr (\u20b9)": 0,
+                "Remarks": "Opening balance from Party Master",
+                "_covered_challan": False,
+            })
 
-    all_rows = (inv_rows or []) + (chal_rows or [])
     if not all_rows:
         st.info("No invoices or challans found for this period.")
         st.caption("💡 Tip: Use **📋 Columnar** tab to see order-level data — it shows all orders even without invoices.")
         return
 
     df = _df(all_rows)
+    if view == "Invoices":
+        df = df[df["Type"].isin(["OPENING", "INVOICE", "PAYMENT"])]
+    elif view == "Challans":
+        df = df[df["Type"].isin(["OPENING", "CHALLAN", "PAYMENT"])]
+    else:
+        df = df[~((df["Type"] == "CHALLAN") & (df["_covered_challan"] == True))]
+    if df.empty:
+        st.info(f"No {view.lower()} ledger entries found for this period.")
+        return
     df["Dr (\u20b9)"] = pd.to_numeric(df["Dr (\u20b9)"],errors="coerce").fillna(0)
     df["Cr (\u20b9)"] = pd.to_numeric(df["Cr (\u20b9)"],errors="coerce").fillna(0)
     df = df.sort_values(["Party","Date"])
+    df["_covered_challan"] = df.get("_covered_challan", False).fillna(False).astype(bool)
+    df["_balance_dr"] = df["Dr (\u20b9)"]
+    df.loc[df["_covered_challan"], "_balance_dr"] = 0
+    df["_net_movement"] = df["_balance_dr"] - df["Cr (\u20b9)"]
+    df["Balance (\u20b9)"] = df.groupby("Party", sort=False)["_net_movement"].cumsum()
 
-    m1,m2,m3 = st.columns(3)
+    m1,m2,m3,m4 = st.columns(4)
     dr=df["Dr (\u20b9)"].sum(); cr=df["Cr (\u20b9)"].sum()
-    m1.metric("Total Invoiced",  f"\u20b9{dr:,.0f}")
-    m2.metric("Total Collected", f"\u20b9{cr:,.0f}")
-    m3.metric("Outstanding",     f"\u20b9{dr-cr:,.0f}")
+    covered_dr = df.loc[df["_covered_challan"], "Dr (\u20b9)"].sum()
+    payable_dr = df["_balance_dr"].sum()
+    m1.metric("Total Debit",     f"\u20b9{dr:,.0f}")
+    m2.metric("Covered Challans", f"\u20b9{covered_dr:,.0f}")
+    m3.metric("Collected",       f"\u20b9{cr:,.0f}")
+    m4.metric("Payable Outstanding", f"\u20b9{payable_dr-cr:,.0f}")
 
-    st.dataframe(df, use_container_width=True, hide_index=True,
+    if pty != "All Parties":
+        mini = df[df["Type"].eq("INVOICE")].sort_values("Date", ascending=False).head(5)
+        lines = [
+            f"Hello {pty}",
+            f"{view} ledger summary",
+            f"Period: {fd} to {td}",
+            f"Opening: \u20b9{float(party_row.get('opening_balance') or 0):,.2f}",
+            f"Payable outstanding: \u20b9{payable_dr-cr:,.2f}",
+            f"Covered challans excluded: \u20b9{covered_dr:,.2f}",
+            "",
+            "Last 5 invoices:",
+        ]
+        if mini.empty:
+            lines.append("No invoices in selected view/period.")
+        else:
+            for _, r in mini.iterrows():
+                lines.append(f"{r['Date']} · {r['Document']} · \u20b9{float(r['Dr (\u20b9)']):,.2f}")
+        lines.append("")
+        lines.append("Thank you.")
+        msg_key = "ldg_wa_msg"
+        msg_src = "ldg_wa_src"
+        src = f"{pty}|{fd}|{td}|{view}|{payable_dr}|{covered_dr}|{cr}"
+        if st.session_state.get(msg_src) != src:
+            st.session_state[msg_key] = "\n".join(lines)
+            st.session_state[msg_src] = src
+        with st.expander("WhatsApp mini ledger", expanded=False):
+            try:
+                from modules.wa_contact_tools import render_mobile_field
+                mobile = render_mobile_field(
+                    "ldg_wa",
+                    name=pty,
+                    mobile=str(party_row.get("mobile") or ""),
+                    label="Mobile",
+                )
+            except Exception:
+                mobile = st.text_input("Mobile", value=str(party_row.get("mobile") or ""), key="ldg_wa_mobile")
+            edited = st.text_area("Message", key=msg_key, height=190)
+            st.link_button("Send WhatsApp Ledger", _wa_link(mobile, edited), use_container_width=True)
+            st.download_button(
+                "Download Ledger CSV",
+                df.drop(columns=["_covered_challan", "_balance_dr", "_net_movement"], errors="ignore").to_csv(index=False).encode(),
+                file_name=f"ledger_{pty}_{fd}_{td}.csv".replace(" ", "_"),
+                mime="text/csv",
+                key="ldg_party_csv",
+                use_container_width=True,
+            )
+
+    show_df = df.drop(columns=["_covered_challan", "_balance_dr", "_net_movement"], errors="ignore")
+    st.dataframe(show_df, use_container_width=True, hide_index=True,
         column_config={
             "Dr (\u20b9)": st.column_config.NumberColumn(format="\u20b9%.0f"),
             "Cr (\u20b9)": st.column_config.NumberColumn(format="\u20b9%.0f"),
+            "Balance (\u20b9)": st.column_config.NumberColumn(format="\u20b9%.0f"),
         })
-    _print_btn(df, f"Ledger {pty} {fd} to {td}", "ldg")
+    _print_btn(show_df, f"{view} Ledger {pty} {fd} to {td}", "ldg")
 
 
 # ── TAB 2: PRODUCT SALES ──────────────────────────────────────────────────────
 def _tab_product_sales():
-    st.caption("Product-wise sales from order lines")
+    st.caption("Product-wise and party-wise sales from order lines")
     fd,td = _date_filter("pws")
+    f1, f2, f3 = st.columns([1.3, 1.3, 1])
+    with f1:
+        pty = _party_picker("pws")
+    with f2:
+        report_view = st.selectbox(
+            "Report",
+            ["Product Summary", "Discount Detail"],
+            key="pws_view",
+        )
     @st.cache_data(ttl=300, show_spinner=False)
     def _get_main_groups():
         return [r["main_group"] for r in
                 _q("SELECT DISTINCT main_group FROM products WHERE main_group IS NOT NULL ORDER BY main_group")]
     mgs = ["All Groups"] + _get_main_groups()
-    mg = st.selectbox("Category", mgs, key="pws_mg")
+    with f3:
+        mg = st.selectbox("Category", mgs, key="pws_mg")
     gf = "" if mg=="All Groups" else "AND p.main_group=%(mg)s"
+    pf = "" if pty=="All Parties" else "AND COALESCE(pa.party_name,o.party_name,'')=%(pty)s"
 
-    rows = _q(f"""
-        SELECT
-            COALESCE(p.main_group,'—') AS "Category",
-            p.product_name              AS "Product",
-            COALESCE(p.brand,'—')     AS "Brand",
-            SUM(ol.quantity)            AS "Qty",
-            ROUND(SUM(ol.unit_price * ol.quantity),0) AS "Base (\u20b9)",
-            ROUND(SUM(ol.unit_price * ol.quantity * COALESCE(p.gst_percent,0)/100),0) AS "GST (\u20b9)",
-            ROUND(SUM(ol.unit_price * ol.quantity * (1+COALESCE(p.gst_percent,0)/100)),0) AS "Total (\u20b9)",
-            COUNT(DISTINCT o.id) AS "Orders"
-        FROM order_lines ol
-        JOIN orders o   ON o.id=ol.order_id
-        JOIN products p ON p.id=ol.product_id
-        WHERE o.created_at::date BETWEEN %(fd)s AND %(td)s
-          AND COALESCE(o.is_deleted,false)=false
-          AND COALESCE(ol.is_deleted,false)=false
-          {gf}
-        GROUP BY p.main_group, p.product_name, p.brand
-        ORDER BY "Total (\u20b9)" DESC NULLS LAST
-    """, {"fd":fd,"td":td,"mg":mg})
+    if report_view == "Product Summary":
+        rows = _q(f"""
+            SELECT
+                COALESCE(pa.party_name,o.party_name,'—') AS "Party",
+                COALESCE(p.main_group,'—') AS "Category",
+                p.product_name              AS "Product",
+                COALESCE(p.brand,'—')     AS "Brand",
+                COALESCE(p.unit,'PCS')     AS "Unit",
+                COALESCE(p.box_size,1)     AS "_Box Size",
+                SUM(ol.quantity)            AS "Qty",
+                ROUND(SUM(COALESCE(ol.unit_price,0) * COALESCE(ol.quantity,0)),2) AS "Gross (\u20b9)",
+                ROUND(SUM(COALESCE(ol.discount_amount,0)),2) AS "Discount (\u20b9)",
+                ROUND(SUM(GREATEST(
+                    COALESCE(ol.billing_total, ol.total_price,
+                        COALESCE(ol.unit_price,0) * COALESCE(ol.quantity,0)
+                        - COALESCE(ol.discount_amount,0)
+                    ), 0
+                )),2) AS "Net (\u20b9)",
+                COUNT(DISTINCT o.id) AS "Orders"
+            FROM order_lines ol
+            JOIN orders o   ON o.id=ol.order_id
+            LEFT JOIN parties pa ON pa.id=o.party_id
+            JOIN products p ON p.id=ol.product_id
+            WHERE o.created_at::date BETWEEN %(fd)s AND %(td)s
+              AND COALESCE(o.is_deleted,false)=false
+              AND COALESCE(ol.is_deleted,false)=false
+              {gf} {pf}
+            GROUP BY COALESCE(pa.party_name,o.party_name,'—'), p.main_group, p.product_name, p.brand, p.unit, p.box_size
+            ORDER BY "Net (\u20b9)" DESC NULLS LAST
+        """, {"fd":fd,"td":td,"mg":mg,"pty":pty})
+    else:
+        rows = _q(f"""
+            SELECT
+                o.created_at::date::text AS "Date",
+                o.order_no AS "Order",
+                COALESCE(pa.party_name,o.party_name,'—') AS "Party",
+                COALESCE(p.main_group,'—') AS "Category",
+                COALESCE(p.product_name,'—') AS "Product",
+                COALESCE(p.brand,'—') AS "Brand",
+                COALESCE(p.unit,'PCS') AS "Unit",
+                COALESCE(p.box_size,1) AS "_Box Size",
+                COALESCE(ol.eye_side,'') AS "Eye",
+                COALESCE(ol.quantity,0) AS "Qty",
+                COALESCE(ol.unit_price,0) AS "Rate (\u20b9)",
+                ROUND(COALESCE(ol.unit_price,0) * COALESCE(ol.quantity,0),2) AS "Gross (\u20b9)",
+                COALESCE(ol.discount_percent,0) AS "Discount %%",
+                COALESCE(ol.discount_amount,0) AS "Discount (\u20b9)",
+                COALESCE(ol.discount_rule,'') AS "Discount Rule",
+                ROUND(GREATEST(
+                    COALESCE(ol.billing_total, ol.total_price,
+                        COALESCE(ol.unit_price,0) * COALESCE(ol.quantity,0)
+                        - COALESCE(ol.discount_amount,0)
+                    ), 0
+                ),2) AS "Net (\u20b9)",
+                o.status AS "Status"
+            FROM order_lines ol
+            JOIN orders o   ON o.id=ol.order_id
+            LEFT JOIN parties pa ON pa.id=o.party_id
+            LEFT JOIN products p ON p.id=ol.product_id
+            WHERE o.created_at::date BETWEEN %(fd)s AND %(td)s
+              AND COALESCE(o.is_deleted,false)=false
+              AND COALESCE(ol.is_deleted,false)=false
+              {gf} {pf}
+            ORDER BY o.created_at DESC, o.order_no, p.product_name
+        """, {"fd":fd,"td":td,"mg":mg,"pty":pty})
 
     if not rows:
         check = _q("SELECT COUNT(*) AS n FROM orders WHERE COALESCE(is_deleted,false)=false")
@@ -217,17 +521,71 @@ def _tab_product_sales():
         return
 
     df = _df(rows)
-    for c in ["Qty","Base (\u20b9)","GST (\u20b9)","Total (\u20b9)","Orders"]:
+    for c in ["Qty","Gross (\u20b9)","Discount %","Discount (\u20b9)","Net (\u20b9)","Orders","Rate (\u20b9)"]:
         if c in df.columns: df[c] = pd.to_numeric(df[c],errors="coerce").fillna(0)
+    if "Qty" in df.columns:
+        df["Qty Display"] = df.apply(_qty_display_for_report, axis=1)
+        cols = list(df.columns)
+        if "Qty Display" in cols and "Qty" in cols:
+            cols.insert(cols.index("Qty") + 1, cols.pop(cols.index("Qty Display")))
+            df = df[cols]
 
     m1,m2,m3,m4 = st.columns(4)
-    m1.metric("Total Value",  f"\u20b9{df['Total (\u20b9)'].sum():,.0f}")
-    m2.metric("GST",          f"\u20b9{df['GST (\u20b9)'].sum():,.0f}")
+    m1.metric("Gross",        f"\u20b9{df.get('Gross (\u20b9)', pd.Series([0])).sum():,.0f}")
+    m2.metric("Discount",     f"\u20b9{df.get('Discount (\u20b9)', pd.Series([0])).sum():,.0f}")
     m3.metric("Units",        f"{int(df['Qty'].sum()):,}")
-    m4.metric("Products",     str(len(df)))
+    m4.metric("Net",          f"\u20b9{df.get('Net (\u20b9)', pd.Series([0])).sum():,.0f}")
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    _print_btn(df, f"Product Sales {fd} to {td}", "pws")
+    if pty != "All Parties":
+        party_info = _party_detail_by_name(pty)
+        send_df = df.drop(columns=["_Box Size"], errors="ignore")
+        top = send_df.sort_values("Net (\u20b9)", ascending=False).head(8)
+        lines = [
+            f"Hello {pty}",
+            f"{report_view} report",
+            f"Period: {fd} to {td}",
+            f"Gross: \u20b9{df.get('Gross (\u20b9)', pd.Series([0])).sum():,.2f}",
+            f"Discount: \u20b9{df.get('Discount (\u20b9)', pd.Series([0])).sum():,.2f}",
+            f"Net: \u20b9{df.get('Net (\u20b9)', pd.Series([0])).sum():,.2f}",
+            "",
+            "Top lines:",
+        ]
+        for _, r in top.iterrows():
+            label = r.get("Product") or r.get("Order") or ""
+            lines.append(f"{label} · {r.get('Qty Display') or ('Qty ' + str(r.get('Qty') or ''))} · \u20b9{float(r.get('Net (\u20b9)') or 0):,.2f}")
+        lines.append("")
+        lines.append("Detailed CSV/download is available from report.")
+        src = f"{pty}|{fd}|{td}|{mg}|{report_view}|{len(df)}|{df.get('Net (\u20b9)', pd.Series([0])).sum()}"
+        msg_key = "pws_wa_msg"
+        msg_src = "pws_wa_src"
+        if st.session_state.get(msg_src) != src:
+            st.session_state[msg_key] = "\n".join(lines)
+            st.session_state[msg_src] = src
+        with st.expander("WhatsApp / download for party", expanded=False):
+            try:
+                from modules.wa_contact_tools import render_mobile_field
+                mobile = render_mobile_field(
+                    "pws_wa",
+                    name=pty,
+                    mobile=str(party_info.get("mobile") or ""),
+                    label="Mobile",
+                )
+            except Exception:
+                mobile = st.text_input("Mobile", value=str(party_info.get("mobile") or ""), key="pws_wa_mobile")
+            edited = st.text_area("Message", key=msg_key, height=190)
+            st.link_button("Send WhatsApp Report", _wa_link(mobile, edited), use_container_width=True)
+            st.download_button(
+                "Download Detailed CSV",
+                send_df.to_csv(index=False).encode(),
+                file_name=f"{report_view}_{pty}_{fd}_{td}.csv".replace(" ", "_"),
+                mime="text/csv",
+                key="pws_party_csv",
+                use_container_width=True,
+            )
+
+    show_df = df.drop(columns=["_Box Size"], errors="ignore")
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
+    _print_btn(show_df, f"{report_view} {pty} {fd} to {td}", "pws")
 
 
 # ── TAB 3: COLUMNAR ───────────────────────────────────────────────────────────
@@ -266,8 +624,11 @@ def _tab_columnar():
             o.created_at::date::text            AS "Date",
             COALESCE(pa.party_name,o.party_name,'—') AS "Party",
             COALESCE(o.patient_name,'—')      AS "Patient",
+            COALESCE(pr.main_group,'—')       AS "Category",
             COALESCE(pr.product_name,'—')     AS "Product",
             COALESCE(pr.brand,'')             AS "Brand",
+            COALESCE(pr.unit,'PCS')            AS "Unit",
+            COALESCE(pr.box_size,1)            AS "_Box Size",
             COALESCE(ol.eye_side,'')          AS "Eye",
             COALESCE(ol.sph::text,'')         AS "SPH",
             COALESCE(ol.cyl::text,'')         AS "CYL",
@@ -275,7 +636,16 @@ def _tab_columnar():
             COALESCE(ol.add_power::text,'')   AS "ADD",
             ol.quantity                         AS "Qty",
             ol.unit_price                       AS "Rate (\u20b9)",
-            ol.unit_price*ol.quantity           AS "Value (\u20b9)",
+            ROUND(COALESCE(ol.unit_price,0)*COALESCE(ol.quantity,0),2) AS "Gross (\u20b9)",
+            COALESCE(ol.discount_percent,0)     AS "Discount %%",
+            COALESCE(ol.discount_amount,0)      AS "Discount (\u20b9)",
+            COALESCE(ol.discount_rule,'')       AS "Discount Rule",
+            ROUND(GREATEST(
+                COALESCE(ol.billing_total, ol.total_price,
+                    COALESCE(ol.unit_price,0)*COALESCE(ol.quantity,0)
+                    - COALESCE(ol.discount_amount,0)
+                ), 0
+            ),2)                                AS "Net (\u20b9)",
             o.status                            AS "Status"
         FROM orders o
         LEFT JOIN parties pa ON pa.id=o.party_id
@@ -303,14 +673,23 @@ def _tab_columnar():
         return
 
     df = _df(rows)
-    val = pd.to_numeric(df.get("Value (\u20b9)",pd.Series([0])),errors="coerce").sum()
+    if "Qty" in df.columns:
+        df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
+        df["Qty Display"] = df.apply(_qty_display_for_report, axis=1)
+        cols = list(df.columns)
+        cols.insert(cols.index("Qty") + 1, cols.pop(cols.index("Qty Display")))
+        df = df[cols]
+    val = pd.to_numeric(df.get("Net (\u20b9)",pd.Series([0])),errors="coerce").sum()
     st.caption(f"Page {_page}/{_pages} · {len(df)} of {_total:,} lines · \u20b9{val:,.0f} this page")
-    st.dataframe(df, use_container_width=True, hide_index=True,
+    show_df = df.drop(columns=["_Box Size"], errors="ignore")
+    st.dataframe(show_df, use_container_width=True, hide_index=True,
         column_config={
             "Rate (\u20b9)":  st.column_config.NumberColumn(format="\u20b9%.0f"),
-            "Value (\u20b9)": st.column_config.NumberColumn(format="\u20b9%.0f"),
+            "Gross (\u20b9)": st.column_config.NumberColumn(format="\u20b9%.0f"),
+            "Discount (\u20b9)": st.column_config.NumberColumn(format="\u20b9%.0f"),
+            "Net (\u20b9)": st.column_config.NumberColumn(format="\u20b9%.0f"),
         })
-    _print_btn(df, f"Columnar {fd} to {td}", "col")
+    _print_btn(show_df, f"Columnar {fd} to {td}", "col")
 
 
 # ── TAB 4: CREDIT DAYS ────────────────────────────────────────────────────────
@@ -838,7 +1217,7 @@ def _tab_gst():
                 p.main_group                     AS "Category",
                 ROUND(SUM(ol.quantity), 0)       AS "Qty",
                 ROUND(SUM(ol.unit_price * ol.quantity), 2) AS "Taxable (₹)",
-                ROUND(AVG(ol.gst_percent), 1)   AS "GST %",
+                ROUND(AVG(ol.gst_percent), 1)   AS "GST %%",
                 ROUND(SUM(ol.unit_price * ol.quantity
                       * COALESCE(ol.gst_percent, 0) / 100), 2) AS "GST Amt (₹)",
                 ROUND(SUM(ol.unit_price * ol.quantity
@@ -991,6 +1370,100 @@ def _tab_audit():
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
+def _tab_sequence_audit() -> None:
+    """Document number sequence gap audit report."""
+    import datetime as _sad
+
+    st.markdown("### 🔢 Document Number Sequence Audit")
+    st.caption(
+        "All detected gaps in document sequences. Every gap must be explained. "
+        "Automatically scanned daily — manual scan available below."
+    )
+
+    sc1, _ = st.columns([2, 5])
+    if sc1.button("🔍 Scan Now", key="rpt_gap_scan", type="primary"):
+        with st.spinner("Scanning..."):
+            results = _q("SELECT * FROM detect_all_doc_gaps(%(fy)s, 'manual_scan')",
+                         {"fy": _sad.date.today().strftime("%y%m")}) or []
+        total = sum(int(r.get("gaps_found") or 0) for r in results)
+        if total:
+            st.success(f"✅ Scan complete — {total} new gap(s) found.")
+        else:
+            st.success("✅ No new gaps — all sequences clean.")
+        st.rerun()
+
+    with st.expander("🔍 Filters", expanded=True):
+        rf1, rf2 = st.columns(2)
+        _dtypes = rf1.multiselect(
+            "Document Type",
+            ["ORDER","CHALLAN","INVOICE","DISPATCH","PAYMENT","CN","DN"],
+            default=["ORDER","CHALLAN","INVOICE","DISPATCH","CN","DN"],
+            key="rpt_gap_types",
+        )
+        _sts = rf2.multiselect(
+            "Status",
+            ["UNEXPLAINED","EXPLAINED","VOIDED","TEST_DATA","SYSTEM_ERROR"],
+            default=["UNEXPLAINED","EXPLAINED","VOIDED","TEST_DATA","SYSTEM_ERROR"],
+            key="rpt_gap_status",
+        )
+
+    summary = _q("""
+        SELECT doc_type, COUNT(*) AS gap_events,
+               SUM(gap_count) AS missing_numbers,
+               SUM(CASE WHEN status='UNEXPLAINED' THEN 1 ELSE 0 END) AS unexplained
+        FROM doc_number_gap_log
+        GROUP BY doc_type ORDER BY unexplained DESC, doc_type
+    """) or []
+
+    if summary:
+        cols = st.columns(max(len(summary), 1))
+        for i, s in enumerate(summary):
+            unex = int(s.get("unexplained") or 0)
+            cols[i].metric(
+                s["doc_type"],
+                f"{s['gap_events']} gap(s)",
+                f"⚠️ {unex} unexplained" if unex else "✅ All explained",
+                delta_color="inverse" if unex else "normal",
+            )
+        st.markdown("---")
+
+    rows = _q("""
+        SELECT doc_type, doc_prefix, fy, gap_from, gap_to, gap_count,
+               status, reason, detected_at::date::text AS detected_on,
+               detected_by, resolution_note
+        FROM doc_number_gap_log
+        WHERE (%(types)s = ARRAY[]::text[] OR doc_type = ANY(%(types)s))
+          AND (%(sts)s   = ARRAY[]::text[] OR status   = ANY(%(sts)s))
+        ORDER BY CASE status WHEN 'UNEXPLAINED' THEN 0 ELSE 1 END,
+                 detected_at DESC
+        LIMIT 200
+    """, {"types": _dtypes or [], "sts": _sts or []}) or []
+
+    if not rows:
+        st.info("No gaps for the selected filters.")
+        return
+
+    STATUS_ICON = {"UNEXPLAINED":"❌","EXPLAINED":"✅","VOIDED":"🔵",
+                   "TEST_DATA":"⚪","SYSTEM_ERROR":"⚠️"}
+
+    for r in rows:
+        pad = 5 if r["doc_type"] == "DISPATCH" else 4
+        g_range = f"{r['doc_prefix']}/{r['fy']}/{str(r['gap_from']).zfill(pad)}"
+        if r["gap_to"] > r["gap_from"]:
+            g_range += f" → {r['doc_prefix']}/{r['fy']}/{str(r['gap_to']).zfill(pad)} ({r['gap_count']})"
+        icon  = STATUS_ICON.get(r["status"], "?")
+        note  = r.get("resolution_note") or r.get("reason") or "—"
+        color = "#ef4444" if r["status"] == "UNEXPLAINED" else "#334155"
+        st.markdown(
+            f"<div style='border-left:3px solid {color};padding:4px 12px;margin:2px 0;"
+            f"font-size:0.80rem'>"
+            f"<b style='color:#e2e8f0'>{icon} {r['doc_type']} · {g_range}</b>"
+            f"  <span style='color:#64748b'>{r['status']} · {r['detected_on']}</span><br>"
+            f"<span style='color:#94a3b8'>{note}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+
 def render_reports():
     st.markdown("## 📊 Reports")
 
@@ -1006,6 +1479,7 @@ def render_reports():
         "💵 Cash Flow",
         "🧾 GST Summary",
         "🔍 Audit Trail",
+        "🔢 Sequence Audit",
     ])
     with tabs[0]:  _tab_ledger()
     with tabs[1]:  _tab_product_sales()
@@ -1018,3 +1492,4 @@ def render_reports():
     with tabs[8]:  _tab_cashflow()
     with tabs[9]:  _tab_gst()
     with tabs[10]: _tab_audit()
+    with tabs[11]: _tab_sequence_audit()

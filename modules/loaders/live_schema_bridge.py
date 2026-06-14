@@ -31,6 +31,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
+
 logger = logging.getLogger(__name__)
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
@@ -151,7 +153,10 @@ TABLE_REGISTRY: Dict[str, dict] = {
     },
     "BLANK": {
         "tables":       [{"name": "blank_inventory", "alias": ""}],
-        "order_by":     "brand, category, material, add_power",
+        # Only export active blank rows. Legacy no-base rows are kept inactive
+        # for ledger/audit history and must not appear in EDIT/ADD downloads.
+        "base_where":   "COALESCE(is_active, TRUE) = TRUE",
+        "order_by":     "brand, category, material, add_power, base_recommended",
         "skip_cols":    set(),
     },
     # PRICE is excluded from the bridge — it needs a UNION of inventory_stock

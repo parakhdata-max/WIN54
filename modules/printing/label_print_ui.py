@@ -8,12 +8,24 @@ import streamlit as st
 
 
 def _get_shop_name() -> str:
+    return _get_flag_value("shop_name", "DV Optical")
+
+
+def _get_flag_value(key: str, default: str) -> str:
     try:
         from modules.sql_adapter import run_query
-        row = run_query("SELECT value FROM system_flags WHERE key='shop_name' LIMIT 1") or []
-        if row: return str(row[0].get("value","DV Optical"))
+        row = run_query("SELECT value FROM system_flags WHERE key=%s LIMIT 1", [key]) or []
+        if row:
+            value = str(row[0].get("value") or "").strip()
+            if value:
+                return value
     except: pass
-    return st.session_state.get("shop_name_override", "DV Optical")
+    return default
+
+
+def get_frame_barcode_print_name() -> str:
+    """Short name used only on 80x12mm frame/jewellery barcode stickers."""
+    return _get_flag_value("frame_barcode_print_name", "Parakh")
 
 
 def render_print_button(
@@ -54,14 +66,18 @@ def render_print_button(
         with col_prev:
             if st.button("👁️ Preview TSPL", key=f"print_prev_{key_suffix}_{code}",
                          use_container_width=True):
-                from modules.printing.label_printer import get_tspl_preview
-                st.code(get_tspl_preview(code, shop_input, price_input), language="text")
+                import importlib
+                import modules.printing.label_printer as label_printer
+                label_printer = importlib.reload(label_printer)
+                st.code(label_printer.get_tspl_preview(code, shop_input, price_input), language="text")
 
 
 def _do_print_single(code, shop, price, key_suffix, copies=1):
     try:
-        from modules.printing.label_printer import print_label
-        ok, msg = print_label(str(code), str(shop), price, copies)
+        import importlib
+        import modules.printing.label_printer as label_printer
+        label_printer = importlib.reload(label_printer)
+        ok, msg = label_printer.print_label(str(code), str(shop), price, copies)
         if ok:
             st.success(f"✅ Printed {copies}× label for **{code}**")
         else:
@@ -115,8 +131,10 @@ def render_batch_print_ui(items: list, key: str = "batch", shop: str = None):
 
     if selected and st.button(f"🖨️ Print {len(selected)} label(s)",
                                type="primary", key=f"bp_go_{key}", use_container_width=True):
-        from modules.printing.label_printer import print_batch
-        result = print_batch(selected, shop=shop_input)
+        import importlib
+        import modules.printing.label_printer as label_printer
+        label_printer = importlib.reload(label_printer)
+        result = label_printer.print_batch(selected, shop=shop_input)
         if result["printed"]:
             st.success(f"✅ Printed {result['printed']} label(s)")
         if result["failed"]:

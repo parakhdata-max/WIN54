@@ -3,7 +3,7 @@ modules/printing/patient_card_printer.py
 ==========================================
 Patient ID card printing for all three formats:
 
-  1. TSC TTP-244 Pro  — 75×65mm TSPL sticker (jewellery roll)
+  1. TSC TTP-244 Pro  — 75×50mm TSPL customer label
   2. Evolis Primacy   — 85.6×54mm CR80 plastic card (HTML→PDF via browser)
   3. A4 PDF sheet     — 6 cards per page, download and cut
 
@@ -111,7 +111,62 @@ def get_patient_barcode(patient_id: str) -> str:
     return ensure_patient_id(patient_id)
 
 
-# ── TSC TTP-244 Pro — 75×65mm sticker (TSPL) ─────────────────────────────────
+def readable_barcode_code(prefix: str, raw: str, max_len: int = 16) -> str:
+    """Return the short alphanumeric barcode value used by job cards.
+
+    Example: R/2627/0010 -> OR26270010. This keeps barcode modules wider
+    and makes scanned values easy to match after normalizing punctuation.
+    """
+    clean = "".join(ch for ch in str(raw or "") if ch.isalnum()).upper()
+    if len(clean) > max_len:
+        clean = clean[-max_len:]
+    if clean.startswith(("O", "P", "C", "PAT")):
+        return clean
+    return f"{prefix}{clean}" if clean else prefix
+
+
+def get_patient_card_ids(patient_id: str, generate_pat: bool = False) -> dict:
+    """
+    Resolve universal customer/card IDs for a saved retail customer.
+
+    customer_id = patients.record_no, shown and encoded for every saved customer.
+    pat_no      = patients.barcode/PAT number, shown only when already present,
+                  unless generate_pat=True (consultation path).
+    """
+    out = {"customer_id": "", "pat_no": "", "scan_code": ""}
+    if not patient_id or str(patient_id).upper().startswith("TEMP-"):
+        return out
+
+    try:
+        from modules.sql_adapter import run_query
+        rows = run_query(
+            """
+            SELECT COALESCE(record_no,'') AS record_no,
+                   COALESCE(barcode,'') AS barcode
+            FROM patients
+            WHERE id=%s::uuid
+            LIMIT 1
+            """,
+            (patient_id,),
+        ) or []
+        if rows:
+            out["customer_id"] = str(rows[0].get("record_no") or "").strip()
+            pat = str(rows[0].get("barcode") or "").strip()
+            if pat.upper().startswith("PAT"):
+                out["pat_no"] = pat
+    except Exception:
+        pass
+
+    if generate_pat and not out["pat_no"]:
+        out["pat_no"] = ensure_patient_id(patient_id)
+
+    if not out["customer_id"]:
+        out["customer_id"] = out["pat_no"] or str(patient_id).replace("-", "")[:12].upper()
+    out["scan_code"] = out["customer_id"]
+    return out
+
+
+# ── TSC TTP-244 Pro — 75×50mm sticker (TSPL) ─────────────────────────────────
 
 def build_tspl_patient_sticker(
     barcode: str,
@@ -121,10 +176,12 @@ def build_tspl_patient_sticker(
     rx_l: dict = None,
     shop: str = "DV Optical",
     copies: int = 1,
+    customer_id: str = "",
+    pat_no: str = "",
 ) -> str:
     """
-    TSPL commands for 75×65mm patient sticker on TSC TTP-244 Pro.
-    Resolution: 8 dots/mm (203 dpi) → 600W × 520H dots.
+    TSPL commands for 75×50mm patient sticker on TSC TTP-244 Pro.
+    Resolution: 8 dots/mm (203 dpi) → 600W × 400H dots.
 
     Layout:
     ┌──────────────────────────────┐
@@ -145,9 +202,14 @@ def build_tspl_patient_sticker(
     rx_r = rx_r or {}
     rx_l = rx_l or {}
 
-    def _fv(v):
+    def _ts(v, max_len: int = 40) -> str:
+        s = str(v or "").encode("ascii", errors="ignore").decode("ascii")
+        s = s.replace('"', "'").replace("\r", " ").replace("\n", " ").strip()
+        return s[:max_len]
+
+    def _fv(v, blank_for_empty: bool = False):
         if not v or str(v).strip() in ("", "None", "nan", "0.0", "0"):
-            return "---"
+            return "" if blank_for_empty else "-"
         try:
             f = float(v)
             return f"+{f:.2f}" if f > 0 else f"{f:.2f}"
@@ -156,53 +218,58 @@ def build_tspl_patient_sticker(
 
     def _fax(v):
         if not v or str(v).strip() in ("", "None", "nan", "0"):
-            return "---"
+            return ""
         try:
             return str(int(float(v)))
         except:
             return str(v)
 
     W = 600   # 75mm × 8dpmm
-    H = 520   # 65mm × 8dpmm
+    H = 400   # 50mm × 8dpmm   (was 520 = 65mm)
 
-    rs = _fv(rx_r.get("sph")); rc = _fv(rx_r.get("cyl")); ra = _fax(rx_r.get("axis"))
-    ls = _fv(rx_l.get("sph")); lc = _fv(rx_l.get("cyl")); la = _fax(rx_l.get("axis"))
-    r_add = _fv(rx_r.get("add")); l_add = _fv(rx_l.get("add"))
+    rs = _fv(rx_r.get("sph")); rc = _fv(rx_r.get("cyl"), blank_for_empty=True); ra = _fax(rx_r.get("axis"))
+    ls = _fv(rx_l.get("sph")); lc = _fv(rx_l.get("cyl"), blank_for_empty=True); la = _fax(rx_l.get("axis"))
+    r_add = _fv(rx_r.get("add"), blank_for_empty=True); l_add = _fv(rx_l.get("add"), blank_for_empty=True)
 
-    rx_r_str = f"R: {rs} / {rc} x {ra}" + (f" ADD {r_add}" if r_add != "---" else "")
-    rx_l_str = f"L: {ls} / {lc} x {la}" + (f" ADD {l_add}" if l_add != "---" else "")
+    rx_r_str = f"R: {rs} / {rc} x {ra}" + (f" ADD {r_add}" if r_add else "")
+    rx_l_str = f"L: {ls} / {lc} x {la}" + (f" ADD {l_add}" if l_add else "")
 
     # Truncate to fit label width
-    name_upper = name.upper()[:26]
-    shop_upper = shop.upper()[:18]
-    mob_str    = f"Mob: {mobile}" if mobile else ""
+    scan_code = str(customer_id or barcode or "").strip() or "UNKNOWN"
+    pat_no = str(pat_no or "").strip()
+    name_upper = _ts(name.upper(), 26)
+    shop_upper = _ts(shop.upper(), 18)
+    scan_code = _ts(scan_code, 24)
+    pat_no = _ts(pat_no, 18)
+    mob_str = _ts(f"Mob: {mobile}" if mobile else "", 28)
+    pat_line = f'TEXT 360,30,"1",0,1,1,"PAT {pat_no}"' if pat_no else ""
+    id_line = f'ID: {scan_code}'
 
-    tspl = f"""SIZE 75 mm, 65 mm
+    tspl = f"""SIZE 75 mm, 50 mm
 GAP 2 mm, 0 mm
 DIRECTION 0
 REFERENCE 0,0
+DENSITY 10
+SPEED 3
 CLS
-SET PEEL OFF
-SET CUTTER OFF
 
-; ── Row 1: Shop name (L) + Patient ID (R) ──
 TEXT 8,6,"3",0,1,1,"{shop_upper}"
-TEXT {W-8},6,"3",0,1,1,"{barcode}"
-BAR 0,46,{W},3
+TEXT 360,8,"2",0,1,1,"{id_line}"
+{pat_line}
+BAR 0,40,{W},3
 
-; ── Row 2: Patient name (large bold) ──
-TEXT 8,56,"4",0,1,1,"{name_upper}"
-TEXT 8,98,"2",0,1,1,"{mob_str}"
-BAR 0,126,{W},2
+TEXT 8,48,"4",0,1,1,"{name_upper}"
+TEXT 8,90,"2",0,1,1,"{mob_str}"
+BAR 0,116,{W},2
 
-; ── Row 3: RX ──
-TEXT 8,136,"3",0,1,1,"{rx_r_str}"
-TEXT 8,170,"3",0,1,1,"{rx_l_str}"
-BAR 0,202,{W},2
+TEXT 8,124,"3",0,1,1,"{_ts(rx_r_str, 36)}"
+TEXT 9,124,"3",0,1,1,"{_ts(rx_r_str, 36)}"
+TEXT 8,158,"3",0,1,1,"{_ts(rx_l_str, 36)}"
+TEXT 9,158,"3",0,1,1,"{_ts(rx_l_str, 36)}"
+BAR 0,190,{W},2
 
-; ── Row 4: Barcode (centred) ──
-BARCODE {W//2},{H-108},"128",88,1,0,3,3,"{barcode}"
-TEXT {W//2},{H-14},"2",0,1,1,"{barcode}"
+BARCODE 80,205,"128",118,1,0,2,2,"{scan_code}"
+TEXT 185,345,"2",0,1,1,"{scan_code}"
 
 PRINT {copies}
 """
@@ -222,6 +289,8 @@ def _build_evolis_html(
     shop: str = "DV Optical",
     tagline: str = "",
     visit_date: str = "",
+    customer_id: str = "",
+    pat_no: str = "",
 ) -> str:
     """
     HTML for Evolis Primacy CR80 plastic card (85.6mm × 54mm).
@@ -236,9 +305,9 @@ def _build_evolis_html(
     rx_r = rx_r or {}
     rx_l = rx_l or {}
 
-    def _fv(v):
-        if not v or str(v).strip() in ("", "None", "nan", "0.0", "0", "---"):
-            return "—"
+    def _fv(v, blank_for_empty: bool = False):
+        if not v or str(v).strip() in ("", "None", "nan", "0.0", "0", "---", "—"):
+            return "" if blank_for_empty else "-"
         try:
             f = float(v)
             return f"+{f:.2f}" if f > 0 else f"{f:.2f}"
@@ -246,22 +315,25 @@ def _build_evolis_html(
             return str(v)
 
     def _fax(v):
-        if not v or str(v).strip() in ("", "None", "nan", "0", "---"):
-            return "—"
+        if not v or str(v).strip() in ("", "None", "nan", "0", "---", "—"):
+            return ""
         try:
             return str(int(float(v)))
         except:
             return str(v)
 
-    rs = _fv(rx_r.get("sph")); rc = _fv(rx_r.get("cyl")); ra = _fax(rx_r.get("axis"))
-    ls = _fv(rx_l.get("sph")); lc = _fv(rx_l.get("cyl")); la = _fax(rx_l.get("axis"))
-    r_add = _fv(rx_r.get("add")); l_add = _fv(rx_l.get("add"))
+    rs = _fv(rx_r.get("sph")); rc = _fv(rx_r.get("cyl"), blank_for_empty=True); ra = _fax(rx_r.get("axis"))
+    ls = _fv(rx_l.get("sph")); lc = _fv(rx_l.get("cyl"), blank_for_empty=True); la = _fax(rx_l.get("axis"))
+    r_add = _fv(rx_r.get("add"), blank_for_empty=True); l_add = _fv(rx_l.get("add"), blank_for_empty=True)
+
+    scan_code = str(customer_id or barcode or "").strip() or "UNKNOWN"
+    pat_no = str(pat_no or "").strip()
 
     # Barcode SVG embedded — real Code128, black on white
     try:
-        bc_svg = barcode_svg(barcode, width=180, height=36)
+        bc_svg = barcode_svg(scan_code, width=180, height=36)
     except Exception:
-        bc_svg = f"<div style=\'font-family:monospace;font-size:7pt;font-weight:bold\'>{barcode}</div>"
+        bc_svg = f"<div style=\'font-family:monospace;font-size:7pt;font-weight:bold\'>{scan_code}</div>"
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -281,25 +353,27 @@ body {{ font-family: Arial, Helvetica, sans-serif; background: white; }}
     overflow: hidden;
 }}
 
-/* ── TOP HEADER STRIPE — solid navy, no gradient ── */
+/* ── TOP HEADER — white background for crisp Evolis output ── */
 .header {{
-    background: #0f172a;
-    padding: 1.6mm 3mm;
+    background: #ffffff;
+    padding: 1.8mm 3mm 1.2mm;
     display: flex;
     justify-content: space-between;
     align-items: center;
     flex-shrink: 0;
+    border-bottom: 0.35mm solid #0f172a;
 }}
 .shop-name {{
-    font-size: 8.5pt;
+    font-size: 9.4pt;
     font-weight: 900;
-    color: #ffffff;
-    letter-spacing: 0.06em;
+    color: #020617;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
 }}
 .card-label {{
     font-size: 5pt;
-    color: #94a3b8;
+    color: #0f172a;
+    font-weight: 800;
     letter-spacing: 0.12em;
     text-transform: uppercase;
 }}
@@ -321,9 +395,16 @@ body {{ font-family: Arial, Helvetica, sans-serif; background: white; }}
 }}
 .patient-sub {{
     font-size: 6.5pt;
-    color: #475569;
+    color: #0f172a;
     margin-top: 0.3mm;
-    font-weight: 600;
+    font-weight: 800;
+}}
+.id-line {{
+    font-size: 6pt;
+    color: #0f172a;
+    margin-top: 0.4mm;
+    font-weight: 900;
+    font-family: Courier New, monospace;
 }}
 
 /* ── RX TABLE ── */
@@ -387,9 +468,10 @@ body {{ font-family: Arial, Helvetica, sans-serif; background: white; }}
   <div class="patient-block">
     <div class="patient-name">{name}</div>
     <div class="patient-sub">
-      {f"📞 {mobile}" if mobile else ""}
-      &nbsp;·&nbsp;
-      <span style="font-family:monospace;color:#0f172a;font-weight:900">{barcode}</span>
+      {f"Mobile: {mobile}" if mobile else ""}
+    </div>
+    <div class="id-line">
+      Customer ID: {scan_code}{f" &nbsp; | &nbsp; PAT: {pat_no}" if pat_no else ""}
     </div>
   </div>
 
@@ -420,83 +502,144 @@ body {{ font-family: Arial, Helvetica, sans-serif; background: white; }}
 </body></html>"""
 
 
+def _build_authenticity_card_html(
+    barcode: str,
+    name: str,
+    mobile: str = "",
+    rx_r: dict = None,
+    rx_l: dict = None,
+    shop: str = "DV Optical",
+    tagline: str = "",
+    visit_date: str = "",
+    customer_id: str = "",
+    pat_no: str = "",
+) -> str:
+    """
+    Browser-printable customer authenticity card.
+    Uses the universal customer_id barcode for billing/history lookup.
+    """
+    rx_r = rx_r or {}
+    rx_l = rx_l or {}
+
+    def _fv(v, blank_for_empty: bool = False):
+        if not v or str(v).strip() in ("", "None", "nan", "0.0", "0", "---", "—"):
+            return "" if blank_for_empty else "-"
+        try:
+            f = float(v)
+            return f"+{f:.2f}" if f > 0 else f"{f:.2f}"
+        except Exception:
+            return str(v)
+
+    def _fax(v):
+        if not v or str(v).strip() in ("", "None", "nan", "0", "---", "—"):
+            return ""
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return str(v)
+
+    scan_code = str(customer_id or barcode or "").strip() or "UNKNOWN"
+    pat_no = str(pat_no or "").strip()
+    try:
+        bc_svg = barcode_svg(scan_code, width=210, height=42)
+    except Exception:
+        bc_svg = f"<div style='font-family:monospace;font-size:8pt;font-weight:bold'>{scan_code}</div>"
+
+    rs = _fv(rx_r.get("sph")); rc = _fv(rx_r.get("cyl"), True); ra = _fax(rx_r.get("axis")); r_add = _fv(rx_r.get("add"), True)
+    ls = _fv(rx_l.get("sph")); lc = _fv(rx_l.get("cyl"), True); la = _fax(rx_l.get("axis")); l_add = _fv(rx_l.get("add"), True)
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+@page {{ size: 85.6mm 54mm; margin: 0; }}
+* {{ box-sizing:border-box; margin:0; padding:0; }}
+body {{ font-family: Arial, Helvetica, sans-serif; background:#fff; color:#0f172a; }}
+.card {{
+  width:85.6mm; height:54mm; border:0.35mm solid #0f172a;
+  padding:2.2mm 3mm; display:flex; flex-direction:column; gap:1.2mm; overflow:hidden;
+}}
+.top {{ display:flex; justify-content:space-between; align-items:flex-start; border-bottom:0.35mm solid #0f172a; padding-bottom:1.2mm; }}
+.shop {{ font-size:9.5pt; font-weight:900; text-transform:uppercase; letter-spacing:.06em; }}
+.label {{ font-size:5.5pt; font-weight:900; text-transform:uppercase; text-align:right; }}
+.name {{ font-size:11pt; font-weight:900; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.meta {{ font-size:6.2pt; font-weight:800; display:flex; justify-content:space-between; gap:2mm; }}
+.id {{ font-family:"Courier New", monospace; font-size:6.3pt; font-weight:900; }}
+.rx {{ width:100%; border-collapse:collapse; font-size:6.2pt; }}
+.rx th {{ background:#0f172a; color:#fff; padding:.7mm; font-size:5.8pt; }}
+.rx td {{ border-bottom:.2mm solid #cbd5e1; padding:.7mm; text-align:center; font-weight:800; }}
+.rx td:first-child {{ text-align:left; font-weight:900; }}
+.foot {{ display:flex; align-items:center; justify-content:space-between; gap:2mm; margin-top:auto; border-top:.25mm solid #cbd5e1; padding-top:.7mm; }}
+.note {{ font-size:5.2pt; font-weight:800; text-align:right; color:#334155; }}
+</style>
+</head><body>
+<div class="card">
+  <div class="top">
+    <div class="shop">{shop}</div>
+    <div class="label">Customer<br>Authenticity Card</div>
+  </div>
+  <div>
+    <div class="name">{name}</div>
+    <div class="meta">
+      <span>{f"Mobile: {mobile}" if mobile else ""}</span>
+      <span>{f"Date: {visit_date}" if visit_date else ""}</span>
+    </div>
+    <div class="id">Customer ID: {scan_code}{f" | PAT: {pat_no}" if pat_no else ""}</div>
+  </div>
+  <table class="rx">
+    <tr><th>Eye</th><th>SPH</th><th>CYL</th><th>AXIS</th><th>ADD</th></tr>
+    <tr><td>R</td><td>{rs}</td><td>{rc}</td><td>{ra}</td><td>{r_add}</td></tr>
+    <tr><td>L</td><td>{ls}</td><td>{lc}</td><td>{la}</td><td>{l_add}</td></tr>
+  </table>
+  <div class="foot">
+    <div>{bc_svg}</div>
+    <div class="note">Scan for billing, service history and customer verification.<br>{tagline}</div>
+  </div>
+</div>
+<script>window.onload = function() {{ window.print(); }}</script>
+</body></html>"""
+
+
 
 def barcode_svg(code: str, width: int = 220, height: int = 56) -> str:
     """
-    Generate a real Code128-B barcode SVG — scannable by any 1D reader.
-    Code128-B covers ASCII 32-127 with checksum verification.
+    Generate a real Code128 barcode SVG — scannable by any 1D reader.
+
+    Important: job cards use python-barcode SVG output and scan reliably.
+    Keep this shared helper on the same engine so confirmation receipts,
+    clinical prints, smart prints and other HTML documents do not drift into
+    a hand-rolled Code128 variant with missing start/check/stop symbols.
     """
-    # Code128-B symbol widths (6 elements: bar,space,bar,space,bar,space)
-    W = [
-        [2,1,2,2,2,2],[2,2,2,1,2,2],[2,2,2,2,2,1],[1,2,1,2,2,3],[1,2,1,3,2,2],
-        [1,3,1,2,2,2],[1,2,2,2,1,3],[1,2,2,3,1,2],[1,3,2,2,1,2],[2,2,1,2,1,3],
-        [2,2,1,3,1,2],[2,3,1,2,1,2],[1,1,2,2,3,2],[1,2,2,1,3,2],[1,2,2,2,3,1],
-        [1,1,3,2,2,2],[1,2,3,1,2,2],[1,2,3,2,2,1],[2,2,3,2,1,1],[2,2,1,1,3,2],
-        [2,2,1,2,3,1],[2,1,3,2,1,2],[2,2,3,1,1,2],[3,1,2,1,3,1],[3,1,1,2,2,2],
-        [3,2,1,1,2,2],[3,2,1,2,2,1],[3,1,2,2,1,2],[3,2,2,1,1,2],[3,2,2,2,1,1],
-        [2,1,2,1,2,3],[2,1,2,3,2,1],[2,3,2,1,2,1],[1,1,1,3,2,3],[1,3,1,1,2,3],
-        [1,3,1,3,2,1],[1,1,2,3,1,3],[1,3,2,1,1,3],[1,3,2,3,1,1],[2,1,1,3,1,3],
-        [2,3,1,1,1,3],[2,3,1,3,1,1],[1,1,3,1,2,3],[1,1,3,3,2,1],[1,3,3,1,2,1],
-        [1,1,2,1,3,3],[1,1,2,3,3,1],[1,3,2,1,3,1],[1,1,3,2,1,3],[1,1,3,3,1,2],
-        [1,3,3,2,1,1],[2,1,3,1,1,3],[2,3,1,1,1,3],[2,1,1,1,3,3],[2,1,1,3,3,1],
-        [2,1,3,1,3,1],[2,3,3,1,1,1],[2,3,1,3,1,1],[3,3,1,1,2,1],[3,1,1,3,2,1],
-        [3,1,3,1,2,1],[3,1,3,3,2,1],[3,3,3,1,2,1],[3,1,2,1,1,3],[3,1,2,3,1,1],
-        [3,3,2,1,1,1],[3,3,2,3,1,1],[3,1,4,1,1,1],[2,2,4,1,1,1],[4,3,1,1,1,1],
-        [1,1,1,1,4,3],[1,1,1,3,4,1],[1,3,1,1,4,1],[1,1,4,1,1,3],[1,1,4,3,1,1],
-        [4,1,1,1,1,3],[4,1,1,3,1,1],[1,1,3,1,4,1],[1,1,4,1,3,1],[3,1,1,1,4,1],
-        [4,1,1,1,3,1],[2,1,1,4,1,2],[2,1,1,2,1,4],[2,1,1,4,2,1],[2,4,1,2,1,1],
-        [4,1,2,1,1,2],[4,1,2,2,1,1],[4,1,2,1,2,1],[3,1,1,1,1,4],[3,1,1,4,1,1],
-        [1,4,1,1,3,1],[1,1,1,4,3,1],[1,4,3,1,1,1],[4,1,1,1,4,1],[2,1,1,1,1,5],
-        [2,1,1,5,1,1],[1,5,1,1,2,1],[1,1,5,1,2,1],[5,1,1,1,2,1],[2,1,2,1,4,1],
-        [2,1,4,1,2,1],[4,1,2,1,2,1],[1,1,1,2,3,4],
-    ]
-    START_B = 104
-    STOP_W  = [2,3,3,1,1,1,2]
+    code = str(code or "").strip()
+    if not code:
+        return ""
+    try:
+        import barcode as _bc_lib
+        from barcode.writer import SVGWriter as _SVGWriter
+        import io as _io
+        import re as _re
 
-    # Build symbol list with checksum
-    symbols = [START_B]
-    chk = START_B
-    for i, ch in enumerate(code):
-        v = ord(ch) - 32
-        v = max(0, min(v, 95))
-        symbols.append(v)
-        chk += v * (i + 1)
-    symbols.append(chk % 103)
-
-    # Calculate total modules to set SVG width dynamically
-    u = 1.9  # module width in px — wider = more readable
-    q = 10   # quiet zone px each side
-    total_u = sum(sum(W[s]) for s in symbols if s < len(W)) + sum(STOP_W)
-    svg_w = int(total_u * u + q * 2 + 2)
-    bar_h = height - 16
-
-    rects = []
-    x = float(q)
-
-    def _sym(widths):
-        nonlocal x
-        for idx2, bw in enumerate(widths):
-            if idx2 % 2 == 0:  # black bar
-                rects.append(
-                    f'<rect x="{x:.1f}" y="2" width="{bw*u:.1f}" '
-                    f'height="{bar_h}" fill="#000" shape-rendering="crispEdges"/>')
-            x += bw * u
-
-    for s in symbols:
-        if s < len(W):
-            _sym(W[s])
-    _sym(STOP_W)
-
-    cx = svg_w / 2
-    return (
-        f'<svg width="{svg_w}" height="{height}" xmlns="http://www.w3.org/2000/svg">' +
-        f'<rect width="{svg_w}" height="{height}" fill="#fff"/>' +
-        "".join(rects) +
-        f'<text x="{cx:.0f}" y="{height-2}" text-anchor="middle" ' +
-        f'font-family="Courier New,monospace" font-size="11" ' +
-        f'font-weight="bold" letter-spacing="1.5" fill="#000">{code}</text>' +
-        '</svg>'
-    )
+        bc = _bc_lib.get("code128", code, writer=_SVGWriter())
+        buf = _io.BytesIO()
+        bc.write(buf, options={
+            "write_text": True,
+            "module_width": 0.25,
+            "module_height": max(8.0, float(height or 56) / 5.0),
+            "quiet_zone": 2.0,
+            "font_size": 7,
+            "text_distance": 1.5,
+        })
+        svg = buf.getvalue().decode("utf-8", errors="ignore")
+        svg = svg[svg.find("<svg"):]
+        svg = _re.sub(r'width="[^"]*"', f'width="{int(width or 220)}"', svg, count=1)
+        svg = _re.sub(r'height="[^"]*"', f'height="{int(height or 56)}"', svg, count=1)
+        return svg.replace("<svg ", '<svg shape-rendering="crispEdges" ')
+    except Exception:
+        safe = "".join(ch for ch in code if 32 <= ord(ch) <= 126)
+        return (
+            f"<div style='border:1px solid #000;display:inline-block;"
+            f"padding:4px 8px;font-family:monospace;font-size:10px;"
+            f"letter-spacing:1px;background:#fff;color:#000'>{safe}</div>"
+        )
 
 
 
@@ -510,13 +653,21 @@ def render_patient_card_buttons(
     rx_r: dict = None,
     rx_l: dict = None,
     visit_date: str = "",
+    key_prefix: str = "",
+    generate_pat: bool = True,
 ):
     """
     Render patient card print buttons in consultation/billing screen.
     Shows three options: TSC sticker, Evolis plastic card, PDF sheet.
+
+    key_prefix : optional namespace for Streamlit widget keys, so the same
+                 patient's card buttons can be rendered in more than one place
+                 on a single page (e.g. header + post-save panel) without
+                 colliding. Leave blank to preserve existing behaviour.
     """
     rx_r = rx_r or {}
     rx_l = rx_l or {}
+    kp = f"{key_prefix}_" if key_prefix else ""
 
     try:
         from modules.settings.shop_master import get_unit_info
@@ -527,48 +678,65 @@ def render_patient_card_buttons(
     shop    = si.get("shop_name", "DV Optical")
     tagline = si.get("shop_tagline", "")
 
-    # Ensure patient has a barcode ID
-    barcode = ensure_patient_id(patient_id) if patient_id else "PAT000000"
+    ids = get_patient_card_ids(patient_id, generate_pat=generate_pat) if patient_id else {}
+    customer_id = ids.get("customer_id") or "UNKNOWN"
+    pat_no = ids.get("pat_no") or ""
+    barcode = ids.get("scan_code") or customer_id
 
+    _pat_badge = (
+        f"<span style='font-size:11px;font-weight:800;color:#166534;margin-left:14px'>PAT</span>"
+        f"<span style='font-family:monospace;font-size:13px;font-weight:900;color:#15803d;margin-left:6px'>{pat_no}</span>"
+        if pat_no else ""
+    )
     st.markdown(
         f"<div style='background:#f0fdf4;border:0.5px solid #22c55e;"
         f"border-radius:8px;padding:8px 12px;margin:4px 0'>"
-        f"<span style='font-size:11px;font-weight:700;color:#166534'>PATIENT ID</span>"
+        f"<span style='font-size:11px;font-weight:700;color:#166534'>CUSTOMER ID</span>"
         f"<span style='font-family:monospace;font-size:14px;font-weight:900;"
-        f"color:#15803d;margin-left:10px'>{barcode}</span>"
+        f"color:#15803d;margin-left:10px'>{customer_id}</span>"
+        f"{_pat_badge}"
         f"</div>",
         unsafe_allow_html=True
     )
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        if st.button("🖨️ TSC Sticker (75×65mm)",
-                     key=f"tsc_card_{patient_id[:8]}",
+        if st.button("🏷️ Barcode Label",
+                     key=f"{kp}tsc_card_{patient_id[:8]}",
                      use_container_width=True,
-                     help="Print on TSC TTP-244 Pro"):
+                     help="75×50mm TSC barcode label"):
             tspl = build_tspl_patient_sticker(
                 barcode=barcode, name=patient_name, mobile=mobile,
-                rx_r=rx_r, rx_l=rx_l, shop=shop
+                rx_r=rx_r, rx_l=rx_l, shop=shop,
+                customer_id=customer_id, pat_no=pat_no
             )
             try:
                 from modules.printing.label_printer import _send_tspl
-                _send_tspl(tspl)
-                st.success("✅ Sent to TSC printer")
+                result = _send_tspl(tspl)
+                if isinstance(result, tuple):
+                    ok, msg = result
+                else:
+                    ok, msg = bool(result), "OK"
+                if ok:
+                    st.success("✅ Sent to TSC printer")
+                else:
+                    st.warning(f"Printer did not accept label: {msg}")
+                    st.code(tspl, language="text")
             except Exception as ex:
                 st.warning(f"Printer offline or not connected: {ex}")
                 st.code(tspl, language="text")
                 st.caption("Copy TSPL above → paste in TSC Console to print manually")
 
     with c2:
-        if st.button("💳 Evolis Plastic Card",
-                     key=f"evolis_card_{patient_id[:8]}",
+        if st.button("💳 CR80 Card",
+                     key=f"{kp}evolis_card_{patient_id[:8]}",
                      use_container_width=True,
                      help="Print CR80 card on Evolis Primacy"):
             html = _build_evolis_html(
                 barcode=barcode, name=patient_name, mobile=mobile,
                 rx_r=rx_r, rx_l=rx_l, shop=shop, tagline=tagline,
-                visit_date=visit_date
+                visit_date=visit_date, customer_id=customer_id, pat_no=pat_no
             )
             import base64
             b64 = base64.b64encode(html.encode()).decode()
@@ -580,15 +748,36 @@ def render_patient_card_buttons(
             w.document.close();
             </script>"""
             components.html(js, height=0)
-            
 
     with c3:
+        if st.button("✅ Authenticity Card",
+                     key=f"{kp}auth_card_{patient_id[:8]}",
+                     use_container_width=True,
+                     help="Customer authenticity card with universal customer barcode"):
+            html = _build_authenticity_card_html(
+                barcode=barcode, name=patient_name, mobile=mobile,
+                rx_r=rx_r, rx_l=rx_l, shop=shop, tagline=tagline,
+                visit_date=visit_date, customer_id=customer_id, pat_no=pat_no
+            )
+            import base64
+            b64 = base64.b64encode(html.encode()).decode()
+            js = f"""
+            <script>
+            var d = atob("{b64}");
+            var w = window.open('','_blank');
+            w.document.write(d);
+            w.document.close();
+            </script>"""
+            components.html(js, height=0)
+
+    with c4:
         # PDF sheet for cutting
         try:
             from modules.documents.card_generator import generate_patient_cards
             from modules.sql_adapter import run_query
             rows = run_query(
-                """SELECT id::text as id, barcode,
+                """SELECT id::text as id,
+                          COALESCE(record_no, barcode, '') AS barcode,
                           master_name as patient_name, mobile,
                           '' as relation,
                           '' as gender
@@ -600,9 +789,9 @@ def render_patient_card_buttons(
                 st.download_button(
                     "📄 Download PDF Sheet",
                     data=pdf_bytes,
-                    file_name=f"patient_card_{barcode}.pdf",
+                    file_name=f"patient_card_{customer_id}.pdf",
                     mime="application/pdf",
-                    key=f"pdf_card_{patient_id[:8]}",
+                    key=f"{kp}pdf_card_{patient_id[:8]}",
                     use_container_width=True,
                     help="A4 sheet — print and cut"
                 )
@@ -630,3 +819,59 @@ def render_patient_id_badge(patient_id: str, patient_name: str) -> str:
             unsafe_allow_html=True
         )
     return barcode
+
+
+# ── Orders bridge — surface the same card buttons in Retail Punching ─────────
+
+def render_patient_card_for_order(key_prefix: str = "") -> None:
+    """
+    Render the patient ID card buttons (Evolis CR80 + TSC 75×50 sticker + PDF
+    sheet) inside the Retail Punching / orders screen, reusing the exact widget
+    already used in consultation.
+
+    Reads the linked patient straight from the retail session state:
+        retail_patient_id / retail_patient_name / retail_patient_mobile
+        retail_new_rx_r|l  (falls back to retail_old_rx_r|l)
+
+    Cards need a real patient master (a saved UUID). For walk-in / unlinked
+    orders the id is a TEMP-xxxx placeholder, so we show a short note instead.
+
+    key_prefix : keep distinct per call site ("hdr", "ps", …) so the same
+                 patient's buttons can appear in more than one place on the
+                 page without Streamlit key collisions.
+    """
+    import datetime as _dt
+
+    pid  = str(st.session_state.get("retail_patient_id") or "").strip()
+    name = str(st.session_state.get("retail_patient_name") or "").strip()
+    mob  = str(st.session_state.get("retail_patient_mobile") or "").strip()
+
+    # Real patient master? (UUID, not a TEMP placeholder)
+    def _is_real_patient(v: str) -> bool:
+        if not v or v.upper().startswith("TEMP-"):
+            return False
+        try:
+            import uuid as _uuid
+            _uuid.UUID(v)
+            return True
+        except Exception:
+            return False
+
+    if not _is_real_patient(pid):
+        st.caption("Patient ID card is available once the order is linked to a saved patient.")
+        return
+
+    rx_r = st.session_state.get("retail_new_rx_r") or st.session_state.get("retail_old_rx_r") or {}
+    rx_l = st.session_state.get("retail_new_rx_l") or st.session_state.get("retail_old_rx_l") or {}
+    today = _dt.datetime.now().strftime("%d %b %Y")
+
+    render_patient_card_buttons(
+        patient_id=pid,
+        patient_name=name,
+        mobile=mob,
+        rx_r=rx_r,
+        rx_l=rx_l,
+        visit_date=today,
+        key_prefix=key_prefix,
+        generate_pat=False,
+    )

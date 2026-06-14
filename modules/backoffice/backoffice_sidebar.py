@@ -158,8 +158,25 @@ def render_backoffice_sidebar(order: Dict) -> None:
         )
         st.markdown("")
 
-        # ── Production Train ────────────────────────────────────────
-        _mini("🚂 Production Flow")
+        # ── Train 1: Order-level status ──────────────────────────────
+        _mini("📋 Order Status")
+        try:
+            from modules.backoffice.order_status_live import get_live_status, status_badge_html
+            _live_st = get_live_status({"id": str(order.get("id","") or ""),
+                                        "order_no": str(order.get("order_no") or ""),
+                                        "status": str(order.get("status") or "")})
+            st.markdown(status_badge_html(_live_st, size="0.78rem"), unsafe_allow_html=True)
+        except Exception:
+            st.markdown(
+                f"<span style='background:{sc}22;color:{sc};"
+                f"border:1px solid {sc}55;padding:3px 10px;border-radius:8px;"
+                f"font-size:0.78rem;font-weight:700'>{si} {status}</span>",
+                unsafe_allow_html=True
+            )
+        st.markdown("")
+
+        # ── Train 2: Job / Supplier / Stock stage badges ─────────────
+        _mini("🚂 Production Stage")
         render_train_sidebar(str(order.get("order_no") or ""))
         st.markdown("")
 

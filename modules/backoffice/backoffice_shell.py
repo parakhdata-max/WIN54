@@ -180,20 +180,36 @@ def _render_tabs(ctx: BackofficeContext) -> None:
     _order_src = str(ctx.order.get("order_source") or "").upper()
     _is_counter_sale = (_order_src == "COUNTER_SALE")
 
-    # Fixed tab labels
-    fixed_labels = [
-        "📦 Order Items",
-        "🔬 Lab Orders",
-        "📊 Status",
-        "💰 Billing Summary",
-    ]
+    # Streamlit opens the first tab after every rerun. Payment/challan actions
+    # set bo_show_billing_tab, so render Billing first for that one rerun.
+    _jump_billing = (
+        st.session_state.pop("bo_jump_to_billing", False)
+        or st.session_state.pop("bo_show_billing_tab", False)
+    )
+    if _jump_billing:
+        fixed_labels = [
+            "💰 Billing Summary ◀",
+            "📦 Order Items",
+            "🔬 Lab Orders",
+            "📊 Status",
+        ]
+    else:
+        fixed_labels = [
+            "📦 Order Items",
+            "🔬 Lab Orders",
+            "📊 Status",
+            "💰 Billing Summary",
+        ]
     if _is_counter_sale:
         fixed_labels.append("⚡ Counter Billing")
 
     plugin_labels = [p.label for p in active_plugins]
     all_tabs = st.tabs(fixed_labels + plugin_labels)
 
-    tab1, tab2, tab3, tab4 = all_tabs[0], all_tabs[1], all_tabs[2], all_tabs[3]
+    if _jump_billing:
+        tab4, tab1, tab2, tab3 = all_tabs[0], all_tabs[1], all_tabs[2], all_tabs[3]
+    else:
+        tab1, tab2, tab3, tab4 = all_tabs[0], all_tabs[1], all_tabs[2], all_tabs[3]
     tab_counter = all_tabs[4] if _is_counter_sale else None
     plugin_tabs = all_tabs[5:] if _is_counter_sale else all_tabs[4:]
 

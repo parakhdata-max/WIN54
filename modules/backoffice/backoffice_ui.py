@@ -98,21 +98,12 @@ import streamlit as st
 import pandas as pd
 import datetime
 import uuid
+import logging
 from typing import Dict, List, Optional
 from modules.workflow.status import OrderStatus
 
 # Import core dependencies
 from modules.sql_adapter import read_product_master
-from modules.core.price_qty_governor import (
-    resolve_price   as resolve_price_for_order_type,
-    normalize_to_pcs_price,
-    is_box_product,
-    get_pcs_price,
-    reverse_qty,
-    compute_line_gst,
-    check_sync,
-    PAIR_TO_PCS,
-)
 from modules.documents.job_engine import generate_job_card_data
 from modules.supplier_orders_management import (
     get_vendor_routed_lines,
@@ -146,6 +137,604 @@ from .backoffice_panels import (
     render_boxing_params_edit_ui,
     render_allocation_window,
 )
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# BACKOFFICE WRITE GUARD — protect line price/discount integrity
+# ----------------------------------------------------------------------------
+# Why this exists:
+#   Backoffice power/product edits were occasionally landing rows with
+#   unit_price = 0 (and matching discount=0) in the DB. Validators caught
+#   it on next open, but the data was already corrupted. The right design
+#   is to enforce at the WRITE BOUNDARY, not the read boundary: refuse to
+#   commit a save that would leave a line unbillable.
+#
+# Behaviour (Strict-with-mirror + loud-fail):
+#   • Refuses any save where the resulting unit_price <= 0.
+#   • AUTO-RECOVERY for the common two-eye case: if another non-deleted
+#     line in the SAME order has the same product_id with a non-zero
+#     unit_price, mirror that price (and gst_percent) and ALLOW the save.
+#     Returns the mirrored values so the caller writes them too. This
+#     does not invent a price — it only copies a price that already
+#     exists on this order.
+#   • DISCOUNT CONSISTENCY: a line with a discount rule attached but
+#     resulting amount = 0 (or vice versa) is rejected — that is the
+#     "discount was dropped by the edit" symptom.
+#   • Failure is LOUD: shows a clear st.error so the user sees exactly
+#     what was blocked and why, and logs to the python logger for ops.
+#
+# Returns (ok, msg, mirrored_price_or_none, mirrored_gst_or_none).
+# Callers must update their UPDATE params with the mirrored values when
+# they are not None.
+# ============================================================================
+def _guard_line_price_before_write(
+    line: Dict,
+    order: Dict,
+    all_lines: Optional[list] = None,
+    context: str = "backoffice-write",
+):
+    """Strict-with-mirror price + discount-consistency gate.
+
+    See module comment above for full semantics. Pure-function: does not
+    write to DB. Caller decides what to do with (ok=False, ...): typically
+    show the error and skip the UPDATE.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    try:
+        _qty = float(line.get("quantity") or line.get("qty") or 0)
+        _up  = float(line.get("unit_price") or 0)
+        _pid = str(line.get("product_id") or "")
+        _disc_amt = float(line.get("discount_amount") or 0)
+        _disc_rule = str(line.get("discount_rule") or "").strip()
+        _name = (
+            line.get("product_name")
+            or (line.get("product") or {}).get("product_name")
+            or "(line)"
+        )
+        _eye = str(line.get("eye_side") or line.get("eye") or "").upper()
+
+        # --- 1. Price > 0 (with mirror auto-recovery) -----------------------
+        _mirrored_up = None
+        _mirrored_gst = None
+        if _up <= 0 and _qty > 0:
+            # Try to mirror from the other eye / sibling line with same product.
+            _siblings = all_lines or order.get("lines") or []
+            _src = None
+            for _s in _siblings:
+                if _s is line:
+                    continue
+                if bool(_s.get("is_deleted")):
+                    continue
+                if str(_s.get("product_id") or "") != _pid or not _pid:
+                    continue
+                _s_up = float(_s.get("unit_price") or 0)
+                if _s_up > 0:
+                    _src = _s
+                    break
+            if _src is not None:
+                _mirrored_up  = float(_src.get("unit_price") or 0)
+                _mirrored_gst = float(_src.get("gst_percent") or line.get("gst_percent") or 0)
+                _log.warning(
+                    "[%s] price guard auto-mirrored zero unit_price on %s/%s "
+                    "from sibling line (product_id=%s): %.2f",
+                    context, _name, _eye, _pid, _mirrored_up,
+                )
+                # mirror into the in-memory line so the rest of the save uses it
+                line["unit_price"]  = _mirrored_up
+                if _mirrored_gst:
+                    line["gst_percent"] = _mirrored_gst
+                _up = _mirrored_up
+            else:
+                _msg = (
+                    f"⛔ Save blocked: {_name} ({_eye or 'line'}) has qty {int(_qty)} "
+                    f"but unit_price = 0, and no sibling line with the same "
+                    f"product has a price to mirror. Set a price first."
+                )
+                _log.warning("[%s] price guard BLOCK: %s", context, _msg)
+                try:
+                    st.error(_msg)
+                except Exception:
+                    pass
+                return False, _msg, None, None
+
+        # --- 2. Discount consistency ----------------------------------------
+        # Rule attached but amount 0, or amount > 0 but no rule -> the edit
+        # has decoupled the two; that is exactly the symptom of a dropped
+        # discount during product/power change. Block it.
+        if _disc_rule and _disc_amt <= 0 and _up > 0 and _qty > 0:
+            _msg = (
+                f"⛔ Save blocked: {_name} ({_eye or 'line'}) carries a "
+                f"discount rule ({_disc_rule}) but the discount amount is 0. "
+                f"Re-apply the discount or clear the rule before saving."
+            )
+            _log.warning("[%s] discount guard BLOCK: %s", context, _msg)
+            try:
+                st.error(_msg)
+            except Exception:
+                pass
+            return False, _msg, _mirrored_up, _mirrored_gst
+
+        # --- 3. Over-discount: discount cannot exceed line gross (F7) -------
+        # _bo_line_amounts uses max(gross - discount, 0) so billing_total never
+        # goes negative, but discount_amount in the DB would remain incorrect,
+        # producing wrong GST and wrong register entries.
+        if _disc_amt > 0 and _up > 0 and _qty > 0:
+            _gross = round(_up * _qty, 2)
+            if _disc_amt > _gross:
+                _msg = (
+                    f"⛔ Save blocked: {_name} ({_eye or 'line'}) has a discount "
+                    f"of ₹{_disc_amt:.2f} which exceeds the line gross of ₹{_gross:.2f}. "
+                    f"Reduce the discount before saving."
+                )
+                _log.warning("[%s] over-discount BLOCK: %s", context, _msg)
+                try:
+                    st.error(_msg)
+                except Exception:
+                    pass
+                return False, _msg, _mirrored_up, _mirrored_gst
+
+        return True, "", _mirrored_up, _mirrored_gst
+
+    except Exception as _ge:
+        # Guard ITSELF failed — fail CLOSED (refuse the save), do not swallow
+        # silently. Same principle as the section_guard fix earlier.
+        import logging, traceback
+        logging.getLogger(__name__).error(
+            "[%s] price guard internal error - BLOCKING save: %s\n%s",
+            context, _ge, traceback.format_exc(),
+        )
+        try:
+            st.error(
+                "⛔ Save blocked — price/discount guard failed unexpectedly. "
+                "See server log. (This is a safety stop to prevent corrupt data.)"
+            )
+        except Exception:
+            pass
+        return False, str(_ge), None, None
+
+
+def _service_route_for_group(service_group: str, direct: bool = False) -> str:
+    """Line-level production route for service-only order lines."""
+    group = str(service_group or "").upper().strip()
+    if direct:
+        return "SERVICE"
+    if group == "COLOURING":
+        return "INHOUSE"
+    if group == "FITTING":
+        return "FITTING"
+    return "SERVICE"
+
+
+def _ensure_bo_service_product(service_group: str, label: str, gst_percent: float = 0.0) -> Optional[str]:
+    """Create/reuse a lightweight product row so service lines print cleanly everywhere."""
+    name = str(label or "").strip() or f"{str(service_group or 'Service').title()} Service"
+    group = str(service_group or "SERVICE").upper().strip()
+    try:
+        from modules.sql_adapter import run_query, run_write
+        rows = run_query(
+            "SELECT id::text AS id FROM products WHERE LOWER(product_name)=LOWER(%s) LIMIT 1",
+            (name,),
+        ) or []
+        if rows:
+            return str(rows[0]["id"])
+        pid = str(uuid.uuid4())
+        run_write(
+            """
+            INSERT INTO products
+                (id, product_name, brand, main_group, category, unit,
+                 gst_percent, is_active, created_at)
+            VALUES
+                (%(id)s::uuid, %(pn)s, 'Services', 'Services', %(cat)s, 'SERVICE',
+                 %(gst)s, TRUE, NOW())
+            ON CONFLICT DO NOTHING
+            """,
+            {"id": pid, "pn": name, "cat": group.title(), "gst": float(gst_percent or 0)},
+        )
+        return pid
+    except Exception:
+        return None
+
+
+def _bo_service_line_amounts(amount: float, gst_percent: float, order_type: str) -> tuple[float, float]:
+    """Return (total, gst_amount) using the same retail/wholesale tax convention as products."""
+    amt = round(float(amount or 0), 2)
+    gst = float(gst_percent or 0)
+    if gst <= 0:
+        return amt, 0.0
+    if str(order_type or "").upper() == "RETAIL":
+        return amt, round(amt - (amt / (1 + gst / 100)), 2)
+    gst_amt = round(amt * gst / 100, 2)
+    return round(amt + gst_amt, 2), gst_amt
+
+
+def _bo_complete_service_rows(service_rows: list) -> list:
+    """Return Service Master rows plus mandatory service fallbacks.
+
+    This prevents collectable leakage when a service exists in business rules
+    but is missing/inactive in service_master. Configured Service Master rows
+    still win; fallback rows only fill gaps so Backoffice always offers the
+    same charge families as punching.
+    """
+    try:
+        from modules.core.business_rules import SERVICE_CHARGE_TYPES
+    except Exception:
+        SERVICE_CHARGE_TYPES = {}
+    rows = [dict(r) for r in (service_rows or [])]
+    seen_groups = {str(r.get("service_group") or "").upper().strip() for r in rows}
+    for group in ("FITTING", "COLOURING", "COURIER", "CONSULTATION", "EYE_TESTING", "MISC"):
+        if group in seen_groups:
+            continue
+        cfg = SERVICE_CHARGE_TYPES.get(group, SERVICE_CHARGE_TYPES.get("MISC", {}))
+        rows.append({
+            "service_code": group,
+            "service_group": group,
+            "service_name": cfg.get("label") or group.title(),
+            "gst_percent": float(cfg.get("default_gst") or 0),
+            "default_price": 0.0,
+            "production_route": group if group in ("FITTING", "COLOURING") else "",
+            "_fallback": True,
+        })
+        seen_groups.add(group)
+    return rows
+
+
+def _bo_line_lens_params(line: Dict) -> Dict:
+    lp = (line or {}).get("lens_params") or {}
+    if isinstance(lp, str):
+        try:
+            import json as _json_lp
+            lp = _json_lp.loads(lp)
+        except Exception:
+            lp = {}
+    return lp if isinstance(lp, dict) else {}
+
+
+def _bo_service_family_for_line(line: Dict) -> str:
+    lp = _bo_line_lens_params(line)
+    text = " ".join(str(x or "") for x in (
+        lp.get("charge_type"),
+        lp.get("service_type"),
+        lp.get("service_group"),
+        lp.get("service_production_type"),
+        lp.get("service_code"),
+        lp.get("service_description"),
+        line.get("product_name") if line else "",
+    )).upper()
+    if "COLOUR" in text or "COLOR" in text or "TINT" in text:
+        return "COLOURING"
+    if "FITTING" in text or "FIT_" in text:
+        return "FITTING"
+    if "COURIER" in text or "DELIVERY" in text or "FREIGHT" in text:
+        return "COURIER"
+    if "CONSULT" in text:
+        return "CONSULTATION"
+    if "TEST" in text or "REFRACTION" in text:
+        return "EYE_TESTING"
+    if bool(line.get("is_service_line")) or str(line.get("eye_side") or "").upper() in ("S", "SERVICE"):
+        return "MISC"
+    return ""
+
+
+def _bo_suspected_missing_services(lines: list) -> list:
+    present = {_bo_service_family_for_line(l) for l in (lines or []) if _bo_service_family_for_line(l)}
+    suspects = []
+    for line in (lines or []):
+        if bool(line.get("is_service_line")):
+            continue
+        lp = _bo_line_lens_params(line)
+        colour_values = [
+            lp.get("colouring_required"),
+            lp.get("coloring_required"),
+            lp.get("tint_required"),
+            lp.get("tinted"),
+            lp.get("colour"),
+            lp.get("color"),
+            lp.get("colour_mix"),
+            lp.get("tint"),
+            lp.get("treatment"),
+        ]
+        colour_truthy = any(
+            str(v or "").strip().upper() not in ("", "NO", "N", "FALSE", "0", "NONE", "CLEAR", "TRANSPARENT", "REGULAR")
+            for v in colour_values
+        )
+        colour_route = str(lp.get("service_production_type") or lp.get("manufacturing_route") or "").upper() in ("COLOURING", "COLOURING_HC")
+        if colour_truthy or colour_route:
+            if "COLOURING" not in present:
+                suspects.append("COLOURING")
+
+        fitting_required = str(lp.get("fitting_required") or "").strip().upper() in ("1", "Y", "YES", "TRUE", "REQUIRED")
+        fitting_height = str(lp.get("fitting_height") or lp.get("fit_height") or "").strip()
+        fitting_route = str(lp.get("service_production_type") or lp.get("manufacturing_route") or "").upper() == "FITTING"
+        if fitting_required or fitting_route or bool(fitting_height):
+            if "FITTING" not in present:
+                suspects.append("FITTING")
+    ordered = ["COLOURING", "FITTING", "COURIER", "CONSULTATION", "EYE_TESTING", "MISC"]
+    return [s for s in ordered if s in set(suspects)]
+
+
+def _bo_line_display_name(line: Dict) -> str:
+    """Display name for product and service rows, including old cached rows."""
+    import json as _name_json
+    lp = line.get("lens_params") or {}
+    if isinstance(lp, str):
+        try:
+            lp = _name_json.loads(lp)
+        except Exception:
+            lp = {}
+    name = str(line.get("product_name") or "").strip()
+    if not name or name.lower() in ("unknown product", "unknown", "none", "null"):
+        name = str(
+            lp.get("service_display_name")
+            or lp.get("display_product_name")
+            or lp.get("service_description")
+            or lp.get("description")
+            or ""
+        ).strip()
+    return name or "Service"
+
+
+def _bo_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except Exception:
+        return float(default)
+
+
+def _bo_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value if value is not None else default))
+    except Exception:
+        return int(default)
+
+
+def _bo_release_stock_allocation_for_line(line: Dict, reason: str = "backoffice_edit") -> None:
+    """Release existing inventory reservation before a product/qty reset.
+
+    Physical stock remains untouched here. This only frees allocated_qty so
+    the old batch becomes available again when staff changes the line.
+    """
+    try:
+        from modules.sql_adapter import run_write as _rw_rel_stock
+        import json as _rel_json
+
+        lp = line.get("lens_params") or {}
+        if isinstance(lp, str):
+            try:
+                lp = _rel_json.loads(lp)
+            except Exception:
+                lp = {}
+        if not isinstance(lp, dict):
+            lp = {}
+
+        route = str(line.get("manufacturing_route") or lp.get("manufacturing_route") or "").upper()
+        alloc_qty_total = _bo_int(line.get("allocated_qty") or 0)
+        alloc_rows = line.get("batch_allocation") or lp.get("batch_allocation") or []
+        if isinstance(alloc_rows, dict):
+            alloc_rows = [alloc_rows]
+        if not alloc_rows and alloc_qty_total > 0:
+            stock_id = str(lp.get("stock_id") or lp.get("batch_id") or "").strip()
+            batch_no = str(lp.get("batch_no") or line.get("batch_no") or "").strip()
+            alloc_rows = [{
+                "stock_id": stock_id,
+                "batch_id": stock_id,
+                "batch_no": batch_no,
+                "allocated_qty": alloc_qty_total,
+            }]
+
+        if route != "STOCK" and not alloc_rows:
+            return
+
+        pid = str(line.get("product_id") or "").strip()
+        for alloc in alloc_rows:
+            if not isinstance(alloc, dict):
+                continue
+            qty = _bo_int(alloc.get("allocated_qty") or alloc.get("qty") or 0)
+            if qty <= 0:
+                continue
+            sid = str(alloc.get("stock_id") or alloc.get("batch_id") or "").strip()
+            bno = str(alloc.get("batch_no") or "").strip()
+            if sid:
+                _rw_rel_stock(
+                    """
+                    UPDATE inventory_stock
+                       SET allocated_qty = GREATEST(0, COALESCE(allocated_qty,0) - %(qty)s),
+                           updated_at = NOW()
+                     WHERE id = %(sid)s::uuid
+                    """,
+                    {"qty": qty, "sid": sid},
+                )
+            elif pid and bno:
+                _rw_rel_stock(
+                    """
+                    UPDATE inventory_stock
+                       SET allocated_qty = GREATEST(0, COALESCE(allocated_qty,0) - %(qty)s),
+                           updated_at = NOW()
+                     WHERE product_id = %(pid)s::uuid
+                       AND UPPER(TRIM(batch_no)) = UPPER(TRIM(%(bno)s))
+                    """,
+                    {"qty": qty, "pid": pid, "bno": bno},
+                )
+    except Exception as _rel_err:
+        logger.warning("[allocation_release] %s failed: %s", reason, _rel_err)
+
+
+def _bo_is_service_line(line: Dict) -> bool:
+    return (
+        bool(line.get("is_service_line"))
+        or str(line.get("eye_side") or "").upper() in ("S", "SERVICE")
+        or str(line.get("unit") or "").upper() == "SERVICE"
+    )
+
+
+def _bo_qty_display(line: Dict) -> str:
+    """Human quantity label for product rows and pair-based service rows."""
+    if _bo_is_service_line(line):
+        lp = _bo_line_lens_params(line)
+        factor = lp.get("service_qty_factor")
+        try:
+            factor = float(factor)
+        except Exception:
+            factor = 0.0
+        if factor > 0:
+            if abs(factor - 0.5) < 0.001:
+                return "0.5 pair"
+            if abs(factor - 1.0) < 0.001:
+                return "1 pair"
+            return f"{factor:g} pair"
+        return "1 service"
+
+    qty = int(line.get("billing_qty") or line.get("quantity") or 0)
+    box_size = int(line.get("box_size") or 1)
+    unit = str(line.get("unit") or "PCS").upper()
+    if unit == "BOX" and box_size > 1:
+        boxes = qty // box_size
+        pcs_rem = qty % box_size
+        return f"{boxes}B" + (f"+{pcs_rem}P" if pcs_rem else "") + f" ({qty}pcs)"
+    return f"{qty} PCS"
+
+
+def _bo_line_amounts(line: Dict, order_type: str = "WHOLESALE") -> Dict[str, float]:
+    """Return canonical taxable/GST/grand for a line.
+
+    order_lines historically stores lens billing_total as taxable/net, while
+    service billing_total can be GST-inclusive. UI summaries must not mix
+    those meanings, so derive from unit_price/qty/discount and stored GST.
+    """
+    qty = _bo_int(line.get("billing_qty") or line.get("quantity") or 1, 1)
+    unit_price = _bo_float(line.get("unit_price"))
+    discount = _bo_float(line.get("discount_amount"))
+    gst_pct = _bo_float(line.get("gst_percent_used") or line.get("gst_percent"))
+    stored_gst = _bo_float(line.get("gst_amount"))
+    order_type = str(order_type or "WHOLESALE").upper()
+
+    gross = round(unit_price * qty, 2)
+    taxable = round(max(gross - discount, 0), 2)
+
+    if order_type == "RETAIL":
+        grand = taxable
+        gst = stored_gst
+        if gst <= 0 and gst_pct > 0 and taxable > 0:
+            gst = round(taxable - (taxable / (1 + gst_pct / 100)), 2)
+            taxable = round(grand - gst, 2)
+        return {"taxable": taxable, "gst": gst, "grand": grand}
+
+    gst = stored_gst
+    if gst <= 0 and gst_pct > 0 and taxable > 0:
+        gst = round(taxable * gst_pct / 100, 2)
+    grand = round(taxable + gst, 2)
+    return {"taxable": taxable, "gst": gst, "grand": grand}
+
+
+def _bo_normalize_line_numbers(line: Dict) -> Dict:
+    """Convert DB Decimal values to plain Python numbers before UI math."""
+    for key in (
+        "unit_price", "billing_total", "total_price", "gst_percent",
+        "gst_amount", "discount_amount", "discount_percent"
+    ):
+        if key in line:
+            line[key] = _bo_float(line.get(key))
+    for key in ("billing_qty", "quantity", "allocated_qty", "ready_qty", "billed_qty", "box_size"):
+        if key in line:
+            line[key] = _bo_int(line.get(key), 1 if key in ("billing_qty", "quantity", "box_size") else 0)
+    return line
+
+
+def _bo_enforce_wholesale_price(line: Dict, order_type: str) -> Dict:
+    """Final UI guard: wholesale product lines must display DB selling_price.
+
+    This intentionally runs even on stale session-state line dicts. It can
+    resolve by product_id, and if a stale line lost product_id it falls back to
+    product_name. Service/manual-price lines are left untouched.
+    """
+    try:
+        _ot_str = str(order_type or "").upper().strip()
+        # Explicit RETAIL/empty guard — never override MRP-based retail prices
+        if _ot_str != "WHOLESALE" or bool(line.get("is_service_line")):
+            return line
+        # Extra safety: if the line itself was stamped as RETAIL, skip it
+        if str(line.get("order_type") or "").upper() == "RETAIL":
+            return line
+        lp = line.get("lens_params") or {}
+        if isinstance(lp, str):
+            import json as _json_wsp
+            try:
+                lp = _json_wsp.loads(lp)
+            except Exception:
+                lp = {}
+        if (
+            "manual" in str(line.get("price_source") or "").lower()
+            or bool(line.get("manual_price_override"))
+            or bool((lp or {}).get("manual_price_override"))
+            or bool((lp or {}).get("price_locked"))
+        ):
+            return line
+
+        pid = str(line.get("product_id") or "").strip()
+        if not pid:
+            pname = str(line.get("product_name") or "").strip()
+            if pname:
+                from modules.sql_adapter import run_query as _rq_wsp
+                rows = _rq_wsp(
+                    """
+                    SELECT id::text AS id, COALESCE(unit,'PCS') AS unit,
+                           GREATEST(COALESCE(box_size,1),1) AS box_size,
+                           COALESCE(gst_percent,0) AS gst_percent
+                    FROM products
+                    WHERE LOWER(product_name) = LOWER(%s)
+                       OR LOWER(TRIM(product_name)) = LOWER(TRIM(%s))
+                    ORDER BY COALESCE(is_active, TRUE) DESC, product_name
+                    LIMIT 1
+                    """,
+                    (pname, pname),
+                ) or []
+                if rows:
+                    pid = str(rows[0].get("id") or "")
+                    line["product_id"] = pid
+                    line["unit"] = line.get("unit") or rows[0].get("unit") or "PCS"
+                    line["box_size"] = int(float(line.get("box_size") or rows[0].get("box_size") or 1))
+                    if not float(line.get("gst_percent") or 0):
+                        line["gst_percent"] = float(rows[0].get("gst_percent") or 0)
+        if not pid:
+            return line
+
+        from modules.core.price_source_resolver import resolve_db_price
+        from modules.core.price_qty_governor import compute_line_gst
+
+        resolved = resolve_db_price(pid, "WHOLESALE", product=line, prefer_batch=True)
+        pcs = float(resolved.get("pcs_price") or 0)
+        if pcs <= 0:
+            return line
+        qty = int(line.get("billing_qty") or line.get("quantity") or 0)
+        cur = float(line.get("unit_price") or 0)
+        if qty <= 0 or abs(cur - pcs) <= 0.5:
+            line["unit_price"] = pcs
+            line["price_source"] = str(resolved.get("source") or line.get("price_source") or "")
+            line["tax_inclusive"] = False
+            return line
+
+        disc_pc = float(line.get("discount_percent") or 0)
+        gross = round(pcs * qty, 2)
+        disc = round(gross * disc_pc / 100, 2) if disc_pc > 0 else float(line.get("discount_amount") or 0)
+        net = round(max(0.0, gross - disc), 2)
+        gst = compute_line_gst(
+            net / max(qty, 1),
+            qty,
+            float(line.get("gst_percent") or 0),
+            "WHOLESALE",
+        )
+        line["unit_price"] = pcs
+        line["billing_total"] = gst["subtotal"]
+        line["total_price"] = gst["subtotal"]
+        line["gst_amount"] = gst["gst_amount"]
+        line["discount_amount"] = disc
+        line["price_source"] = str(resolved.get("source") or "BATCH")
+        line["tax_inclusive"] = False
+    except Exception:
+        pass
+    return line
 
 # Assignment panel — supplier / job-card allocation before save
 try:
@@ -221,7 +810,7 @@ def render_product_info_display(line: Dict, idx: int, eye_label: str, order: Dic
         )
     
     with col_edit:
-        if st.button(" Change", key=f"change_product_{eye_label}_{idx}", width='stretch'):
+        if st.button(" Change", key=f"change_product_{eye_label}_{idx}", use_container_width=True):
             #  FIX: Set modal state instead of inline edit
             st.session_state['bo_product_change_modal'] = {
                 'active': True,
@@ -259,164 +848,685 @@ def render_product_sync_option(group: Dict, product_id: str):
                 st.caption(" Both R and L eyes will use the same product")
 
 
+
+def _bo_repricing_for_product(new_pid: str, line: Dict, order: Dict):
+    """Resolve unit_price + gst_percent for a product change in backoffice.
+
+    Uses the central pricing hierarchy first so ophthalmic RX edits respect
+    the selected index/coating/treatment. Falls back to inventory prices.
+    Returns (unit_price_per_piece, gst_percent).
+    """
+    try:
+        from modules.sql_adapter import run_query as _rq_re
+        if not new_pid:
+            return 0.0, 0.0
+        _ot = str(order.get("order_type") or "RETAIL").upper()
+        _lp = line.get("lens_params") or {}
+        if not isinstance(_lp, dict):
+            _lp = {}
+        _index_value = (
+            _lp.get("lens_index")
+            or _lp.get("index")
+            or _lp.get("Lens Index")
+            or _lp.get("index_value")
+        )
+        _coating = _lp.get("coating") or _lp.get("LensCoating") or _lp.get("lens_coating")
+        _treatment = (
+            _lp.get("treatment")
+            or _lp.get("material")
+            or _lp.get("Material / Treatment")
+            or "Clear"
+        )
+
+        try:
+            from modules.core.price_source_resolver import resolve_db_price as _resolve_db_price
+
+            _resolved = _resolve_db_price(
+                new_pid,
+                _ot,
+                product=line,
+                prefer_batch=False,
+                index_value=_index_value,
+                coating=_coating,
+                treatment=_treatment,
+            )
+            _pcs_price = float((_resolved or {}).get("pcs_price") or 0)
+            if (_resolved or {}).get("found") and _pcs_price > 0:
+                _gst = float((_resolved or {}).get("gst_percent") or 0)
+                return _pcs_price, _gst
+        except Exception as _resolver_err:
+            logger.warning(
+                "Backoffice product-change spec price resolver failed for product %s: %s",
+                new_pid,
+                _resolver_err,
+                exc_info=True,
+            )
+
+        _rows = _rq_re("""
+            SELECT
+                COALESCE(p.gst_percent, 0)         AS gst_percent,
+                COALESCE(MAX(i.selling_price), 0)  AS selling_price,
+                COALESCE(MAX(i.mrp), 0)            AS mrp
+            FROM products p
+            LEFT JOIN inventory_stock i
+                   ON i.product_id = p.id
+                  AND COALESCE(i.is_active, TRUE) = TRUE
+            WHERE p.id = %s::uuid
+            GROUP BY p.gst_percent
+            LIMIT 1
+        """, (new_pid,)) or []
+        if not _rows:
+            return 0.0, 0.0
+        _r = _rows[0]
+        _gst = float(_r.get("gst_percent") or 0)
+        _sp  = float(_r.get("selling_price") or 0)
+        _mrp = float(_r.get("mrp") or 0)
+        _price = (_mrp or _sp) if _ot == "RETAIL" else (_sp or _mrp)
+        try:
+            from modules.core.price_qty_governor import normalize_to_pcs_price
+            if _price > 0:
+                _price = normalize_to_pcs_price(_price, line)
+        except Exception:
+            pass
+        return float(_price or 0), _gst
+    except Exception as _repricing_err:
+        logger.warning(
+            "Backoffice product-change repricing failed for product %s: %s",
+            new_pid,
+            _repricing_err,
+            exc_info=True,
+        )
+        return 0.0, 0.0
+
+
+def _bo_refresh_order_total_value(order_id: str) -> None:
+    """Recompute orders.total_value from active order_lines after product/pricing edits."""
+    try:
+        from modules.sql_adapter import run_write as _rw_h, run_query as _rq_h
+        from modules.sql_adapter import resolve_order_uuid as _resolve_order_uuid
+        from decimal import Decimal, ROUND_HALF_UP
+        order_id = _resolve_order_uuid(order_id) or ""
+        if not order_id or len(str(order_id)) < 10:
+            return
+        _rows = _rq_h("""
+            SELECT COALESCE(SUM(COALESCE(ol.billing_total, ol.total_price, 0)), 0) AS net_total,
+                   COALESCE(MAX(o.order_type), 'RETAIL') AS order_type
+            FROM order_lines ol
+            JOIN orders o ON o.id = ol.order_id
+            WHERE ol.order_id = %(oid)s::uuid
+              AND COALESCE(ol.is_deleted, FALSE) = FALSE
+        """, {"oid": order_id}) or []
+        if _rows:
+            _net = float(_rows[0].get("net_total") or 0)
+            if str(_rows[0].get("order_type") or "").upper() == "RETAIL":
+                _net = float(Decimal(str(_net)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+            _rw_h(
+                "UPDATE orders SET total_value=%(tv)s, updated_at=NOW() WHERE id=%(oid)s::uuid",
+                {"tv": round(_net, 2), "oid": order_id},
+            )
+    except Exception:
+        pass
+
 @st.dialog(" Change Product", width="large")
 def product_change_dialog():
     """
-     COMPACT DIALOG: Uses simple dropdowns instead of full product selector
+    Product change dialog — aligned with punching system.
+    Shows: Category → Brand → Product → Index → Coating → Treatment
+    For frames: Brand → Product (model number)
+    Writes change to DB immediately.
     """
-    modal_state = st.session_state.get('bo_product_change_modal', {})
-    
-    if not modal_state.get('active', False):
+    import json as _pcd_json
+    modal_state = st.session_state.get("bo_product_change_modal", {})
+    if not modal_state.get("active", False):
         return
-    
-    line = modal_state['line']
-    idx = modal_state['idx']
-    eye_label = modal_state['eye_label']
-    order = modal_state['order']
-    
-    st.warning(f" Changing product for **{eye_label} Eye** - Line #{idx + 1}")
-    st.caption("Current: " + line.get('product_name', 'N/A') + " | " + line.get('brand', 'N/A'))
-    
-    st.markdown("---")
-    
-    #  Simple compact product selection using just the product master
-    from modules.sql_adapter import read_product_master
-    products_df = read_product_master()
-    
-    if products_df.empty:
-        st.error("No products available")
-        if st.button("Close", key="close_product_modal_no_products"):
-            st.session_state['bo_product_change_modal'] = {'active': False}
-            st.rerun()
-        return
-    
-    # Quick filters
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        main_groups = [''] + sorted(products_df['main_group'].dropna().astype(str).unique().tolist())
-        selected_group = st.selectbox("Category", main_groups, key="dialog_main_group")
-    
-    with col2:
-        brands = [''] + sorted(products_df['brand'].dropna().astype(str).unique().tolist())
-        selected_brand = st.selectbox("Brand", brands, key="dialog_brand")
-    
-    # Filter products
-    filtered_df = products_df.copy()
-    if selected_group:
-        filtered_df = filtered_df[filtered_df['main_group'].astype(str) == selected_group]
-    if selected_brand:
-        filtered_df = filtered_df[filtered_df['brand'].astype(str) == selected_brand]
-    
-    # Product dropdown
-    product_list = sorted(filtered_df['product_name'].dropna().astype(str).unique().tolist())
-    
-    if not product_list:
-        st.warning("No products match the filters")
-        if st.button("Close", key="close_product_modal_no_match"):
-            st.session_state['bo_product_change_modal'] = {'active': False}
-            st.rerun()
-        return
-    
-    selected_product = st.selectbox("Select Product *", [''] + product_list, key="dialog_product")
-    
-    if selected_product:
-        product_row = filtered_df[filtered_df['product_name'] == selected_product].iloc[0]
-        
-        st.success(f" **Selected:** {product_row['product_name']} | {product_row.get('brand', 'N/A')}")
-        
-        st.markdown("---")
-        
-        col_apply, col_cancel = st.columns(2)
-        
-        with col_apply:
-            if st.button(" Apply Change", type="primary", width='stretch'):
-                old_product = line.get('product_name', 'Unknown')
-                
-                # Update product fields
-                line['product_id'] = str(product_row['product_id'])
-                line['product_name'] = str(product_row['product_name'])
-                line['brand'] = str(product_row.get('brand', ''))
-                line['main_group'] = str(product_row.get('main_group', ''))
-                line['material'] = str(product_row.get('material', ''))
-                line['type'] = str(product_row.get('type', ''))
-                line['unit'] = str(product_row.get('unit', ''))
-                line['box_size'] = int(product_row.get('box_size') or 1)
-                
-                # Product changed → zero unit_price so refresh_line_state
-                # derives a fresh price from the new product's batch.
-                line['unit_price']    = 0
-                line['billing_total'] = 0
-                line.pop('pricing_applied_at', None)
-                # Determine product type for is_lens/is_contact flags
-                main_group = str(product_row.get('main_group', '')).lower()
-                line['is_contact'] = 'contact' in main_group
-                line['is_lens'] = 'lens' in main_group or 'spectacle' in main_group
-                
-                #  FULL RESET before workflow
-                line['batch_allocation'] = []
-                line['allocated_qty'] = 0
-                line['batch_status'] = 'PENDING'
-                line['manufacturing_route'] = None
-                line['supplier_order_id'] = None
-                #  FIX: billing_qty remains unchanged during product change
-                
-                # Clear temp allocation state
-                temp_key = f'temp_alloc_{eye_label}_{idx}'
-                if temp_key in st.session_state:
-                    del st.session_state[temp_key]
-                
-                # Recalculate manufacturing power
-                update_manufacturing_power(line)
-                
+    st.markdown(
+        """
+<style>
+div[role="dialog"] {
+    max-height: 94vh !important;
+}
+div[role="dialog"] > div {
+    max-height: 90vh !important;
+    overflow-y: auto !important;
+    padding-bottom: 1rem !important;
+}
+div[role="dialog"] [data-testid="stHorizontalBlock"] {
+    gap: 0.55rem !important;
+}
+div[role="dialog"] [data-testid="stVerticalBlock"] {
+    gap: 0.35rem !important;
+}
+div[role="dialog"] [data-baseweb="popover"] [role="listbox"],
+div[role="dialog"] [data-baseweb="menu"],
+div[role="dialog"] ul[role="listbox"] {
+    max-height: 46vh !important;
+    overflow-y: auto !important;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-                
-                # Log change
-                if 'product_change_history' not in order:
-                    order['product_change_history'] = []
-                
-                import datetime
-                order['product_change_history'].append({
-                    'timestamp': datetime.datetime.now().isoformat(),
-                    'eye_side': line.get('eye_side'),
-                    'old_product': old_product,
-                    'new_product': product_row['product_name'],
-                    'changed_by': 'backoffice_user'
-                })
-                
-                #  Recalculate after product change
-                refresh_line_state(line)
-                
-                order_no = None
+    line      = modal_state["line"]
+    idx       = modal_state["idx"]
+    eye_label = modal_state["eye_label"]
+    order     = modal_state["order"]
+    order_id  = str(order.get("id") or order.get("order_id") or "")
+    line_id   = str(line.get("line_id") or line.get("id") or "")
 
-                if order and isinstance(order, dict):
-                    order_no = order.get("order_no")
+    st.warning(f"Changing product for **{eye_label} Eye** — Line #{idx + 1}")
+    st.caption("Current: " + line.get("product_name","N/A") + " | " + line.get("brand","N/A"))
 
-                else:
-                    st.warning(" No active order to reload")
-                    order = None
+    # ── Load product master ───────────────────────────────────────────
+    try:
+        from modules.sql_adapter import read_product_master
+        products_df = read_product_master()
+    except Exception as _e:
+        st.error(f"Could not load products: {_e}"); return
+    if products_df is None or products_df.empty:
+        st.error("No products available"); return
 
-                if order:
-                    st.session_state.current_order = order
-                    recalculate_order_totals(order)
+    # ── Is current line a frame? ──────────────────────────────────────
+    _cur_mg = str(line.get("main_group") or "").lower()
+    _is_frame = "frame" in _cur_mg or "sunglass" in _cur_mg
 
-                # Close dialog
-                st.session_state['bo_product_change_modal'] = {'active': False}
-                st.success(f" Product changed!")
-                st.rerun()
-        
-        with col_cancel:
-            if st.button(" Cancel", width='stretch', key="cancel_product_change_col"):
-                st.session_state['bo_product_change_modal'] = {'active': False}
-                st.rerun()
+
+    # ── Central product selector (same as punching) ───────────────────
+    st.markdown("#### Select New Product")
+    _pcd_selector_result = None
+    try:
+        from modules.ui_product_selector import render_product_selector as _render_pcd_selector
+        st.session_state["_current_order_type"] = str(order.get("order_type") or "RETAIL").upper()
+        _pcd_selector_result = _render_pcd_selector()
+    except Exception as _sel_err:
+        st.caption(f"Central product selector unavailable, using fallback selector: {_sel_err}")
+
+    _using_central_selector = bool(_pcd_selector_result and _pcd_selector_result.get("product_row"))
+    if _using_central_selector:
+        _product_row_dict = dict(_pcd_selector_result.get("product_row") or {})
+        _prod_row = pd.Series({
+            "product_id": _product_row_dict.get("product_id"),
+            "product_name": _product_row_dict.get("product_name"),
+            "brand": _product_row_dict.get("brand", ""),
+            "main_group": _product_row_dict.get("main_group", ""),
+            "material": _product_row_dict.get("material", ""),
+            "index_value": _product_row_dict.get("lens_index") or _product_row_dict.get("index_value") or "",
+            "coating_type": _product_row_dict.get("coating_type") or _product_row_dict.get("coating") or "",
+            "gst_percent": _product_row_dict.get("gst_percent", 0),
+            "mrp": _product_row_dict.get("mrp", 0),
+            "selling_price": _product_row_dict.get("selling_price", 0),
+            "purchase_rate": _product_row_dict.get("purchase_rate", 0),
+            "unit": _product_row_dict.get("unit", "PCS"),
+            "box_size": _product_row_dict.get("box_size", 1),
+            "batch_no": _product_row_dict.get("batch_no", ""),
+            "available_qty": _product_row_dict.get("available_qty", 0),
+        })
+        _sel_group = str(_prod_row.get("main_group") or "")
+        _is_frame_sel = bool(_pcd_selector_result.get("is_frame")) or "frame" in _sel_group.lower() or "sunglass" in _sel_group.lower()
     else:
-        if st.button(" Cancel", width='stretch', key="cancel_product_change_else"):
-            st.session_state['bo_product_change_modal'] = {'active': False}
+        st.caption("Use the selector above, or choose from fallback Category / Brand / Product below.")
+        # ── Fallback Category/Brand/Product filter ─────────────────────
+        _groups = [""] + sorted(products_df["main_group"].dropna().astype(str).unique())
+        _default_g = str(line.get("main_group") or "")
+        _g_idx = _groups.index(_default_g) if _default_g in _groups else 0
+        _sel_group = st.selectbox("Category", _groups, index=_g_idx, key="pcd_group")
+        _is_frame_sel = "frame" in _sel_group.lower() or "sunglass" in _sel_group.lower()
+
+        _pf = products_df.copy()
+        if _sel_group:
+            _pf = _pf[_pf["main_group"].astype(str) == _sel_group]
+        _brands = [""] + sorted(_pf["brand"].dropna().astype(str).unique())
+        _def_b = str(line.get("brand") or "")
+        _b_idx = _brands.index(_def_b) if _def_b in _brands else 0
+        _sel_brand = st.selectbox("Brand", _brands, index=_b_idx, key="pcd_brand")
+        if _sel_brand:
+            _pf = _pf[_pf["brand"].astype(str) == _sel_brand]
+
+        if _is_frame_sel:
+            _frame_name_search = st.text_input(
+                "Search frame by name",
+                value="",
+                placeholder="Type frame model/name...",
+                key="pcd_frame_name_search",
+            ).strip()
+            if _frame_name_search:
+                _pf = _pf[
+                    _pf["product_name"].astype(str).str.contains(
+                        _frame_name_search, case=False, na=False, regex=False
+                    )
+                ]
+            if _pf.empty:
+                _pf = products_df[
+                    products_df["main_group"].astype(str).str.lower().str.contains(
+                        "frame|sunglass", regex=True, na=False
+                    )
+                ].copy()
+                if _sel_brand:
+                    _pf = _pf[_pf["brand"].astype(str) == _sel_brand]
+                st.caption("Frame list reloaded from frame master.")
+        _prod_list = [""] + sorted(_pf["product_name"].dropna().astype(str).unique())
+        _def_p = str(line.get("product_name",""))
+        _p_idx = _prod_list.index(_def_p) if _def_p in _prod_list else 0
+        _prod_label = "Frame Model" if _is_frame_sel else "Select Product *"
+        _sel_prod = st.selectbox(_prod_label, _prod_list, index=_p_idx, key="pcd_prod")
+
+        if not _sel_prod:
+            _pc1, _pc2 = st.columns(2)
+            if _pc1.button("Cancel", key="pcd_cancel_nosel"):
+                st.session_state["bo_product_change_modal"] = {"active": False}
+                st.rerun()
+            return
+
+        _prod_row = _pf[_pf["product_name"].astype(str) == _sel_prod]
+        if _prod_row.empty:
+            st.warning("Product not found"); return
+        _prod_row = _prod_row.iloc[0]
+
+    # ── Lens parameters (Index / Coating / Treatment) — not shown for frames ──
+    _new_index    = ""
+    _new_coating  = ""
+    _new_treatment= ""
+
+    if not _is_frame_sel:
+        _lp_cur = line.get("lens_params") or {}
+        if isinstance(_lp_cur, str):
+            try: _lp_cur = _pcd_json.loads(_lp_cur)
+            except Exception as _e:
+                logger.warning("Suppressed error: %s", _e)
+                _lp_cur = {}
+
+        _li1, _li2, _li3 = st.columns(3)
+        _sel_index_default = (
+            _prod_row.get("index_value")
+            if _using_central_selector and str(_prod_row.get("index_value") or "").strip()
+            else (_lp_cur.get("lens_index") or _lp_cur.get("index") or _prod_row.get("index_value") or "")
+        )
+        _sel_coating_default = (
+            _prod_row.get("coating_type")
+            if _using_central_selector and str(_prod_row.get("coating_type") or "").strip()
+            else (_lp_cur.get("coating") or _prod_row.get("coating_type") or "")
+        )
+        _sel_treatment_default = (
+            _prod_row.get("material")
+            if _using_central_selector and str(_prod_row.get("material") or "").strip()
+            else (_lp_cur.get("treatment") or _lp_cur.get("material") or _prod_row.get("material") or "")
+        )
+        if _using_central_selector:
+            _pcd_spec_sig = "|".join(str(x or "") for x in (
+                _prod_row.get("product_id"),
+                _sel_index_default,
+                _sel_coating_default,
+                _sel_treatment_default,
+            ))
+            if st.session_state.get("pcd_spec_sig") != _pcd_spec_sig:
+                st.session_state["pcd_spec_sig"] = _pcd_spec_sig
+                st.session_state["pcd_index"] = str(_sel_index_default or "")
+                st.session_state["pcd_coating"] = str(_sel_coating_default or "")
+                st.session_state["pcd_treatment"] = str(_sel_treatment_default or "")
+        _new_index = _li1.text_input(
+            "Index",
+            value=str(_sel_index_default or ""),
+            key="pcd_index",
+        )
+        _new_coating = _li2.text_input(
+            "Coating",
+            value=str(_sel_coating_default or ""),
+            key="pcd_coating",
+        )
+        _new_treatment = _li3.text_input(
+            "Treatment / Material",
+            value=str(_sel_treatment_default or ""),
+            key="pcd_treatment",
+            help="e.g. Clear, Photochromic, Tinted",
+        )
+
+    # ── Power confirmation panel (F6) ────────────────────────────────────
+    # Power fields (sph/cyl/axis/add_power) are NOT auto-copied or auto-cleared
+    # on product change. Show the current power and force an explicit decision
+    # so stale power never silently stays on a new product.
+    _cur_sph  = line.get("sph")
+    _cur_cyl  = line.get("cyl")
+    _cur_axis = line.get("axis")
+    _cur_add  = line.get("add_power")
+    _has_power = any(v is not None and v != 0 for v in [_cur_sph, _cur_cyl, _cur_axis, _cur_add])
+
+    if _has_power:
+        def _pfmt(v):
+            try:
+                f = float(v)
+                return f"{f:+.2f}" if f != 0 else "0.00"
+            except Exception:
+                return str(v) if v is not None else "—"
+
+        st.info(
+            f"⚠️ **Power on existing line:** "
+            f"SPH {_pfmt(_cur_sph)}  CYL {_pfmt(_cur_cyl)}  "
+            f"AXIS {int(_cur_axis) if _cur_axis else '—'}  "
+            f"ADD {_pfmt(_cur_add) if _cur_add else '—'}"
+        )
+        _power_action = st.radio(
+            "Power after product change",
+            options=["Keep current power", "Clear power (set to zero)"],
+            index=0,
+            key="pcd_power_action",
+            help="Confirm whether the existing power applies to the new product.",
+        )
+    else:
+        _power_action = "Keep current power"  # no power to worry about
+
+    # ── Preview ───────────────────────────────────────────────────────
+    _preview_parts = [str(_prod_row["product_name"])]
+    if _new_index:    _preview_parts.append(f"Idx {_new_index}")
+    if _new_coating:  _preview_parts.append(_new_coating)
+    if _new_treatment and not _is_frame_sel: _preview_parts.append(_new_treatment)
+    st.success("Selected: " + " | ".join(_preview_parts))
+
+    _pa1, _pa2 = st.columns(2)
+
+    with _pa1:
+        if st.button("✅ Apply Change", type="primary",
+                     use_container_width=True, key="pcd_apply"):
+            try:
+                from modules.sql_adapter import run_write as _pcd_rw, run_query as _pcd_rq
+
+                # ── Update lens_params with new index/coating/treatment ────
+                _lp_new = dict(_lp_cur) if not _is_frame_sel else {}
+                if _new_index:    _lp_new["lens_index"] = _new_index; _lp_new["index"] = _new_index
+                if _new_coating:  _lp_new["coating"]    = _new_coating
+                if _new_treatment:_lp_new["treatment"]  = _new_treatment; _lp_new["material"] = _new_treatment
+
+                # Product changed: clear stale production/allocation metadata.
+                _lp_new["manufacturing_route"] = None
+                _lp_new["batch_allocation"]    = []
+                _lp_new["batch_status"]        = "PENDING"
+                _lp_new.pop("surfacing_data", None)
+                if _pcd_selector_result and _pcd_selector_result.get("selected_sku"):
+                    _lp_new["batch_no"] = str(_pcd_selector_result.get("selected_sku") or "")
+                    _lp_new["selected_sku"] = str(_pcd_selector_result.get("selected_sku") or "")
+                    _lp_new["stock_status"] = str(_pcd_selector_result.get("stock_status") or "")
+                    _lp_new["available_qty"] = int(_pcd_selector_result.get("available_qty") or 0)
+                    _lp_new["selector_source"] = "ui_product_selector"
+
+                _new_pid = str(_prod_row["product_id"])
+                _old_alloc_line = dict(line)
+                _old_alloc_line["lens_params"] = dict(_lp_cur) if isinstance(_lp_cur, dict) else _lp_cur
+
+                # ── Mutate in-memory line FIRST so pricing/discount engines see new product ──
+                line["product_id"]   = _new_pid
+                line["product_name"] = str(_prod_row["product_name"])
+                line["brand"]        = str(_prod_row.get("brand", ""))
+                line["main_group"]   = str(_prod_row.get("main_group", ""))
+                line["material"]     = str(_prod_row.get("material", ""))
+                line["lens_params"]  = _lp_new
+                line["manufacturing_route"] = None
+                line["batch_allocation"]    = []
+                line["allocated_qty"]       = 0
+                line["batch_status"]        = "PENDING"
+                line["suggested_allocation"] = None
+
+                # Clear old product discount attribution before new-rule evaluation.
+                line["discount_percent"] = 0.0
+                line["discount_amount"]  = 0.0
+                line["discount_rule"]    = ""
+                line["applied_rule_ids"] = ""
+
+                # ── Power: apply staff decision from power_action radio (F6) ──
+                # "Clear power" zeroes all four fields on the line so the new
+                # product starts fresh. "Keep" leaves them untouched (staff
+                # confirmed they still apply).
+                if _power_action == "Clear power (set to zero)":
+                    line["sph"]       = None
+                    line["cyl"]       = None
+                    line["axis"]      = None
+                    line["add_power"] = None
+                    _lp_new["power_cleared_on_product_change"] = True
+                else:
+                    _lp_new.pop("power_cleared_on_product_change", None)
+
+                # ── Re-resolve price + GST for the new product ──
+                _new_unit_price, _new_gst_pct = _bo_repricing_for_product(_new_pid, line, order)
+                if _new_unit_price <= 0 and _using_central_selector:
+                    _ot_pcd_price = str(order.get("order_type") or "RETAIL").upper()
+                    _selector_price = (
+                        float(_prod_row.get("mrp") or 0)
+                        if _ot_pcd_price == "RETAIL"
+                        else float(_prod_row.get("selling_price") or _prod_row.get("mrp") or 0)
+                    )
+                    if _selector_price > 0:
+                        _new_unit_price = _selector_price
+                        _new_gst_pct = float(_prod_row.get("gst_percent") or _new_gst_pct or 0)
+                        _lp_new["price_source"] = str(_prod_row.get("_price_source") or "ui_product_selector")
+                line["unit_price"]  = _new_unit_price
+                line["gst_percent"] = _new_gst_pct
+                _qty_pcd = int(line.get("billing_qty") or line.get("quantity") or 1)
+                line["quantity"] = _qty_pcd
+                line["total_price"]   = round(_new_unit_price * _qty_pcd, 2)
+                line["billing_total"] = line["total_price"]
+
+                # ── Re-apply discount engine for NEW brand/product ──
+                try:
+                    from modules.pricing.discount_flow import apply_order_discounts
+                    _ot_pcd = str(order.get("order_type") or "RETAIL").upper()
+                    _party_id = str(order.get("party_id") or "").strip()
+                    if not _party_id:
+                        _party_name = str(order.get("party_name") or order.get("patient_name") or "").strip()
+                        if _party_name:
+                            try:
+                                _r = _pcd_rq(
+                                    "SELECT id::text AS id FROM parties "
+                                    "WHERE party_name=%s AND COALESCE(is_active,TRUE)=TRUE LIMIT 1",
+                                    (_party_name,),
+                                ) or []
+                                if _r:
+                                    _party_id = str(_r[0].get("id") or "")
+                            except Exception as _party_lookup_err:
+                                logger.warning(
+                                    "[product_change_dialog] party lookup failed for discount context: %s",
+                                    _party_lookup_err,
+                                )
+                    apply_order_discounts([line], party_id=_party_id, order_type=_ot_pcd)
+                except Exception as _de:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"[product_change_dialog] discount re-eval failed: {_de}"
+                    )
+
+                if float(line.get("discount_amount") or 0) > 0:
+                    _lp_new["discount_status"] = "APPLIED"
+                else:
+                    _lp_new.pop("discount_status", None)
+
+                # ── Persist complete pricing/discount state to DB ──
+                _pcd_params = {
+                    "pid": _new_pid,
+                    "lp":  _pcd_json.dumps(_lp_new),
+                    "up":  float(line.get("unit_price") or 0),
+                    "tp":  float(line.get("billing_total") or line.get("total_price") or 0),
+                    "gp":  float(line.get("gst_percent") or 0),
+                    "ga":  float(line.get("gst_amount") or 0),
+                    "dp":  float(line.get("discount_percent") or 0),
+                    "da":  float(line.get("discount_amount") or 0),
+                    "dr":  str(line.get("discount_rule") or ""),
+                    "ari": str(line.get("applied_rule_ids") or ""),
+                    "lid": line_id,
+                    # F6: power fields — None when staff chose to clear
+                    "sph":       line.get("sph"),
+                    "cyl":       line.get("cyl"),
+                    "axis":      line.get("axis"),
+                    "add_power": line.get("add_power"),
+                }
+
+                # ── PRICE/DISCOUNT WRITE GUARD (product change) ──────────
+                # Refuse to write a zero-price row. Mirrors price from a
+                # sibling line on the same order if available; otherwise
+                # blocks the save and shows a clear error so the user can
+                # fix it instead of producing an unbillable row.
+                _g_ok, _g_msg, _mp, _mg = _guard_line_price_before_write(
+                    line, order, all_lines=None, context="product-change",
+                )
+                if not _g_ok:
+                    return  # error already shown to user; do not save
+                if _mp is not None:
+                    _pcd_params["up"] = float(_mp)
+                    _pcd_params["tp"] = round(
+                        float(_mp) * float(line.get("quantity") or 1), 2
+                    )
+                    if _mg is not None:
+                        _pcd_params["gp"] = float(_mg)
+
+                _bo_release_stock_allocation_for_line(_old_alloc_line, "product_change")
+
+                try:
+                    _pcd_rw("""
+                        UPDATE order_lines
+                        SET product_id           = %(pid)s::uuid,
+                            lens_params          = %(lp)s::jsonb,
+                            unit_price           = %(up)s,
+                            total_price          = %(tp)s,
+                            billing_total        = %(tp)s,
+                            gst_percent          = %(gp)s,
+                            gst_amount           = %(ga)s,
+                            discount_percent     = %(dp)s,
+                            discount_amount      = %(da)s,
+                            discount_rule        = %(dr)s,
+                            applied_rule_ids     = %(ari)s,
+                            allocated_qty        = 0,
+                            batch_status         = 'PENDING',
+                            suggested_allocation = NULL,
+                            sph                  = %(sph)s,
+                            cyl                  = %(cyl)s,
+                            axis                 = %(axis)s,
+                            add_power            = %(add_power)s
+                        WHERE id = %(lid)s::uuid
+                    """, _pcd_params)
+                except Exception:
+                    _pcd_rw("""
+                        UPDATE order_lines
+                        SET product_id           = %(pid)s::uuid,
+                            lens_params          = %(lp)s::jsonb,
+                            unit_price           = %(up)s,
+                            total_price          = %(tp)s,
+                            gst_percent          = %(gp)s,
+                            gst_amount           = %(ga)s,
+                            discount_percent     = %(dp)s,
+                            discount_amount      = %(da)s,
+                            discount_rule        = %(dr)s,
+                            applied_rule_ids     = %(ari)s,
+                            allocated_qty        = 0,
+                            batch_status         = 'PENDING',
+                            suggested_allocation = NULL
+                        WHERE id = %(lid)s::uuid
+                    """, _pcd_params)
+
+                # Product/power changes can activate/deactivate supplier
+                # schemes and cart/free offers on sibling lines. Re-run and
+                # persist the full pricing stack before totals/challan gates
+                # read this order again.
+                try:
+                    from modules.backoffice.backoffice_helpers import refresh_order_pricing_rules
+                    refresh_order_pricing_rules(order, persist=True)
+                except Exception as _sync_err:
+                    logger.warning("Backoffice product-change pricing sync failed: %s", _sync_err)
+
+                # ── Re-assign manufacturing_route after product change ─────────
+                # The product change clears manufacturing_route to None so the
+                # workflow engine must re-evaluate it. Without this, the changed
+                # line is invisible in both the 🏭 Supplier and 🧪 External Supplier
+                # production tabs, and half-pair splits (one eye VENDOR, one INHOUSE)
+                # never appear in the correct pipeline.
+                try:
+                    refresh_line_state(line)
+                    # Persist the newly-computed route back to DB
+                    _new_route = (
+                        line.get("manufacturing_route")
+                        or (line.get("lens_params") or {}).get("manufacturing_route")
+                    )
+                    if _new_route:
+                        _lp_new["manufacturing_route"] = _new_route
+                        _pcd_rw("""
+                            UPDATE order_lines
+                            SET lens_params = lens_params || %(lp_patch)s::jsonb
+                            WHERE id = %(lid)s::uuid
+                        """, {
+                            "lp_patch": _pcd_json.dumps({
+                                "manufacturing_route": _new_route
+                            }),
+                            "lid": line_id,
+                        })
+                        logger.info(
+                            "[product_change] line %s manufacturing_route → %s",
+                            line_id, _new_route,
+                        )
+                except Exception as _rls_err:
+                    logger.warning(
+                        "[product_change] refresh_line_state failed for line %s: %s",
+                        line_id, _rls_err,
+                    )
+
+                _bo_refresh_order_total_value(order_id)
+
+                # ── Clear all relevant caches ──
+                try:
+                    from modules.backoffice.order_loader import (
+                        load_single_order, load_orders_from_database, load_orders_summary
+                    )
+                    for _fn in (load_single_order, load_orders_from_database, load_orders_summary):
+                        try: _fn.clear()
+                        except Exception: pass
+                except Exception:
+                    pass
+                try:
+                    from modules.backoffice.backoffice_helpers import load_orders_from_database as _boh_load
+                    _boh_load.clear()
+                    st.session_state["bo_orders_loaded"] = False
+                except Exception:
+                    pass
+
+                st.session_state["bo_product_change_modal"] = {"active": False}
+
+                # ── Force fresh DB reload on next render ──────────────────
+                # bo_active_orders holds the cached order dict with stale line data.
+                # Removing it here means render_order_detail falls through to
+                # load_single_order(order_id) on the next rerun — guaranteeing
+                # the UI shows the just-persisted product/price/discount values.
+                #
+                # FIX (Order-not-found after product change): load_single_order
+                # needs the DB UUID, but bo_selected_order_id may be the display
+                # order number. Capture the real DB id of THIS order before we
+                # evict it from the cache, and stash it so the reload path can
+                # resolve by UUID. Pure safety addition — no existing logic
+                # changed, no lines removed.
+                _real_db_id = None
+                for _o in st.session_state.get("bo_active_orders", []):
+                    if str(_o.get("id") or _o.get("order_id") or "") == str(order_id) \
+                       or str(_o.get("order_no") or "") == str(order_id):
+                        _real_db_id = _o.get("id") or _o.get("order_id")
+                        break
+                if _real_db_id:
+                    st.session_state["bo_reload_db_id"] = str(_real_db_id)
+
+                st.session_state["bo_active_orders"] = [
+                    o for o in st.session_state.get("bo_active_orders", [])
+                    if str(o.get("id") or o.get("order_id") or "") != str(order_id)
+                ]
+                st.session_state["bo_orders_loaded"] = False
+
+                _disc_msg = ""
+                _da_show = float(line.get("discount_amount") or 0)
+                if _da_show > 0:
+                    _rule_show = str(line.get("discount_rule") or "rule")
+                    _disc_msg = f" · Discount applied: {_rule_show} ({_da_show:.2f})"
+                st.success(f"✅ Product changed to {_prod_row['product_name']}{_disc_msg}")
+                st.rerun()
+
+            except Exception as _pe:
+                st.error(f"Product change failed: {_pe}")
+
+    with _pa2:
+        if st.button("Cancel", use_container_width=True, key="pcd_cancel"):
+            st.session_state["bo_product_change_modal"] = {"active": False}
             st.rerun()
 
-
-# ============================================================================
-# ============================================================================
 
 def show_supplier_order_section(order: Dict):
     """
@@ -434,7 +1544,7 @@ def show_supplier_order_section(order: Dict):
     all_lines.extend(order.get('stock_lines', []))
     all_lines.extend(order.get('inhouse_lines', []))
     all_lines.extend(order.get('lab_order_lines', []))
-    all_lines.extend(order.get('service_lines', []))  # consultation fee lines
+    all_lines.extend(order.get('service_lines', []))
     
     #  FIX: Include BOTH VENDOR and EXTERNAL_LAB routes
     vendor_lines = [
@@ -451,7 +1561,7 @@ def show_supplier_order_section(order: Dict):
         if st.button(
             f"📦 Create Supplier Order ({len(vendor_lines)} items)",
             type="primary",
-            width='stretch',
+            use_container_width=True,
             key="create_supplier_order_main_btn"
         ):
             create_supplier_order_from_lines(order, vendor_lines)
@@ -512,561 +1622,6 @@ def show_supplier_order_section(order: Dict):
 # ============================================================================
 # ============================================================================
 
-_STAGE_REJECT_REASONS = {
-    "PRODUCTION_PICKED":   ["Blank broken on machine", "Wrong base curve", "Power out of tolerance",
-                            "Blank scratched before surfacing", "Machine error", "Other"],
-    "SURFACING_DONE":      ["Power out of tolerance", "Surface defect — scratches", "Prism error",
-                            "Edge chipping", "Wrong axis", "Other"],
-    "INSPECTION":          ["Power rejected at inspection", "Cosmetic defect", "Thickness out of spec",
-                            "Wrong coating requested", "Other"],
-    "HARDCOAT_PICKED":     ["Hardcoat adhesion failure", "Bubbling / peeling", "Contamination",
-                            "Wrong coating applied", "Other"],
-    "HARDCOAT_COMPLETED":  ["Hardcoat failed QC", "Crazing / cracking", "Colour tint bleed", "Other"],
-    "COLOURING_PICKED":    ["Wrong tint shade", "Uneven colouring", "Lens cracked during tint", "Other"],
-    "COLOURING_COMPLETED": ["Tint failed QC", "Colour mismatch", "Fading / streaking", "Other"],
-    "ARC_SENT":            ["Lost in transit to ARC lab", "Wrong lens sent", "Other"],
-    "ARC_RECEIVED":        ["ARC coating peeling", "Reflection test failed", "Delamination", "Other"],
-    "PRODUCTION_COMPLETED":["Final inspection — power out of tolerance", "Cosmetic reject",
-                            "Thickness issue", "Other"],
-    "FINAL_QC":            ["Final QC failed", "Customer spec mismatch", "Cosmetic reject",
-                            "Frame fitting issue", "Other"],
-}
-
-
-def _render_inline_reject(lid: str, current_stage: str, line: dict, order: dict):
-    """
-    Inline reject panel — shown inside _render_job_stage_controls at any stage.
-    Handles full pipeline reset: blank restore + job reset + log entry.
-    After reset, pipeline restarts from JOB_CREATED → staff selects new blank.
-    """
-    import streamlit as st
-    from modules.security.roles import current_user
-
-    _eye = str(line.get("eye_side") or "?").upper()[:1]
-    _eye_label = "RIGHT" if _eye == "R" else "LEFT" if _eye == "L" else _eye
-
-    # Get blank_id from lens_params.surfacing_data
-    try:
-        import json as _j
-        _lp = line.get("lens_params") or {}
-        if isinstance(_lp, str):
-            _lp = _j.loads(_lp)
-        _surf = _lp.get("surfacing_data") or {}
-        _blank_id   = str(_surf.get("blank_id") or "")
-        _blank_label = f"{_surf.get('blank_brand','')} {_surf.get('blank_material','')} {_surf.get('base_curve','')}D"
-        _blank_label = _blank_label.strip() or "—"
-    except Exception:
-        _blank_id, _blank_label = "", "—"
-
-    _stage_color = "#f59e0b"
-
-    st.markdown(
-        f"<div style='background:#1a0f00;border:1px solid {_stage_color}55;"
-        f"border-radius:8px;padding:10px 14px;margin:6px 0'>"
-        f"<div style='color:{_stage_color};font-weight:700;font-size:0.85rem'>"
-        f"↩️ Reject {_eye_label} Eye — Stage: {current_stage}</div>"
-        f"<div style='color:#94a3b8;font-size:0.75rem;margin-top:3px'>"
-        f"Blank: {_blank_label} &nbsp;·&nbsp; "
-        f"Blank will be restored to stock. Job resets to JOB_CREATED. "
-        f"Staff selects a new blank to restart.</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    # Stage-specific reasons
-    _reasons = _STAGE_REJECT_REASONS.get(current_stage, ["Blank failed", "Other"])
-    _reason_opts = ["— Select reason —"] + _reasons
-    _reason = st.selectbox(
-        "Rejection reason",
-        _reason_opts,
-        key=f"inline_rej_reason_{lid}",
-        label_visibility="collapsed",
-    )
-    _other = ""
-    if _reason == "Other":
-        _other = st.text_input(
-            "Specify",
-            key=f"inline_rej_other_{lid}",
-            placeholder="Describe what failed...",
-            label_visibility="collapsed",
-        )
-    _final_reason = _other.strip() if _reason == "Other" else _reason
-
-    _notes = st.text_area(
-        "Additional notes (optional)",
-        key=f"inline_rej_notes_{lid}",
-        height=60,
-        placeholder="e.g. crack appeared after hardcoat, sent to bin 3",
-        label_visibility="collapsed",
-    )
-
-    _disabled = _final_reason in ("", "— Select reason —")
-    _c1, _c2 = st.columns(2)
-    with _c1:
-        if st.button(
-            "✅ Confirm — Reject & Restart Pipeline",
-            key=f"inline_rej_confirm_{lid}",
-            type="primary",
-            width='stretch',
-            disabled=_disabled,
-        ):
-            _execute_pipeline_rejection(
-                line_id=lid,
-                blank_id=_blank_id,
-                eye_side=_eye,
-                stage=current_stage,
-                reason=_final_reason,
-                notes=_notes.strip(),
-                user=(current_user() or {}).get("name", "lab"),
-            )
-            st.session_state.pop(f"_rej_panel_{lid}", None)
-
-    with _c2:
-        if st.button("← Cancel", key=f"inline_rej_cancel_{lid}",
-                     width='stretch'):
-            st.session_state.pop(f"_rej_panel_{lid}", None)
-            st.rerun()
-
-
-def _execute_pipeline_rejection(line_id, blank_id, eye_side, stage, reason, notes, user):
-    """
-    Full atomic pipeline rejection at any stage:
-    1. Restore blank to blank_inventory (+1) — only if blank was physically picked
-    2. Reset job_master → JOB_CREATED, increment reprocess_count
-    3. Clear blank_allocations row
-    4. Wipe surfacing keys from order_lines.lens_params
-    5. Log to job_rejection_log
-    6. Restore order_line.allocated_qty/batch_status if production not started
-    """
-    import streamlit as st
-    from modules.sql_adapter import run_transaction_fn, QueryError
-
-    # Stages where blank was physically picked — blank needs restoring
-    _blank_consumed_stages = {
-        "PRODUCTION_PICKED", "SURFACING_DONE", "INSPECTION",
-        "HARDCOAT_PICKED", "HARDCOAT_COMPLETED",
-        "COLOURING_PICKED", "COLOURING_COMPLETED",
-        "ARC_SENT", "ARC_RECEIVED",
-        "PRODUCTION_COMPLETED", "FINAL_QC",
-        "READY_TO_BILL",
-    }
-
-    _full_reason = reason + (f" | Notes: {notes}" if notes else "")
-
-    try:
-        # Step 1: Restore blank inventory if blank was physically consumed
-        _restored = False
-        if blank_id and stage in _blank_consumed_stages:
-            from modules.sql_adapter import update_blank_quantity
-            _restored = update_blank_quantity(
-                blank_id=blank_id,
-                qty_change=+1,
-                eye_side=eye_side if eye_side in ("R", "L") else None,
-            )
-            if not _restored:
-                st.warning(
-                    "⚠️ Blank could not be restored to inventory — "
-                    "check blank_inventory manually. Pipeline still reset."
-                )
-
-        # Steps 2-5: Reset job + clear allocation + log (one transaction)
-        def _reset_tx(conn, cursor):
-            # 2. Reset job_master
-            cursor.execute("""
-                UPDATE job_master
-                SET    current_stage   = 'JOB_CREATED',
-                       is_closed       = FALSE,
-                       reprocess_count = COALESCE(reprocess_count, 0) + 1,
-                       coating_path    = NULL
-                WHERE  order_line_id   = %(lid)s::uuid
-                  AND  COALESCE(is_closed, FALSE) = FALSE
-            """, {"lid": line_id})
-
-            # 3. Clear blank_allocations
-            cursor.execute("""
-                DELETE FROM blank_allocations
-                WHERE  order_line_id = %(lid)s::uuid
-            """, {"lid": line_id})
-
-            # 4. Wipe surfacing keys from lens_params (preserve other data)
-            cursor.execute("""
-                UPDATE order_lines
-                SET    lens_params = COALESCE(lens_params, '{}')::jsonb
-                       - 'blank_id' - 'blank_brand' - 'blank_material'
-                       - 'blank_colour' - 'base_curve' - 'diameter'
-                       - 'sph_surf' - 'cyl_surf' - 'frame_type'
-                       - 'job_card_wip' - 'surfacing_data',
-                       batch_status = 'PENDING',
-                       allocated_qty = 0,
-                       ready_qty     = 0
-                WHERE  id = %(lid)s::uuid
-            """, {"lid": line_id})
-
-            # 5. Ensure rejection log table exists + insert
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS job_rejection_log (
-                    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    order_line_id      UUID,
-                    blank_id           UUID,
-                    eye_side           CHAR(1),
-                    stage_at_rejection TEXT,
-                    reason             TEXT,
-                    notes              TEXT,
-                    blank_restored     BOOLEAN DEFAULT FALSE,
-                    rejected_by        TEXT,
-                    rejected_at        TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
-            # Add blank_restored + notes columns if missing
-            for col, typ in [("notes", "TEXT"), ("blank_restored", "BOOLEAN DEFAULT FALSE")]:
-                try:
-                    cursor.execute(f"ALTER TABLE job_rejection_log ADD COLUMN IF NOT EXISTS {col} {typ}")
-                except Exception:
-                    pass
-
-            cursor.execute("""
-                INSERT INTO job_rejection_log
-                    (order_line_id, blank_id, eye_side, stage_at_rejection,
-                     reason, notes, blank_restored, rejected_by)
-                VALUES
-                    (%(lid)s::uuid, %(bid)s::uuid, %(eye)s, %(stage)s,
-                     %(reason)s, %(notes)s, %(restored)s, %(by)s)
-            """, {
-                "lid":      line_id,
-                "bid":      blank_id or "00000000-0000-0000-0000-000000000000",
-                "eye":      eye_side[:1] if eye_side else None,
-                "stage":    stage,
-                "reason":   reason,
-                "notes":    notes or "",
-                "restored": _restored,
-                "by":       user,
-            })
-
-            # ── Write to job_stage_events so Rejection Report picks it up ──
-            cursor.execute("""
-                SELECT id FROM job_master
-                WHERE order_line_id = %(lid)s::uuid LIMIT 1
-            """, {"lid": line_id})
-            _jm_r = cursor.fetchone()
-            if _jm_r:
-                _jm_id2 = _jm_r[0] if isinstance(_jm_r, (list,tuple)) else _jm_r.get("id")
-                if _jm_id2:
-                    cursor.execute("""
-                        INSERT INTO job_stage_events
-                            (id, job_id, stage_code, department, remarks, created_at)
-                        VALUES
-                            (gen_random_uuid(), %(jid)s::uuid,
-                             'REJECTED', 'LAB', %(reason)s, NOW())
-                    """, {"jid": str(_jm_id2), "reason": reason})
-
-        run_transaction_fn(_reset_tx)
-
-        _restore_msg = "Blank restored to stock. " if _restored else ""
-        st.success(
-            f"✅ {_restore_msg}"
-            f"Pipeline reset to JOB_CREATED. "
-            f"Select a new blank to restart {'R' if eye_side=='R' else 'L'} eye production."
-        )
-        st.rerun()
-
-    except Exception as e:
-        st.error(f"❌ Rejection failed: {e}")
-
-
-
-def _render_job_stage_controls(line: Dict, order: Dict, compact: bool = False) -> None:
-    """
-    Inline production stage advance panel for a single order_line.
-
-    Queries job_master for this line, shows:
-      - Current stage badge + progress dots
-      - One button per allowed next stage (from job_stage_transitions table,
-        falling back to a hardcoded map)
-
-    Works in any context (inside expanders, columns, etc.).
-    compact=True → uses a single horizontal row instead of a full card.
-    """
-    from modules.sql_adapter import run_query as _rqjs
-
-    lid = (line.get("line_id") or line.get("id") or "").strip()
-    if not lid:
-        return
-
-    # ── Fetch job row ──────────────────────────────────────────────────────
-    try:
-        job_rows = _rqjs(
-            "SELECT id::text AS job_id, current_stage, is_closed, "
-            "total_qty, blank_allocated_qty, coating_path, updated_at "
-            "FROM job_master WHERE order_line_id = %(lid)s::uuid "
-            "AND NOT COALESCE(is_closed, FALSE) "
-            "ORDER BY created_at DESC LIMIT 1",
-            {"lid": lid}
-        )
-    except Exception:
-        return
-
-    if not job_rows:
-        # Show closed job summary if no open job
-        try:
-            closed = _rqjs(
-                "SELECT current_stage FROM job_master "
-                "WHERE order_line_id = %(lid)s::uuid AND is_closed = TRUE "
-                "ORDER BY updated_at DESC LIMIT 1",
-                {"lid": lid}
-            )
-            if closed:
-                st.markdown(
-                    "<div style='background:#0a1f12;border:1px solid #10b98155;"
-                    "border-radius:8px;padding:8px 14px;margin:6px 0;"
-                    "color:#4ade80;font-size:0.78rem;font-weight:700'>"
-                    f"✅ Job complete — {closed[0].get('current_stage','READY_FOR_PACK')}"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-        except Exception:
-            pass
-        return
-
-    job     = job_rows[0]
-    job_id  = job["job_id"]
-    stage   = job.get("current_stage") or "JOB_CREATED"
-    coating = job.get("coating_path") or ""
-
-    # ── Fetch allowed next stages from DB transition table ─────────────────
-    _STD_NEXT_INLINE = {
-        "JOB_CREATED":          ["JOB_PRINTED"],
-        "JOB_PRINTED":          ["PRODUCTION_PICKED"],
-        "BLANK_ALLOCATED":      ["PRODUCTION_PICKED"],
-        "PRODUCTION_PICKED":    ["SURFACING_DONE", "HARDCOAT_PICKED"],
-        "SURFACING_DONE":       ["INSPECTION", "HARDCOAT_PICKED"],
-        "INSPECTION":           ["HARDCOAT_PICKED", "HARDCOAT_COMPLETED"],
-        "HARDCOAT_PICKED":      ["HARDCOAT_COMPLETED"],
-        "HARDCOAT_COMPLETED":   ["ARC_SENT", "COLOURING_PICKED", "PRODUCTION_COMPLETED"],
-        "COLOURING_PICKED":     ["COLOURING_COMPLETED"],
-        "COLOURING_COMPLETED":  ["ARC_SENT", "PRODUCTION_COMPLETED"],
-        "ARC_SENT":             ["ARC_RECEIVED"],
-        "ARC_RECEIVED":         ["FINAL_QC", "PRODUCTION_COMPLETED"],
-        "PRODUCTION_COMPLETED": ["FINAL_QC", "READY_FOR_PACK"],
-        "FINAL_QC":             ["READY_FOR_PACK", "AWAITING_FITTING"],
-        "READY_FOR_PACK":       ["READY_TO_BILL", "AWAITING_FITTING"],  # READY_TO_BILL = skip fitting, go to billing
-        "AWAITING_FITTING":     ["SENT_TO_FITTER"],
-        "SENT_TO_FITTER":       ["RECEIVED_FROM_FITTER"],
-        "RECEIVED_FROM_FITTER": ["FITTING_DONE"],
-        "FITTING_DONE":         ["DISPATCHED"],
-    }
-    _STAGE_LABELS_INLINE = {
-        "JOB_CREATED":          ("📋", "Job Created",           "#64748b"),
-        "JOB_PRINTED":          ("🖨",  "Job Card Printed",      "#3b82f6"),
-        "BLANK_ALLOCATED":      ("🎯", "Blank Allocated",        "#8b5cf6"),
-        "PRODUCTION_PICKED":    ("⚙️", "Picked for Production",  "#f59e0b"),
-        "SURFACING_DONE":       ("✨", "Surfacing Done",          "#a855f7"),
-        "INSPECTION":           ("🔍", "Inspection",             "#0d9488"),
-        "HARDCOAT_PICKED":      ("🛡",  "Picked for Hardcoat",   "#06b6d4"),
-        "HARDCOAT_COMPLETED":   ("🛡",  "Hardcoat Done",         "#0891b2"),
-        "COLOURING_PICKED":     ("🎨", "Picked for Colouring",   "#ec4899"),
-        "COLOURING_COMPLETED":  ("🎨", "Colouring Done",         "#be185d"),
-        "ARC_SENT":             ("⚗️", "Sent for ARC",           "#7c3aed"),
-        "ARC_RECEIVED":         ("⚗️", "ARC Received",           "#6d28d9"),
-        "PRODUCTION_COMPLETED": ("✅", "Production Done",        "#10b981"),
-        "FINAL_QC":             ("🔬", "Final QC",               "#059669"),
-        "READY_FOR_PACK":       ("📦", "Ready for Packing",      "#10b981"),
-        "AWAITING_FITTING":     ("⏳", "Awaiting Fitting",       "#f59e0b"),
-        "SENT_TO_FITTER":       ("🔧", "Sent to Fitter",         "#d97706"),
-        "RECEIVED_FROM_FITTER": ("📬", "Received from Fitter",   "#ea580c"),
-        "FITTING_DONE":         ("✅", "Fitting Done",            "#16a34a"),
-        "DISPATCHED":           ("🚚", "Dispatched",             "#0891b2"),
-    }
-
-    try:
-        tr_rows = _rqjs(
-            "SELECT to_stage_code FROM job_stage_transitions "
-            "WHERE from_stage_code = %(s)s AND allowed = TRUE "
-            "ORDER BY to_stage_code",
-            {"s": stage}
-        )
-        allowed_next = [r["to_stage_code"] for r in tr_rows if r.get("to_stage_code")]
-    except Exception:
-        allowed_next = []
-    if not allowed_next:
-        allowed_next = _STD_NEXT_INLINE.get(stage, [])
-
-    # ── Current stage info ─────────────────────────────────────────────────
-    icon, label, clr = _STAGE_LABELS_INLINE.get(stage, ("⚙️", stage, "#64748b"))
-    coating_badge = (
-        f"<span style='background:#7c3aed22;color:#c4b5fd;"
-        f"border:1px solid #7c3aed55;border-radius:12px;"
-        f"padding:1px 8px;font-size:0.65rem;font-weight:700;margin-left:6px'>"
-        f"⚗️ {coating}</span>"
-        if coating else ""
-    )
-
-    st.markdown(
-        f"<div style='background:#0f172a;border:1px solid {clr}55;"
-        f"border-radius:8px;padding:8px 14px;margin:8px 0 4px;"
-        f"display:flex;align-items:center;gap:10px'>"
-        f"<span style='background:{clr}22;color:{clr};border:1.5px solid {clr}66;"
-        f"border-radius:20px;padding:3px 12px;font-size:0.78rem;font-weight:800'>"
-        f"{icon} {label}</span>"
-        f"{coating_badge}"
-        f"<span style='color:#475569;font-size:0.65rem;margin-left:auto'>"
-        f"🧱 Blank {int(job.get('blank_allocated_qty') or 0)}/"
-        f"{int(job.get('total_qty') or 0)}</span>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    # ── Advance buttons + Reject button ──────────────────────────────────
-    # Reject is shown alongside advance buttons at any post-pick stage
-    _REJECTABLE_STAGES = {
-        "PRODUCTION_PICKED", "SURFACING_DONE", "INSPECTION",
-        "HARDCOAT_PICKED", "HARDCOAT_COMPLETED",
-        "COLOURING_PICKED", "COLOURING_COMPLETED",
-        "ARC_SENT", "ARC_RECEIVED",
-        "PRODUCTION_COMPLETED", "FINAL_QC",
-    }
-
-    if not allowed_next and stage not in _REJECTABLE_STAGES:
-        st.caption("No further stage transitions for this job.")
-        return
-
-    order_id = str(order.get("id") or "")
-
-    # Show reject button if at a rejectable stage
-    if stage in _REJECTABLE_STAGES:
-        from modules.security.roles import has_role as _hr_rej
-        if _hr_rej("admin", "manager", "lab"):
-            _rej_key = f"_rej_panel_{lid}"
-            _rej_col1, _rej_col2 = st.columns([3, 1])
-            with _rej_col2:
-                if st.button(
-                    "↩️ Reject",
-                    key=f"rej_open_{lid}",
-                    width='stretch',
-                    help="Blank failed at this stage — return to stock, restart pipeline"
-                ):
-                    st.session_state[_rej_key] = not st.session_state.get(_rej_key, False)
-                    st.rerun()
-
-            if st.session_state.get(_rej_key):
-                _render_inline_reject(lid, stage, line, order)
-
-    if not allowed_next:
-        return
-
-    btn_cols = st.columns(min(len(allowed_next), 3))
-    for col, next_stage in zip(btn_cols, allowed_next):
-        ns_icon, ns_label, ns_clr = _STAGE_LABELS_INLINE.get(
-            next_stage, ("→", next_stage, "#3b82f6")
-        )
-        with col:
-            if st.button(
-                f"{ns_icon} → {ns_label}",
-                key=f"jc_adv_{lid}_{next_stage}",
-                width='stretch',
-                type="primary",
-            ):
-                # Try DB function first, fall back to manual
-                ok, msg = False, ""
-                try:
-                    res = _rqjs(
-                        "SELECT advance_job_stage(%(jid)s::uuid, %(ns)s, NULL::uuid) AS r",
-                        {"jid": job_id, "ns": next_stage}
-                    )
-                    result = str((res[0].get("r") or "") if res else "")
-                    if result.startswith("ERROR"):
-                        ok, msg = False, result
-                    else:
-                        ok, msg = True, result
-                except Exception:
-                    pass
-
-                if not ok:
-                    # Manual fallback
-                    try:
-                        from modules.sql_adapter import run_write as _rw
-                        # PRODUCTION_PICKED blank guard
-                        if next_stage == "PRODUCTION_PICKED":
-                            ba = _rqjs(
-                                "SELECT 1 FROM blank_allocations "
-                                "WHERE order_line_id = %(lid)s::uuid LIMIT 1",
-                                {"lid": lid}
-                            )
-                            if not ba:
-                                st.error("❌ Blank not selected — fill in the job card above first")
-                                return
-
-                        # READY_FOR_PACK side effects
-                        if next_stage == "READY_FOR_PACK":
-                            info = _rqjs(
-                                "SELECT total_qty FROM job_master WHERE id = %(jid)s::uuid",
-                                {"jid": job_id}
-                            )
-                            qty = int((info[0].get("total_qty") or 0)) if info else 0
-                            if qty > 0:
-                                _rw(
-                                    "UPDATE order_lines SET "
-                                    "ready_qty = COALESCE(ready_qty,0) + %(q)s, "
-                                    "WHERE id = %(lid)s::uuid",
-                                    {"q": qty, "lid": lid}
-                                )
-                            _rw(
-                                "UPDATE job_master SET is_closed=TRUE, updated_at=NOW() "
-                                "WHERE id=%(jid)s::uuid",
-                                {"jid": job_id}
-                            )
-
-                        # DISPATCHED/DELIVERED side effects - ensure ready_qty is set
-                        elif next_stage in ("DISPATCHED", "DELIVERED") and lid:
-                            # Check if ready_qty is already set for this line
-                            current = _rqjs(
-                                "SELECT COALESCE(ready_qty,0) as rq, quantity as qty "
-                                "FROM order_lines WHERE id = %(lid)s::uuid",
-                                {"lid": lid}
-                            )
-                            if current and int(current[0].get("rq", 0)) == 0:
-                                qty = int(current[0].get("qty", 0))
-                                if qty > 0:
-                                    _rw(
-                                        "UPDATE order_lines SET "
-                                        "ready_qty = %(q)s, "
-                                        "WHERE id = %(lid)s::uuid",
-                                        {"q": qty, "lid": lid}
-                                    )
-
-                        _rw(
-                            "UPDATE job_master SET current_stage=%(ns)s, updated_at=NOW() "
-                            "WHERE id=%(jid)s::uuid",
-                            {"jid": job_id, "ns": next_stage}
-                        )
-                        # Log event
-                        try:
-                            _rw(
-                                "INSERT INTO job_stage_events "
-                                "(id, job_id, stage_id, stage_code, department, created_at) "
-                                "SELECT gen_random_uuid(), %(jid)s::uuid, "
-                                "COALESCE((SELECT id FROM job_stage_master "
-                                "WHERE stage_code=%(ns)s LIMIT 1), gen_random_uuid()), "
-                                "%(ns)s, 'backoffice', NOW()",
-                                {"jid": job_id, "ns": next_stage}
-                            )
-                        except Exception:
-                            pass
-                        ok, msg = True, f"Advanced to {next_stage}"
-                    except Exception as _e:
-                        ok, msg = False, str(_e)
-
-                if ok:
-                    st.success(f"✅ {ns_icon} Stage → **{ns_label}**")
-                    try:
-                        from modules.backoffice.backoffice_helpers import load_orders_from_database
-                        load_orders_from_database.clear()
-                    except Exception:
-                        pass
-                    st.rerun()
-                else:
-                    st.error(f"❌ {msg}")
-
-
 def generate_job_cards(order: Dict):
     """
     Generate job cards with surfacing support.
@@ -1081,36 +1636,15 @@ def generate_job_cards(order: Dict):
     from modules.documents.job_card_surfacing import (
         render_surfacing_job_card,
         render_job_card_print,
-        save_job_card_line,
     )
-
-    def _get_line_key(ln):
-        """Mirror of _line_key() from job_card_surfacing for use in backoffice_ui."""
-        lid = (ln.get("line_id") or ln.get("id") or "").strip()
-        eye = (ln.get("eye_side") or "X").upper().strip()
-        ono = (ln.get("order_no") or "").strip()
-        return f"jc_{lid}_{eye}" if lid else f"jc_{ono}_{eye}"
 
     st.markdown("---")
     st.markdown("### 🔧 In-House Job Cards")
 
     inhouse_lines = order.get("inhouse_lines", [])
 
-    # Warn if any line has no route saved — job cards should only show after assignment
-    _unrouted = [l for l in (order.get("lines") or [])
-                 if not str(l.get("manufacturing_route") or "").strip()
-                 and str(l.get("eye_side") or "").upper() in ("R","L")
-                 and not l.get("is_service_line")]
-    if _unrouted:
-        st.warning(
-            "⚠️ **Routes not saved yet.** "
-            "Go to the Assignment tab, set routes (In-house / External Lab / Supplier / Stock), "
-            "click **✅ Confirm All Assignments** — then come back here to fill job cards. "
-            "Job cards shown below may include lines not assigned to in-house."
-        )
-
     if not inhouse_lines:
-        st.info("No in-house lines. Assign routes in the Assignment tab first.")
+        st.warning("No in-house items requiring job cards")
         return
 
     # ── Group lines: try to pair R + L for same product ──────────────
@@ -1136,182 +1670,50 @@ def generate_job_cards(order: Dict):
         l_line = sides.get("L")
 
         if r_line is not None and l_line is not None:
+            # ── Paired: show R and L in two columns ──────────────────
             product_name = r_line.get("product_name", "Unknown Product")
-            category_name = r_line.get("main_group") or r_line.get("category") or "—"
 
             with st.expander(
-                f"👁️ {product_name}  ·  {category_name}  — R + L",
+                f"👁️ {product_name} — Right & Left Eye",
                 expanded=True,
             ):
-                # ── Product / category header ─────────────────────────
-                st.markdown(
-                    f"<div style='background:#0f172a;border:1px solid #3b82f644;"
-                    f"border-radius:10px;padding:10px 18px;margin-bottom:12px;"
-                    f"display:flex;gap:20px;align-items:center'>"
-                    f"<div><div style='color:#60a5fa;font-size:1.1rem;font-weight:800'>"
-                    f"{product_name}</div>"
-                    f"<div style='color:#94a3b8;font-size:0.78rem'>{category_name}</div></div>"
-                    f"<div style='color:#334155;font-size:1.5rem'>|</div>"
-                    f"<div style='color:#64748b;font-size:0.75rem'>"
-                    f"Brand: {r_line.get('brand','—')}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True)
-
                 col_r, col_divider, col_l = st.columns([10, 1, 10])
 
                 with col_r:
                     st.markdown(
-                        "<div style='background:#0f2230;border-left:4px solid #4ade80;"
-                        "border-radius:0 8px 8px 0;padding:6px 14px;margin-bottom:10px'>"
-                        "<span style='color:#4ade80;font-weight:700;font-size:1rem'>"
+                        "<div style='background:#1a3a2a;border-radius:8px;padding:6px 14px;"
+                        "margin-bottom:10px;'>"
+                        "<span style='color:#4ade80;font-weight:700;font-size:1rem;'>"
                         "👁 RIGHT EYE</span></div>",
-                        unsafe_allow_html=True)
+                        unsafe_allow_html=True,
+                    )
                     render_surfacing_job_card(r_line, order)
+                    if r_line.get("surfacing_data"):
+                        _r_pk = f"bo_jc_print_r_{r_line.get('line_id','')[:8]}"
+                        if st.button("🖨 Print Job Card — R", key=_r_pk+"_btn",
+                                     use_container_width=True):
+                            render_job_card_print(r_line, order)
 
-                    _render_job_stage_controls(r_line, order)
                 with col_divider:
                     st.markdown(
-                        "<div style='border-left:2px dashed #334155;height:100%;"
-                        "margin:0 auto;width:2px'></div>",
-                        unsafe_allow_html=True)
+                        "<div style='border-left:2px dashed #334155;height:100%;margin:0 auto;width:2px;'></div>",
+                        unsafe_allow_html=True,
+                    )
 
                 with col_l:
                     st.markdown(
-                        "<div style='background:#0f1e30;border-left:4px solid #60a5fa;"
-                        "border-radius:0 8px 8px 0;padding:6px 14px;margin-bottom:10px'>"
-                        "<span style='color:#60a5fa;font-weight:700;font-size:1rem'>"
+                        "<div style='background:#1a2a3a;border-radius:8px;padding:6px 14px;"
+                        "margin-bottom:10px;'>"
+                        "<span style='color:#60a5fa;font-weight:700;font-size:1rem;'>"
                         "👁 LEFT EYE</span></div>",
-                        unsafe_allow_html=True)
+                        unsafe_allow_html=True,
+                    )
                     render_surfacing_job_card(l_line, order)
-                    _render_job_stage_controls(l_line, order)
-
-                # ── PRINT BUTTON for both eyes ───────────────────────
-                st.markdown("---")
-
-                # Safe key — pk may contain slashes/spaces
-                import re as _re
-                _pair_pk = _re.sub(r"[^a-zA-Z0-9_]", "_", str(pk))
-
-                # Reload both lines fresh from DB — in-memory dicts are stale after save
-                def _reload_line_fresh(ln):
-                    try:
-                        from modules.sql_adapter import run_query as _rq3
-                        import json as _j3
-                        _lid3 = (ln.get("line_id") or ln.get("id") or "").strip()
-                        if not _lid3: return ln
-                        rows = _rq3(
-                            "SELECT lens_params FROM order_lines WHERE id=%(l)s::uuid LIMIT 1",
-                            {"l": _lid3})
-                        if not rows: return ln
-                        lp = rows[0].get("lens_params") or {}
-                        if isinstance(lp, str):
-                            try: lp = _j3.loads(lp)
-                            except: return ln
-                        fresh = dict(ln)
-                        if lp.get("surfacing_data"):
-                            fresh["surfacing_data"] = lp["surfacing_data"]
-                        return fresh
-                    except Exception:
-                        return ln
-
-                _r_fresh = _reload_line_fresh(r_line)
-                _l_fresh = _reload_line_fresh(l_line)
-
-                # Check if computed (filled in cards) or already saved in DB
-                _r_lk   = f"jc_computed_{_get_line_key(_r_fresh)}"
-                _l_lk   = f"jc_computed_{_get_line_key(_l_fresh)}"
-                _r_computed = _r_lk in st.session_state
-                _l_computed = _l_lk in st.session_state
-                _r_saved_db = bool(_r_fresh.get("surfacing_data") or
-                                   (_r_fresh.get("lens_params") or {}).get("surfacing_data"))
-                _l_saved_db = bool(_l_fresh.get("surfacing_data") or
-                                   (_l_fresh.get("lens_params") or {}).get("surfacing_data"))
-                _r_ready    = _r_computed or _r_saved_db
-                _l_ready    = _l_computed or _l_saved_db
-                _both_ready = _r_ready and _l_ready
-                _both_saved = _r_saved_db and _l_saved_db
-
-                # ── Status badges ─────────────────────────────────────
-                def _badge(ready, saved, eye):
-                    if saved:   return f"✅ {eye} Saved", "#4ade80", "#0d2818"
-                    if ready:   return f"📝 {eye} Ready to save", "#facc15", "#1a1500"
-                    return f"⏳ {eye} — fill card above", "#f59e0b", "#1a0f00"
-
-                _r_label, _r_col, _r_bg = _badge(_r_ready, _r_saved_db, "RE")
-                _l_label, _l_col, _l_bg = _badge(_l_ready, _l_saved_db, "LE")
-                st.markdown(
-                    f"<div style='display:flex;gap:8px;padding:8px 0 4px'>"
-                    f"<span style='background:{_r_bg};color:{_r_col};border:1px solid {_r_col};"
-                    f"border-radius:20px;padding:3px 12px;font-size:0.8rem;font-weight:700'>{_r_label}</span>"
-                    f"<span style='background:{_l_bg};color:{_l_col};border:1px solid {_l_col};"
-                    f"border-radius:20px;padding:3px 12px;font-size:0.8rem;font-weight:700'>{_l_label}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True)
-
-                # ── Single Save Both button ───────────────────────────
-                _btn1, _btn2 = st.columns(2)
-                with _btn1:
-                    _save_help = None if _both_ready else "Fill in both R and L job cards above first"
-                    if st.button(
-                        "💾 Save Both Job Cards & Update Inventory",
-                        type="primary",
-                        key=f"save_both_{_pair_pk}",
-                        width='stretch',
-                        disabled=not _both_ready,
-                        help=_save_help,
-                    ):
-                        from modules.documents.job_card_surfacing import save_job_card_line
-                        _errs = []
-                        _msgs = []
-
-                        # ── FIX: Merge in-memory computed surfacing_data into
-                        # the fresh line before saving. _reload_line_fresh() only
-                        # returns data already committed to DB. When a user fills
-                        # the job card (including a base change) the selections
-                        # live in st.session_state[jc_computed_<key>] and must
-                        # be injected here, otherwise save_job_card_line has
-                        # nothing to write and silently loses the work.
-                        def _inject_computed(fr, lk):
-                            if not fr.get("surfacing_data") and lk in st.session_state:
-                                fr = dict(fr)
-                                fr["surfacing_data"] = st.session_state[lk]
-                            return fr
-
-                        _r_to_save = _inject_computed(_r_fresh, _r_lk)
-                        _l_to_save = _inject_computed(_l_fresh, _l_lk)
-
-                        for _ln, _fr in (("RE", _r_to_save), ("LE", _l_to_save)):
-                            _ok, _msg = save_job_card_line(_fr, order)
-                            if _ok:
-                                _msgs.append(_msg)
-                            else:
-                                _errs.append(f"{_ln}: {_msg}")
-                        if _errs:
-                            for _e in _errs:
-                                st.error(f"❌ {_e}")
-                        if _msgs:
-                            for _m in _msgs:
-                                st.success(_m)
-                        if not _errs:
-                            st.balloons()
-                        st.rerun()
-
-                with _btn2:
-                    if st.button("🖨️ Print Both Job Cards",
-                                 type="primary" if _both_saved else "secondary",
-                                 key=f"print_pair_{_pair_pk}",
-                                 width='stretch',
-                                 disabled=not _both_saved,
-                                 help=None if _both_saved else "Save both eyes first"):
-                        st.session_state[f"show_print_pair_{_pair_pk}"] = True
-                        st.rerun()
-
-                # ── Print preview — R and L side by side ─────────────
-                _print_key = f"show_print_pair_{_pair_pk}"
-                if st.session_state.get(_print_key):
-                    with st.expander("🖨 Print Preview — Both Eyes", expanded=True):
-                        from modules.documents.job_card_surfacing import render_job_card_print_pair
-                        render_job_card_print_pair(_r_fresh, _l_fresh, order)
+                    if l_line.get("surfacing_data"):
+                        _l_pk = f"bo_jc_print_l_{l_line.get('line_id','')[:8]}"
+                        if st.button("🖨 Print Job Card — L", key=_l_pk+"_btn",
+                                     use_container_width=True):
+                            render_job_card_print(l_line, order)
 
             rendered_line_ids.add(id(r_line))
             rendered_line_ids.add(id(l_line))
@@ -1327,174 +1729,75 @@ def generate_job_cards(order: Dict):
 
             with st.expander(f"👁 {product_name} — {eye_display}", expanded=True):
                 render_surfacing_job_card(line, order)
-                _render_job_stage_controls(line, order)
                 if line.get("surfacing_data"):
-                    with st.expander("🖨 Print Preview", expanded=False):
+                    _s_pk = f"bo_jc_print_s_{line.get('line_id','')[:8]}"
+                    if st.button("🖨 Print Job Card", key=_s_pk+"_btn",
+                                 use_container_width=True):
                         render_job_card_print(line, order)
 
             rendered_line_ids.add(id(line))
 
 def generate_lab_orders(order: Dict):
-    """
-    Lab / Vendor order panel — shows VENDOR + EXTERNAL_LAB lines.
-    Allows marking lines as ready when supplier has delivered.
-    """
+    """Generate lab orders for external items"""
     st.markdown("---")
-    st.markdown("### 🏭 Supplier / External Lab Orders")
-
-    # Only VENDOR and EXTERNAL_LAB lines — INHOUSE lines are handled by
-    # generate_job_cards() and must never appear here.
-    # The caller (Documents tab) already sets order["lab_order_lines"] to
-    # the vendor-only subset before calling this function.
-    all_vendor = list(order.get("lab_order_lines", []))
-
-    # Deduplicate by line_id — guards against any double-entry from upstream
-    _seen_lids: set = set()
-    _deduped: list = []
-    for _ln in all_vendor:
-        _dedup_lid = str(_ln.get("line_id") or _ln.get("id") or id(_ln))
-        if _dedup_lid not in _seen_lids:
-            _seen_lids.add(_dedup_lid)
-            _deduped.append(_ln)
-    all_vendor = _deduped
-
-    if not all_vendor:
-        st.info("No vendor / external lab lines for this order.")
+    st.markdown("###  Lab Orders")
+    
+    lab_lines = order.get('lab_order_lines', [])
+    
+    if not lab_lines:
+        st.warning("No lab order items")
         return
-
-    order_id = str(order.get("id") or order.get("order_id") or "")
-
-    # Load suppliers from parties table
-    _suppliers = []
-    try:
-        from modules.sql_adapter import run_query as _rq_sup
-        _sup_rows = _rq_sup("""
-            SELECT id::text, party_name, mobile
-            FROM parties
-            WHERE UPPER(COALESCE(party_type,'')) IN ('SUPPLIER','VENDOR')
-              AND COALESCE(is_active, TRUE) = TRUE
-            ORDER BY party_name
-        """) or []
-        _suppliers = [{"id": r["id"], "name": r["party_name"]} for r in _sup_rows]
-    except Exception:
-        pass
-
-    if not _suppliers:
-        _suppliers = [{"id": "", "name": "External Lab / Supplier"}]
-
-    for _vi, line in enumerate(all_vendor):
-        # _vi is the loop index — appended to every key so even blank/duplicate
-        # line_ids (edge case: new unsaved lines) never collide.
-        _lid    = str(line.get("line_id") or line.get("id") or f"v{_vi}")
-        _key_sfx = f"{_lid}_{_vi}"  # unique suffix: uuid + position
-        _eye    = str(line.get("eye_side") or "").upper()
-        _pname  = str(line.get("product_name") or "").split(" | ")[0]
-        _route  = str(line.get("manufacturing_route") or "VENDOR").upper()
-        _needed = int(line.get("billing_qty") or line.get("quantity") or 0)
-        _ready  = int(line.get("ready_qty") or 0)
-        _supp   = str(line.get("supplier_name") or line.get("supplier_id") or "")
-        _sph    = fmt_signed(line.get("sph")) if line.get("sph") is not None else "—"
-        _cyl    = fmt_signed(line.get("cyl")) if line.get("cyl") is not None else ""
-
-        _done   = _ready >= _needed
-        _bg     = "#0f2a1a" if _done else "#1a0f00"
-        _bdr    = "#22c55e" if _done else "#f59e0b"
-        _color  = "#86efac" if _done else "#fcd34d"
-        _status_lbl = f"✅ Ready ({_ready}/{_needed})" if _done else f"⏳ {_ready}/{_needed} received"
-
-        st.markdown(
-            f"<div style='background:{_bg};border:1px solid {_bdr};"
-            f"border-radius:8px;padding:8px 12px;margin-bottom:6px'>"
-            f"<div style='display:flex;justify-content:space-between'>"
-            f"<span style='color:#e2e8f0;font-weight:700;font-size:0.85rem'>"
-            f"{'👁 '+_eye+' — ' if _eye and _eye not in ('O','OTHER','') else '🖼 '}{_pname}"
-            f"</span>"
-            f"<span style='color:{_color};font-size:0.78rem;font-weight:700'>{_status_lbl}</span>"
-            f"</div>"
-            f"<div style='color:#64748b;font-size:0.72rem;margin-top:3px'>"
-            f"{_route}" + (f" · {_sph}" + (f" {_cyl}" if _cyl else "") if _sph != '—' else "")
-            + (f" · Supplier: {_supp}" if _supp else "") + "</div></div>",
-            unsafe_allow_html=True
-        )
-
-        if not _done:
-            with st.expander(f"📦 Mark as Received / Update", expanded=False):
-                _mc1, _mc2 = st.columns(2)
-                _recv_qty = _mc1.number_input(
-                    "Qty Received", min_value=0, max_value=_needed,
-                    value=_ready, step=1,
-                    key=f"lab_recv_{_key_sfx}"
-                )
-                _sup_ids  = [s["id"] for s in _suppliers]
-                _sup_lbls = {s["id"]: s["name"] for s in _suppliers}
-                _def_sup  = _sup_ids[0] if _sup_ids else ""
-                _sel_sup  = _mc2.selectbox(
-                    "Supplier / Lab",
-                    _sup_ids, format_func=lambda x: _sup_lbls.get(x, x),
-                    key=f"lab_sup_{_key_sfx}"
-                )
-                _exp_del = st.date_input(
-                    "Expected Delivery",
-                    value=datetime.date.today() + datetime.timedelta(days=7),
-                    key=f"lab_exp_{_key_sfx}"
-                )
-                if st.button(
-                    f"✅ Update — {_recv_qty} pcs received",
-                    key=f"lab_upd_{_key_sfx}",
-                    type="primary",
-                    disabled=(_recv_qty == _ready)
-                ):
-                    try:
-                        from modules.sql_adapter import run_write as _rw_lab
-                        _rw_lab("""
-                            UPDATE order_lines
-                            SET ready_qty   = %(rq)s,
-                                supplier_id = CASE WHEN %(sid)s = '' THEN supplier_id
-                                                   ELSE %(sid)s::uuid END
-                            WHERE id = %(lid)s::uuid
-                        """, {"rq": _recv_qty, "sid": _sel_sup or "", "lid": _lid})
-                        line["ready_qty"] = _recv_qty
-                        if _recv_qty >= _needed:
-                            st.success(f"✅ {_pname} — all {_recv_qty} pcs received from {_sup_lbls.get(_sel_sup,'supplier')}")
-                        else:
-                            st.info(f"Updated: {_recv_qty}/{_needed} received")
-                        st.rerun()
-                    except Exception as _le: st.error(f"Update failed: {_le}")
-
-    # ── Bulk supplier assignment (all unassigned lines) ───────────────────
-    _unassigned = [l for l in all_vendor if not l.get("supplier_id") and not l.get("supplier_name")]
-    if _unassigned:
-        st.markdown("---")
-        st.markdown("**📋 Assign Supplier for unassigned lines:**")
-        _sup_ids  = [s["id"] for s in _suppliers]
-        _sup_lbls = {s["id"]: s["name"] for s in _suppliers}
-        _bulk_sup = st.selectbox(
-            "Supplier / Lab",
-            _sup_ids, format_func=lambda x: _sup_lbls.get(x, x),
-            key=f"lab_bulk_sup_{order_id[:8]}"
-        )
-        if st.button("✅ Assign to all pending lines",
-                     key=f"lab_bulk_assign_{order_id[:8]}",
-                     type="primary"):
+    
+    # Lab order summary
+    st.markdown("#### Lab Order Summary")
+    
+    lab_data = []
+    for line in lab_lines:
+        #  FIX: Calculate pending qty for lab orders
+        billing_qty = int(line.get('billing_qty', 0))
+        allocated = int(line.get('allocated_qty', 0))
+        pending = max(0, billing_qty - allocated)
+        
+        lab_data.append({
+            'Product': line.get('product_name', 'N/A'),
+            'Brand': line.get('brand', 'N/A'),
+            'Eye': line.get('eye_side', 'N/A'),
+            'SPH': fmt_signed(line.get('sph')),
+            'CYL': fmt_signed(line.get('cyl')),
+            'AXIS': line.get('axis', 'N/A'),
+            'Qty': pending
+        })
+    
+    st.dataframe(pd.DataFrame(lab_data))
+    
+    # Lab selection
+    lab_name = st.selectbox(
+        "Select Lab",
+        ["Lab A - Premium Optics", "Lab B - Standard Optics", "Lab C - Express Optics"],
+        key='lab_select'
+    )
+    
+    expected_delivery = st.date_input(
+        "Expected Delivery Date",
+        value=datetime.date.today() + datetime.timedelta(days=7),
+        key='lab_delivery_date'
+    )
+    
+    from modules.utils.submit_guard import is_locked, guarded_submit
+    if st.button(" Send Lab Order", type="primary", use_container_width=True,
+                 disabled=is_locked("lab_order")):
+        with guarded_submit("lab_order") as _allowed:
+            if not _allowed:
+                st.stop()
             try:
-                import json as _jbulk
-                from modules.sql_adapter import run_write as _rw_bulk
-                for _ul in _unassigned:
-                    _bl_id = str(_ul.get("line_id") or _ul.get("id") or "")
-                    _lp_bl = _ul.get("lens_params") or {}
-                    if isinstance(_lp_bl, str):
-                        try: _lp_bl = _jbulk.loads(_lp_bl)
-                        except: _lp_bl = {}
-                    _lp_bl["supplier_id"]   = _bulk_sup
-                    _lp_bl["supplier_name"] = _sup_lbls.get(_bulk_sup,"")
-                    _rw_bulk("""
-                        UPDATE order_lines
-                        SET lens_params = %(lp)s::jsonb
-                        WHERE id = %(lid)s::uuid
-                    """, {"lp": _jbulk.dumps(_lp_bl), "lid": _bl_id})
-                st.success(f"✅ Assigned {_sup_lbls.get(_bulk_sup)} to {len(_unassigned)} lines")
-                st.rerun()
-            except Exception as _be: st.error(f"Failed: {_be}")
+                from modules.backoffice.audit_logger import audit, AuditAction
+                audit(AuditAction.LAB_ORDER_SENT, entity="orders",
+                      entity_id=order.get("order_id"),
+                      payload={"lab": lab_name, "delivery": str(expected_delivery)})
+            except Exception:
+                pass
+            st.success(f" Lab order sent to {lab_name}")
+            st.info(f"Expected delivery: {expected_delivery}")
 
 
 def generate_labels(order: Dict):
@@ -1535,7 +1838,7 @@ def generate_labels(order: Dict):
             # ===== BATCH INFO =====
             if line.get('batch_allocation'):
                 batch_info = ", ".join(
-                    str(b.get('batch_no') or 'N/A') for b in line.get('batch_allocation', [])
+                    b.get('batch_no', 'N/A') for b in line.get('batch_allocation', [])
                 )
                 st.text(f"Batch(es): {batch_info}")
 
@@ -1578,6 +1881,7 @@ def render_qty_finalization_ui(line: Dict, line_idx: int, order: Dict):
     )
 
     if new_qty != current_qty:
+        _bo_release_stock_allocation_for_line(line, "quantity_change")
         line["billing_qty"] = new_qty
 
         #  CRITICAL FIX  Always update totals
@@ -1597,41 +1901,79 @@ def render_qty_finalization_ui(line: Dict, line_idx: int, order: Dict):
 # ============================================================================
 # ============================================================================
 
+# ============================================================================
+# ORDER-SUMMARY INLINE DELETE
+# ----------------------------------------------------------------------------
+# Renders a 🗑 button cell for a single summary row. Reuses the canonical
+# soft-delete SQL pattern already used by the line-card 🗑 Delete Line
+# expander (UPDATE order_lines SET is_deleted=TRUE, status='CANCELLED' …),
+# so deletes from the Summary and from the Line Card are identical and the
+# existing ↩ Restore Deleted Lines panel restores either of them.
+# Two-click confirm — accidental tap-to-delete is prevented by a session
+# flag, mirroring the line-card pattern.
+# ============================================================================
+def _bo_summary_row_delete_button(line: Dict, order: Dict, cell) -> None:
+    """Render delete (+ inline confirm) inside `cell` for a summary row."""
+    try:
+        _lid = str(line.get("line_id") or line.get("id") or "").strip()
+        if not _lid or len(_lid) < 10:
+            cell.write("—")
+            return
+        # Block delete if line is already billed (mirrors line-card guard).
+        if float(line.get("billed_qty") or 0) > 0:
+            cell.write("🔒")
+            cell.caption("billed")
+            return
+        _ck = f"bo_summary_del_confirm_{_lid}"
+        if not st.session_state.get(_ck):
+            if cell.button("🗑", key=f"bo_summary_del_{_lid}", help="Delete this line"):
+                st.session_state[_ck] = True
+                st.rerun()
+        else:
+            _c1, _c2 = cell.columns(2)
+            if _c1.button("✅", key=f"bo_summary_del_yes_{_lid}",
+                          help="Confirm delete", type="primary"):
+                try:
+                    from modules.sql_adapter import run_write as _rw_sd
+                    _rw_sd(
+                        """
+                        UPDATE order_lines
+                        SET is_deleted  = TRUE,
+                            status      = 'CANCELLED',
+                            deleted_at  = NOW(),
+                            deleted_by  = %(who)s
+                        WHERE id = %(lid)s::uuid
+                        """,
+                        {"lid": _lid, "who": str(st.session_state.get("user_name") or "backoffice")},
+                    )
+                    try:
+                        _bo_refresh_order_total_value(
+                            str(order.get("id") or order.get("order_id") or "")
+                        )
+                    except Exception:
+                        pass
+                    # also mirror in-memory so the very next render is correct
+                    line["is_deleted"] = True
+                    st.session_state[_ck] = False
+                    st.success("Line deleted")
+                    st.rerun()
+                except Exception as _de:
+                    st.error(f"Delete failed: {_de}")
+                    st.session_state[_ck] = False
+            if _c2.button("✖", key=f"bo_summary_del_no_{_lid}", help="Cancel"):
+                st.session_state[_ck] = False
+                st.rerun()
+    except Exception as _be:
+        # never crash a render row
+        try:
+            cell.write("—")
+            import logging
+            logging.getLogger(__name__).warning(
+                "[BO summary delete] render failed: %s", _be
+            )
+        except Exception:
+            pass
 
-def _calc_line_display_total(line: dict) -> tuple:
-    """
-    Compute (subtotal, gst_amt, grand_total) for display from live line fields.
-    unit_price in DB = price per BOX for BOX unit, price per PCS otherwise.
-    """
-    upr      = float(line.get("unit_price") or 0)
-    bq       = int(line.get("billing_qty") or line.get("quantity") or 0)
-    box_sz   = int(line.get("box_size") or 1)
-    unit     = str(line.get("unit") or "PCS").upper()
-    gst_pct  = float(line.get("gst_percent_used") or line.get("gst_percent") or 0)
-    tax_inc  = line.get("tax_inclusive", True)
-
-    if upr <= 0:
-        # Fallback to stored values
-        sub = float(line.get("billing_total") or line.get("total_price") or 0)
-        gst = float(line.get("gst_amount") or 0)
-        return sub, gst, sub + gst
-
-    # unit_price is ALWAYS per-PCS (normalize_to_pcs_price divides at punch time;
-    # wholesale enrichment below also stores per-PCS after dividing by box_size).
-    sub = round(bq * upr, 2)
-
-    if tax_inc and gst_pct:
-        # RETAIL: MRP is GST-inclusive — back-calculate tax out of price
-        # sub = total paid by customer (GST already inside)
-        # taxable_base = sub × 100 / (100 + rate)
-        # grand_total  = sub  (not sub + gst — that would double-count)
-        gst  = round(sub * gst_pct / (100 + gst_pct), 2)
-        base = round(sub - gst, 2)
-        return base, gst, sub          # total = sub (inclusive)
-    else:
-        # WHOLESALE/PURCHASE: price is ex-GST, tax added on top
-        gst = round(sub * gst_pct / 100, 2)
-        return sub, gst, sub + gst     # total = sub + gst (exclusive)
 
 def render_order_detail():
     """
@@ -1644,33 +1986,10 @@ def render_order_detail():
     4. Ophthalmic job cards render correctly
     """
 
-    # Pre-initialize all_lines so it is never unbound regardless of execution path.
-    # The real population happens below after categorize_order_lines() is called.
-    all_lines = []
-
     # 
     # 1. Resolve order_id
     # 
     order_id = st.session_state.bo_selected_order_id
-
-    # If order_id looks like a UUID, resolve it to order_no
-    # (production page previously set UUID; now sets order_no, but old session may have UUID)
-    import re as _re_oid
-    if order_id and _re_oid.match(
-        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-        str(order_id), _re_oid.IGNORECASE
-    ):
-        try:
-            from modules.sql_adapter import run_query as _rq_oid
-            _ono_row = _rq_oid(
-                "SELECT order_no FROM orders WHERE id=%(oid)s::uuid LIMIT 1",
-                {"oid": order_id}
-            )
-            if _ono_row and _ono_row[0].get("order_no"):
-                order_id = _ono_row[0]["order_no"]
-                st.session_state.bo_selected_order_id = order_id
-        except Exception:
-            pass
 
     if not order_id:
         st.warning("No order selected")
@@ -1678,6 +1997,18 @@ def render_order_detail():
             st.session_state.bo_view_mode = 'dashboard'
             st.rerun()
         return
+
+    # Production cards may open Backoffice with display refs such as
+    # R/2627/0012-C or composite group keys. Resolve once here so every
+    # downstream loader/query receives the real order UUID.
+    try:
+        from modules.sql_adapter import resolve_order_uuid as _resolve_order_uuid_bo_detail
+        _resolved_order_id = _resolve_order_uuid_bo_detail(order_id) or ""
+        if _resolved_order_id:
+            order_id = _resolved_order_id
+            st.session_state.bo_selected_order_id = _resolved_order_id
+    except Exception:
+        pass
 
     # Reset assignment panel state whenever a DIFFERENT order is opened
     _last_oid_key = "_bo_assignment_last_order_id"
@@ -1692,192 +2023,73 @@ def render_order_detail():
     # 
     order = None
     for o in st.session_state.bo_active_orders:
-        if get_display_order_id(o) == order_id:
+        if (
+            get_display_order_id(o) == order_id
+            or str(o.get("id", "")) == str(order_id)
+            or str(o.get("order_id", "")) == str(order_id)
+            or str(o.get("order_no", "")) == str(order_id)
+        ):
             order = o
             break
 
-    # Fallback: reload from DB if not in active list (e.g. after page reload / cache clear)
-    if not order:
+    # Lazy load: if we only have a summary row (no lines), load full detail now
+    if order is not None and not order.get("lines") and not order.get("_existed_in_db"):
         try:
-            from .backoffice_helpers import load_orders_from_database, categorize_order_lines
-            _fresh = load_orders_from_database(limit=500, include_closed=True)
-            for o in _fresh:
-                if get_display_order_id(o) == order_id:
-                    order = o
-                    # Merge back into session so subsequent reruns find it
-                    _existing_nos = {get_display_order_id(x) for x in st.session_state.bo_active_orders}
-                    if order_id not in _existing_nos:
-                        st.session_state.bo_active_orders.append(o)
-                    break
-        except Exception as _reload_err:
+            from modules.backoffice.order_loader import load_single_order as _lso
+            _full = _lso(str(order.get("id") or order.get("order_id") or order_id))
+            if _full:
+                order = _full
+                # Update the session state entry so next open is instant
+                for _i, _o in enumerate(st.session_state.bo_active_orders):
+                    if (
+                        get_display_order_id(_o) == order_id
+                        or str(_o.get("id", "")) == str(order_id)
+                        or str(_o.get("order_id", "")) == str(order_id)
+                        or str(_o.get("order_no", "")) == str(order_id)
+                    ):
+                        st.session_state.bo_active_orders[_i] = _full
+                        break
+        except Exception as _le:
+            pass  # fall through with summary row — UI will show what it has
+
+    if not order:
+        # Not in session list — try direct DB load
+        try:
+            from modules.backoffice.order_loader import load_single_order as _lso2
+            order = _lso2(str(order_id))
+        except Exception:
             pass
 
     if not order:
-        st.error(f"Order {order_id} not found — it may have been deleted or is outside the current load window.")
-        if st.button("↩ Back to Dashboard", key="back_to_dashboard_order_not_found"):
+        # FIX (Order-not-found after product change): the product-change flow
+        # evicts the order from cache and stashes its REAL DB UUID. If the
+        # lookup above failed because order_id is a display number, retry the
+        # DB load with that UUID. One-shot — clear after use.
+        _stashed = st.session_state.pop("bo_reload_db_id", None)
+        if _stashed:
+            try:
+                from modules.backoffice.order_loader import load_single_order as _lso3
+                order = _lso3(str(_stashed))
+            except Exception:
+                pass
+
+    if not order:
+        st.error("Order not found")
+        if st.button(" Back to Dashboard", key="back_to_dashboard_order_not_found"):
             st.session_state.bo_view_mode = 'dashboard'
             st.rerun()
         return
 
-    # ── Live DB line refresh ─────────────────────────────────────────────
-    # Always re-fetch order_lines from DB before rendering.
-    # Prevents stale cache issues when lines were added/changed in another tab.
-    try:
-        from modules.backoffice.order_edit_view import _load_lines as _boev_load
-        _live_lines = _boev_load(str(order.get("id") or ""))
-        if _live_lines:
-            # Restore extra fields from lens_params that _load_lines doesn't fetch
-            import json as _jll
-            for _ll in _live_lines:
-                _lp = _ll.get("lens_params") or {}
-                if isinstance(_lp, str):
-                    try: _lp = _jll.loads(_lp)
-                    except: _lp = {}
-                _ll["lens_params"] = _lp
-                # Restore display_product_name, batch_no, colour, frame_group
-                for _attr in ("display_product_name","batch_no","colour_mix","frame_group",
-                              "batch_allocation","manufacturing_route",
-                              "batch_status","billing_qty","gst_percent","is_service_line"):
-                    # allocated_qty handled separately below — DB column is authoritative
-                    if _lp.get(_attr) is not None and not _ll.get(_attr):
-                        _ll[_attr] = _lp[_attr]
-                if _lp.get("display_product_name") and not _ll.get("product_name"):
-                    _ll["product_name"] = _lp["display_product_name"]
-                # billing_qty = quantity for lines from _load_lines
-                if not _ll.get("billing_qty"):
-                    _ll["billing_qty"] = _ll.get("quantity", 0)
-                # Restore batch_allocation — priority:
-                # 1. suggested_allocation column (written by allocation window)
-                # 2. lens_params batch_allocation (written by full order save)
-                _sa_col = _ll.get("suggested_allocation")
-                if _sa_col and not _ll.get("batch_allocation"):
-                    import json as _jsa
-                    if isinstance(_sa_col, str):
-                        try: _sa_col = _jsa.loads(_sa_col)
-                        except: _sa_col = []
-                    if isinstance(_sa_col, list) and _sa_col:
-                        _ll["batch_allocation"] = _sa_col
-                if not _ll.get("batch_allocation") and _lp.get("batch_allocation"):
-                    _ll["batch_allocation"] = _lp["batch_allocation"]
-                # Sanitise batch_allocation: coerce all values to Python natives
-                # (lens_params parsed from JSON/pandas may contain numpy types)
-                _ba_raw = _ll.get("batch_allocation") or []
-                if _ba_raw:
-                    _ll["batch_allocation"] = [
-                        {k: (str(v) if k == "batch_no" else
-                             int(v) if k in ("allocated_qty","qty") else
-                             float(v) if k == "selling_price" else v)
-                         for k, v in _ba.items()}
-                        for _ba in _ba_raw if isinstance(_ba, dict)
-                    ]
-                    # Recompute allocated_qty from batch_allocation — batch_allocation
-                    # is the authoritative source after allocation window saves it
-                    _ba_sum = sum(
-                        int(b.get("allocated_qty", 0))
-                        for b in _ll["batch_allocation"]
-                        if isinstance(b, dict)
-                    )
-                    if _ba_sum > 0:
-                        # batch_allocation has data → use it regardless of DB column
-                        _ll["allocated_qty"] = _ba_sum
-                        _ll["batch_status"]  = _lp.get("batch_status", "ALLOCATED")
-                        _ll["manufacturing_route"] = (
-                            _lp.get("manufacturing_route")
-                            or _ll.get("manufacturing_route")
-                            or "STOCK"
-                        )
-                if not _ll.get("manufacturing_route") and _lp.get("manufacturing_route"):
-                    _ll["manufacturing_route"] = _lp["manufacturing_route"]
-            order["lines"] = _live_lines
-    except Exception as _ll_err:
-        pass  # Non-fatal: fall back to cached lines
-
-    # ── GST enrichment — fill gst_percent for any line still showing 0 ──
-    # Uses the same resolve_gst_percent() as the tax engine (single source of truth).
-    # Priority: ol.gst_percent (DB) → product_gst_history table → main_group heuristic
-    import datetime as _dt_gst
-    _bill_date_gst = _dt_gst.date.today()
-    _gst_lookup_fn = None
-    try:
-        from modules.backoffice.backoffice_helpers import _make_gst_lookup_public
-        _gst_lookup_fn = _make_gst_lookup_public()
-    except Exception:
-        # _make_gst_lookup is nested — build inline
-        try:
-            from modules.sql_adapter import run_query as _rq_gst
-            _gst_rows = _rq_gst("""
-                SELECT product_id::text, gst_percent, effective_from
-                FROM product_gst_history
-                ORDER BY effective_from DESC
-            """) or []
-            _gst_hist = {}
-            for _gr in _gst_rows:
-                _pid_h = str(_gr.get("product_id") or "")
-                _eff_h = _gr.get("effective_from")
-                if isinstance(_eff_h, str):
-                    try: _eff_h = _dt_gst.date.fromisoformat(_eff_h[:10])
-                    except: _eff_h = None
-                _gst_hist.setdefault(_pid_h, []).append(
-                    (_eff_h, float(_gr.get("gst_percent") or 0))
-                )
-            for _pid_h in _gst_hist:
-                _gst_hist[_pid_h].sort(
-                    key=lambda x: x[0] or _dt_gst.date.min, reverse=True
-                )
-            def _gst_lookup_fn(product_id, bill_date):
-                entries = _gst_hist.get(str(product_id), [])
-                bd = bill_date if isinstance(bill_date, _dt_gst.date) else _dt_gst.date.today()
-                for eff, pct in entries:
-                    if eff is None or eff <= bd:
-                        return pct
-                return entries[-1][1] if entries else None
-        except Exception:
-            _gst_lookup_fn = None
-
-    try:
-        from modules.pricing.tax_engine import resolve_gst_percent as _resolve_gst
-        _has_resolve = True
-    except Exception:
-        _has_resolve = False
-
-    for _gl in order.get("lines", []):
-        _gl_gst = float(_gl.get("gst_percent") or 0)
-        if _gl_gst > 0:
-            _gl["gst_percent_used"] = _gl_gst
-            continue
-        # Use tax engine resolver (same as apply_taxes uses)
-        if _has_resolve:
-            try:
-                _gl_gst = _resolve_gst(_gl, _bill_date_gst, _gst_lookup_fn, order)
-            except Exception:
-                _gl_gst = 0.0
-        # Final fallback: Indian GST heuristic by product category
-        if not _gl_gst:
-            _mg_gst = str(_gl.get("main_group") or "").lower()
-            if "ophthalmic" in _mg_gst:
-                _gl_gst = 12.0  # HSN 9001
-            elif "contact" in _mg_gst or "rgp" in _mg_gst:
-                _gl_gst = 12.0  # HSN 9001
-            elif "frame" in _mg_gst or "sunglass" in _mg_gst:
-                _gl_gst = 5.0   # HSN 9003
-            elif "solution" in _mg_gst:
-                _gl_gst = 18.0  # HSN 3004
-            elif "accessory" in _mg_gst or "accessories" in _mg_gst:
-                _gl_gst = 18.0
-        if _gl_gst > 0:
-            _gl["gst_percent"]      = _gl_gst
-            _gl["gst_percent_used"] = _gl_gst
-
-    # Ensure line categories are always populated (stock/inhouse/lab buckets)
-    try:
-        from .backoffice_helpers import categorize_order_lines
-        categorize_order_lines(order)
-    except Exception:
-        pass
-
-    # Resolve order_type early — used throughout this function
-    # Must be defined before any section that references it (e.g. Other Items header)
-    order_type = str(order.get("order_type") or "RETAIL").upper()
+    if str(order.get("order_type") or "").upper() == "CONSULTATION":
+        st.info(
+            "Consultation-only visit is closed in the Consultation module. "
+            "Receipts are posted directly to registers/accounts and do not enter Backoffice."
+        )
+        if st.button(" Back to Dashboard", key="back_to_dashboard_consultation_order"):
+            st.session_state.bo_view_mode = 'dashboard'
+            st.session_state.bo_selected_order_id = None
+            st.rerun()
+        return
 
     # 
     # 3. Lazy refresh  run workflow engine on lines that need it
@@ -1898,10 +2110,211 @@ def render_order_detail():
                 line["_needs_refresh"] = False
             needs_rerun = True
 
+    # ── READ-TIME PRICE AUTO-HEAL ────────────────────────────────────────
+    # Heal any line that was previously saved with unit_price=0 while a
+    # sibling line on the SAME order has a valid price for the SAME
+    # product. Mirrors price + gst + discount_percent + rule from the
+    # priced sibling, recomputes discount_amount + totals from the mirror,
+    # and PERSISTS the repair to the DB in a single UPDATE per healed line.
+    # After the first open of a broken order the row is fixed in storage,
+    # and the write-guard prevents recurrence on future edits.
+    # Auditable: every heal is logged with from/to values.
+    try:
+        _lines_for_heal = order.get("lines", []) or []
+        _heal_lid_done = set()
+        for _ln in _lines_for_heal:
+            if bool(_ln.get("is_deleted")):
+                continue
+            _up_cur = float(_ln.get("unit_price") or 0)
+            _qty_cur = float(_ln.get("quantity") or _ln.get("qty") or 0)
+            if _up_cur > 0 or _qty_cur <= 0:
+                continue
+            _pid = str(_ln.get("product_id") or "")
+            if not _pid:
+                continue
+            # find a priced sibling with the same product
+            _src = None
+            for _sib in _lines_for_heal:
+                if _sib is _ln or bool(_sib.get("is_deleted")):
+                    continue
+                if str(_sib.get("product_id") or "") != _pid:
+                    continue
+                if float(_sib.get("unit_price") or 0) > 0:
+                    _src = _sib
+                    break
+            if _src is None:
+                # no sibling to mirror from — leave the row, validator will
+                # surface it to the user (correct behaviour; we never invent)
+                continue
+
+            _new_up   = float(_src.get("unit_price") or 0)
+            _new_gst  = float(_src.get("gst_percent") or _ln.get("gst_percent") or 0)
+            _new_dpct = float(_src.get("discount_percent") or 0)
+            _new_drule= str(_src.get("discount_rule") or "")
+            _qty_int  = int(_qty_cur)
+            _gross    = round(_new_up * _qty_int, 2)
+            _new_damt = round(_gross * _new_dpct / 100, 2) if _new_dpct > 0 else 0.0
+            _new_net  = round(max(0.0, _gross - _new_damt), 2)
+            # GST is per-PCS-net basis, same convention used elsewhere
+            _gst_amt  = round(_new_net * _new_gst / 100, 2)
+
+            # Mutate in-memory line so subsequent render shows healed values
+            _ln["unit_price"]      = _new_up
+            _ln["gst_percent"]     = _new_gst
+            _ln["discount_percent"]= _new_dpct
+            _ln["discount_rule"]   = _new_drule
+            _ln["discount_amount"] = _new_damt
+            _ln["total_price"]     = _new_net
+            _ln["billing_total"]   = _new_net
+            _ln["gst_amount"]      = _gst_amt
+
+            # Persist the repair to the DB (one UPDATE per healed line).
+            _lid = str(_ln.get("line_id") or _ln.get("id") or "")
+            if _lid and _lid not in _heal_lid_done:
+                _heal_lid_done.add(_lid)
+                try:
+                    from modules.sql_adapter import run_write as _rw_heal
+                    _rw_heal(
+                        """
+                        UPDATE order_lines
+                        SET unit_price       = %(up)s,
+                            gst_percent      = %(gp)s,
+                            total_price      = %(tp)s,
+                            billing_total    = %(tp)s,
+                            gst_amount       = %(ga)s,
+                            discount_percent = %(dp)s,
+                            discount_amount  = %(da)s,
+                            discount_rule    = %(dr)s
+                        WHERE id = %(lid)s::uuid
+                          AND COALESCE(unit_price, 0) = 0
+                        """,
+                        {
+                            "up": _new_up,    "gp": _new_gst,
+                            "tp": _new_net,   "ga": _gst_amt,
+                            "dp": _new_dpct,  "da": _new_damt,
+                            "dr": _new_drule, "lid": _lid,
+                        },
+                    )
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "[BO] price auto-heal: order=%s line=%s eye=%s "
+                        "product_id=%s mirrored unit_price 0 -> %.2f from "
+                        "sibling line; persisted to DB.",
+                        order.get("order_no"), _lid,
+                        _ln.get("eye_side"), _pid, _new_up,
+                    )
+                    needs_rerun = True  # totals must re-sum after heal
+                except Exception as _he:
+                    # Heal write failed — do NOT swallow silently. The
+                    # in-memory mirror still benefits this render, but log
+                    # so ops can see the persistence failure.
+                    import logging, traceback
+                    logging.getLogger(__name__).warning(
+                        "[BO] price auto-heal DB write failed (in-memory "
+                        "still mirrored): %s\n%s", _he, traceback.format_exc()
+                    )
+    except Exception as _heal_top:
+        # Heal is best-effort, never blocks render. Log loudly.
+        import logging
+        logging.getLogger(__name__).warning(
+            "[BO] price auto-heal scan failed: %s", _heal_top
+        )
+
+    # ── DISCOUNT RECONCILIATION FROM DB ───────────────────────────────────
+    # Symptom this fixes: badge / Order Summary discount shows ₹0.00 even
+    # though the DB has discount_amount > 0 for live lines (e.g. L line
+    # ₹21.50 in DB but memory shows 0). Root cause: refresh_line_state +
+    # update_line_billing + auto-refresh discount engine each touch
+    # billing_total / gst / etc. and somewhere in that chain in-memory
+    # discount_amount gets reset before the badge sums it. We don't fight
+    # each intermediate writer — instead we read DB truth once after all
+    # the refreshers have run, and reconcile if memory drifted.
+    # Strict: only writes from DB→memory, never the other way; only when
+    # DB value is higher than memory (so a deliberate in-session edit that
+    # legitimately reduced the discount is not clobbered).
+    try:
+        _live_lids = [
+            str(_l.get("line_id") or _l.get("id") or "")
+            for _l in (order.get("lines") or [])
+            if str(_l.get("line_id") or _l.get("id") or "")
+            and not bool(_l.get("is_deleted"))
+        ]
+        if _live_lids:
+            from modules.sql_adapter import run_query as _rq_dr
+            _db_disc_rows = _rq_dr(
+                """
+                SELECT id::text AS lid,
+                       COALESCE(discount_amount, 0)  AS da,
+                       COALESCE(discount_percent, 0) AS dp,
+                       COALESCE(discount_rule, '')   AS dr
+                FROM order_lines
+                WHERE id::text = ANY(%(ids)s)
+                """,
+                {"ids": _live_lids},
+            ) or []
+            _by_lid = {str(r.get("lid")): r for r in _db_disc_rows}
+            _reconciled = 0
+            for _ln in (order.get("lines") or []):
+                _lid_r = str(_ln.get("line_id") or _ln.get("id") or "")
+                if not _lid_r or bool(_ln.get("is_deleted")):
+                    continue
+                _db_row = _by_lid.get(_lid_r)
+                if not _db_row:
+                    continue
+                _db_da = float(_db_row.get("da") or 0)
+                _mem_da = float(_ln.get("discount_amount") or 0)
+                # Trust DB only if it is strictly higher — i.e. memory has
+                # lost the discount. Never lower a discount based on DB.
+                if _db_da > _mem_da + 0.01:
+                    _ln["discount_amount"]  = _db_da
+                    _ln["discount_percent"] = float(_db_row.get("dp") or 0)
+                    _ln["discount_rule"]    = str(_db_row.get("dr") or "")
+                    # Recompute net so billing_total reflects the restored
+                    # discount (intermediate writers may have set it gross).
+                    _gross = round(
+                        float(_ln.get("unit_price") or 0)
+                        * int(_ln.get("quantity") or _ln.get("billing_qty") or 1),
+                        2,
+                    )
+                    _net = round(max(0.0, _gross - _db_da), 2)
+                    _ln["billing_total"] = _net
+                    _ln["total_price"]   = _net
+                    # GST recompute on net (wholesale = on top, retail = incl)
+                    try:
+                        _ot_r = str(order.get("order_type") or "RETAIL").upper()
+                        _gp_r = float(_ln.get("gst_percent") or 0)
+                        if _gp_r > 0 and _net > 0:
+                            if _ot_r == "RETAIL":
+                                _ln["gst_amount"] = round(_net - (_net / (1 + _gp_r/100)), 2)
+                            else:
+                                _ln["gst_amount"] = round(_net * _gp_r / 100, 2)
+                    except Exception:
+                        pass
+                    _reconciled += 1
+            if _reconciled:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[BO] discount reconciliation: restored %d line(s) "
+                    "from DB on order %s",
+                    _reconciled, order.get("order_no"),
+                )
+                needs_rerun = True
+    except Exception as _dr_e:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[BO] discount reconciliation failed: %s", _dr_e
+        )
+
     if needs_rerun:
         # Recalculate order totals then re-categorize
         recalculate_order_totals(order)
-        from .backoffice_helpers import categorize_order_lines
+        from .backoffice_helpers import categorize_order_lines, apply_schemes_to_order_lines, apply_cart_schemes_to_order_lines
+        try:
+            _scheme_party = str(order.get("party_id") or order.get("customer_id") or "")
+            apply_schemes_to_order_lines(order, party_id=_scheme_party)
+            apply_cart_schemes_to_order_lines(order, party_id=_scheme_party)
+        except Exception:
+            pass
         categorize_order_lines(order)
     
     # =====================================================
@@ -1914,3412 +2327,4771 @@ def render_order_detail():
             import logging
             logging.warning(f"[BO] Sidebar render failed: {e}")
 
-    # ── Sticky order banner ───────────────────────────────────────────────────
-    _order_no   = order.get("order_no") or order.get("order_id") or "—"
-    _seq_no     = order.get("display_order_no")
-    _seq_label  = f"#{int(_seq_no):04d}" if _seq_no else ""
-    _patient    = order.get("patient_name") or "—"
-    # Single source of truth — get_live_status() computes from DB state
+    # Header
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        st.title(f"📋 Order: {get_display_label(order)}")
+
+    # ── Order channel + party / patient identity (Issue 1) ───────────────
+    # Display-only. Pulls from the existing order dict — no logic change,
+    # no lines removed. Makes RETAIL / WHOLESALE / ONLINE + who the order is
+    # for unmistakable at the top of the page.
     try:
-        from modules.backoffice.order_status_live import get_live_status as _gls_hdr, compute_order_status as _cos_hdr
-        _ord_status = _cos_hdr(order, write=True)   # compute + persist if changed
-    except Exception:
-        _ord_status = str(order.get("status") or "PENDING").upper()
-    _ord_date   = str(order.get("created_at") or "")[:10]
-
-    # Billing-frozen flag — blocks all line edits when order is in billing pipeline
-    # CONFIRMED onwards: backoffice is the single authority.
-    # Line-level edits (power, product swap for lenses) are frozen.
-    # Frame SKU/colour/price change remains allowed via assignment panel.
-    # Billing pipeline statuses freeze EVERYTHING including frame changes.
-    _CONFIRMED_FROZEN_STATUSES = {"CONFIRMED", "IN_PRODUCTION", "READY"}
-    _BILLING_FROZEN_STATUSES = {
-        "READY_FOR_BILLING", "PARTIALLY_BILLED",
-        "BILLED", "DISPATCHED", "DELIVERED", "CLOSED",
-    }
-    _is_confirmed_frozen = _ord_status.upper() in _CONFIRMED_FROZEN_STATUSES
-    _billing_frozen = _ord_status.upper() in _BILLING_FROZEN_STATUSES
-
-    # Override: lock if ANY active challan exists for this order
-    # Covers consultation orders that skip normal status flow
-    if not _billing_frozen:
-        try:
-            from modules.sql_adapter import run_query as _rq_chk
-            _challan_exists = _rq_chk("""
-                SELECT 1 FROM challans c
-                WHERE (c.order_ids::text[] @> ARRAY[%(oid)s::text]
-                    OR c.order_ids::text[] @> ARRAY[%(ono)s::text])
-                  AND c.status NOT IN ('CANCELLED','VOID')
-                  AND COALESCE(c.is_deleted, FALSE) = FALSE
-                LIMIT 1
-            """, {"oid": str(order.get("id") or ""), "ono": str(order.get("order_no") or "")})
-            if _challan_exists:
-                _billing_frozen = True
-        except Exception:
-            pass
-    # Combined: any frozen state blocks lens-level edits
-    _any_frozen = _is_confirmed_frozen or _billing_frozen
-
-    # ── Smart Workflow Guide ─────────────────────────────────────────────────
-    # Context-aware step guide — shows operator exactly what to do next
-    def _render_workflow_guide(all_lines=None):
-        all_lines = all_lines or []
-        # Use get_live_status() — the single source of truth
-        try:
-            from modules.backoffice.order_status_live import get_live_status as _gls
-            _st = _gls(order).upper()
-        except Exception:
-            _st = _ord_status.upper()
-
-        if _st in ("CLOSED","CANCELLED","DELIVERED"):
-            return
-
-        # ── Live line-level state computation ─────────────────────────────
-        _all_order_lines = [l for l in all_lines
-                            if not str(l.get("eye_side","")).upper() in ("S","SERVICE")
-                            and not l.get("is_service_line")]
-
-        # Confirmed: order is locked
-        _confirmed = _st not in ("PENDING","PROVISIONAL","UNDER_REVIEW")
-
-        # Assignment: all lines have a route set
-        _all_assigned = _confirmed and all(
-            str(l.get("manufacturing_route") or
-                (l.get("lens_params") or {}).get("manufacturing_route") or "")
-            for l in _all_order_lines
-        )
-
-        # Production: compute per-route live state
-        _prod_lines = [l for l in _all_order_lines
-                       if str(l.get("manufacturing_route") or
-                              (l.get("lens_params") or {}).get("manufacturing_route") or
-                              "STOCK").upper() in ("VENDOR","EXTERNAL_LAB","INHOUSE")]
-        _stock_only = not _prod_lines  # only stock lines → no production step
-
-        _prod_total  = len(_prod_lines)
-        _prod_ready  = sum(
-            1 for l in _prod_lines
-            if int(l.get("ready_qty") or 0) >= int(l.get("quantity") or l.get("billing_qty") or 1)
-        )
-        _prod_done   = (_prod_total == 0) or (_prod_ready >= _prod_total)
-
-        # Billing: count billed vs total
-        _billed_total = len(_all_order_lines)
-        _billed_count = sum(1 for l in _all_order_lines
-                            if int(l.get("billed_qty") or 0) > 0)
-        _fully_billed = _billed_count >= _billed_total and _billed_total > 0
-        _part_billed  = 0 < _billed_count < _billed_total
-
-        # ── Build steps based on actual state ─────────────────────────────
-        if _st in ("PENDING","PROVISIONAL","UNDER_REVIEW"):
-            _steps = [
-                ("1", "Review Lines",   "Check products, powers, prices", False, True),
-                ("2", "Assign Routes",  "Set route per line in Assignment", False, False),
-                ("3", "Confirm Order",  "Save to Order → locks the order", True,  False),
-            ]
-        elif not _confirmed:
-            _steps = [
-                ("1", "Confirm",  "Save order to confirm", True, False),
-            ]
-        elif _stock_only:
-            # Stock-only: Confirm → Billing (no production step)
-            _steps = [
-                ("1", "Confirmed",  f"✅ {_billed_count}/{_billed_total} lines", False, True),
-                ("2", "Billing",
-                 ("✅ Fully billed" if _fully_billed else
-                  f"⚡ {_billed_count}/{_billed_total} billed" if _part_billed else
-                  "Create Challan → Invoice in Billing Summary tab"),
-                 not _fully_billed, _fully_billed),
-            ]
-        else:
-            # Has production lines: Confirm → Production → Billing
-            _prod_hint = (
-                f"✅ All {_prod_total} line(s) received/ready" if _prod_done else
-                f"{_prod_ready}/{_prod_total} line(s) ready — check Supplier/Lab tabs"
-            )
-            _bill_hint = (
-                "✅ Fully billed" if _fully_billed else
-                f"⚡ {_billed_count}/{_billed_total} billed — Create Challan for remaining" if _part_billed else
-                "Create Challan → Invoice in Billing Summary tab"
-            )
-            _steps = [
-                ("1", "Confirmed",   "✅",         False, True),
-                ("2", "Production",  _prod_hint,   not _prod_done, _prod_done),
-                ("3", "Billing",     _bill_hint,   _prod_done and not _fully_billed, _fully_billed),
-            ]
-
-        # ── Render compact horizontal stepper ─────────────────────────────
-        _cols = st.columns(len(_steps))
-        for i, (num, title, hint, is_current, done) in enumerate(_steps):
-            with _cols[i]:
-                _bg    = "#0d2040" if is_current else ("#0f2a1a" if done else "#0f172a")
-                _border= "#6366f1" if is_current else ("#22c55e" if done else "#1e293b")
-                _color = "#a5b4fc" if is_current else ("#86efac" if done else "#475569")
-                _icon  = "▶" if is_current else ("✅" if done else "○")
-                st.markdown(
-                    f"<div style='background:{_bg};border:1.5px solid {_border};"
-                    f"border-radius:8px;padding:8px 10px;text-align:center;min-height:52px'>"
-                    f"<div style='color:{_color};font-weight:700;font-size:0.8rem'>"
-                    f"{_icon} {num}. {title}</div>"
-                    f"<div style='color:#64748b;font-size:0.65rem;margin-top:2px'>{hint}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-
-    # Build all_lines HERE so every block below (banners, supplier reassign, tabs) can access it
-    try:
-        from .backoffice_helpers import categorize_order_lines
-        categorize_order_lines(order)
-    except Exception:
-        pass
-
-    all_lines = []
-    all_lines.extend(order.get('stock_lines', []))
-    all_lines.extend(order.get('inhouse_lines', []))
-    all_lines.extend(order.get('lab_order_lines', []))
-    # SERVICE lines (consultation fee, eye testing) — re-include so they
-    # appear in billing summary and billing_status_panel. Each sub-panel
-    # excludes them individually via eye_side checks.
-    all_lines.extend(order.get('service_lines', []))
-
-    # Render workflow guide now that all_lines is available
-    _render_workflow_guide(all_lines=all_lines)
-
-    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-    # Banner for CONFIRMED stage (partial freeze — frame SKU still editable)
-    if _is_confirmed_frozen and not _billing_frozen:
-        _conf_stage_msgs = {
-            "CONFIRMED":     "Order confirmed by backoffice. Power and product changes are locked. Frame SKU/colour can still be changed in Assignment.",
-            "IN_PRODUCTION": "Order is in production. All line edits are locked. Use Release to edit.",
-            "READY":         "Order is ready for dispatch. All line edits are locked.",
-        }
-        _conf_msg = _conf_stage_msgs.get(_ord_status.upper(), "Order is confirmed — edits locked in retail punching.")
+        _ch = str(order.get("order_type") or order.get("source") or "").upper().strip()
+        _ch_label = {
+            "RETAIL": "🛍️ RETAIL",
+            "WHOLESALE": "🏭 WHOLESALE",
+            "ONLINE": "🌐 ONLINE",
+            "BULK": "📦 BULK",
+        }.get(_ch, _ch or "—")
+        _ch_color = {
+            "RETAIL": "#0ea5e9", "WHOLESALE": "#a855f7",
+            "ONLINE": "#10b981", "BULK": "#f59e0b",
+        }.get(_ch, "#64748b")
+        _patient = str(order.get("patient_name") or "").strip()
+        _party   = str(order.get("party_name") or order.get("customer_name") or "").strip()
+        _bits = []
+        if _party:
+            _bits.append(f"Party: <b>{_party}</b>")
+        if _patient and _patient.upper() != "N/A":
+            _bits.append(f"Patient: <b>{_patient}</b>")
+        _who = " &nbsp;·&nbsp; ".join(_bits) if _bits else "<i>No party / patient name on order</i>"
         st.markdown(
-            f"<div style='background:#0f1e3a;border-left:4px solid #6366f1;"
-            f"border-radius:6px;padding:8px 14px;margin-bottom:10px;"
-            f"color:#a5b4fc;font-size:0.8rem'>🔒 {_conf_msg}</div>",
-            unsafe_allow_html=True,
-        )
-
-    if _billing_frozen:
-        _freeze_msg = {
-            "READY_FOR_BILLING": "Order is in the billing queue — all edits are locked until recalled.",
-            "PARTIALLY_BILLED":  "Order is partially billed — all edits are locked until recalled.",
-            "BILLED":            "Order is billed. Raise a Credit Note to make corrections.",
-            "DISPATCHED":        "Order has been dispatched. No further edits allowed.",
-            "DELIVERED":         "Order has been delivered. No further edits allowed.",
-            "CLOSED":            "Order is closed.",
-        }.get(_ord_status.upper(), "Order is locked — no edits allowed at this stage.")
-        st.markdown(
-            f"<div style='background:#1a0a0a;border-left:4px solid #f59e0b;"
-            f"border-radius:0 8px 8px 0;padding:10px 16px;margin-bottom:10px;"
-            f"display:flex;align-items:center;gap:12px'>"
-            f"<span style='font-size:1.1rem'>🔒</span>"
-            f"<span style='color:#fbbf24;font-size:0.82rem;font-weight:600'>"
-            f"{_freeze_msg}</span>"
+            f"<div style='margin:-8px 0 10px 0;padding:7px 12px;"
+            f"background:{_ch_color}1a;border-left:4px solid {_ch_color};"
+            f"border-radius:5px'>"
+            f"<span style='background:{_ch_color};color:#fff;font-weight:700;"
+            f"font-size:0.74rem;padding:2px 9px;border-radius:4px'>{_ch_label}</span>"
+            f"&nbsp;&nbsp;<span style='color:#334155;font-size:0.86rem'>{_who}</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
-
-    # ── Supplier Reassign — available on ANY confirmed/locked order ───────────
-    # Surgical override: only changes supplier_id in lens_params + audit log.
-    # Power, price, qty, route — all untouched. No full unlock needed.
-    if _any_frozen and _ord_status.upper() not in ("BILLED","DISPATCHED","DELIVERED","CLOSED","CANCELLED"):
-        _vendor_lines = [
-            l for l in all_lines
-            if str(l.get("manufacturing_route") or
-                   (l.get("lens_params") or {}).get("manufacturing_route") or
-                   "").upper() in ("VENDOR","EXTERNAL_LAB")
-        ]
-        if _vendor_lines:
-            with st.expander("🔄 Reassign Supplier (supplier OOS / rejected)", expanded=False):
-                st.caption(
-                    "Only supplier changes — powers, prices, routes are untouched. "
-                    "Use this when your assigned supplier can't fulfil the order."
-                )
-                # Load suppliers
-                try:
-                    from modules.sql_adapter import run_query as _rq_rs
-                    _rs_rows = _rq_rs("""
-                        SELECT id::text, party_name FROM parties
-                        WHERE UPPER(COALESCE(party_type,'')) IN ('SUPPLIER','VENDOR')
-                          AND COALESCE(is_active,TRUE)=TRUE
-                        ORDER BY party_name
-                    """, {}) or []
-                    _rs_ids  = [r["id"] for r in _rs_rows]
-                    _rs_lbls = {r["id"]: r["party_name"] for r in _rs_rows}
-                except Exception:
-                    _rs_ids = []; _rs_lbls = {}
-
-                for _vl in _vendor_lines:
-                    _vl_lid   = str(_vl.get("line_id") or "")
-                    _vl_eye   = str(_vl.get("eye_side","")).upper()
-                    _vl_pname = str(_vl.get("product_name","")).split(" | ")[0]
-                    _vl_lp    = _vl.get("lens_params") or {}
-                    if isinstance(_vl_lp, str):
-                        import json as _jrs
-                        try: _vl_lp = _jrs.loads(_vl_lp)
-                        except: _vl_lp = {}
-                    _cur_sup  = str(_vl_lp.get("supplier_name") or _vl_lp.get("supplier_id") or "—")
-                    _eye_lbl  = f"👁 {_vl_eye} " if _vl_eye not in ("O","OTHER","") else "🖼 "
-
-                    _rc1, _rc2, _rc3, _rc4 = st.columns([2, 2, 1, 1])
-                    _rc1.markdown(f"**{_eye_lbl}{_vl_pname}**")
-                    _rc1.caption(f"Current: {_cur_sup}")
-
-                    if _rs_ids:
-                        _cur_id  = str(_vl_lp.get("supplier_id") or "")
-                        _def_idx = _rs_ids.index(_cur_id) if _cur_id in _rs_ids else 0
-                        _new_sup = _rc2.selectbox(
-                            "New Supplier",
-                            _rs_ids, index=_def_idx,
-                            format_func=lambda x: _rs_lbls.get(x,x),
-                            key=f"rs_sel_{_vl_lid}",
-                            label_visibility="collapsed"
-                        )
-                        _rs_reason = _rc3.selectbox(
-                            "Reason",
-                            ["OOS","Rejected","Quality","Other"],
-                            key=f"rs_rsn_{_vl_lid}",
-                            label_visibility="collapsed"
-                        )
-                        if _rc4.button("✅", key=f"rs_save_{_vl_lid}",
-                                       type="primary",
-                                       use_container_width=True,
-                                       disabled=(_new_sup == _cur_id)):
-                            try:
-                                import json as _jrs2
-                                from modules.sql_adapter import run_write as _rw_rs
-                                _vl_lp["supplier_id"]   = _new_sup
-                                _vl_lp["supplier_name"] = _rs_lbls.get(_new_sup,"")
-                                _rw_rs("""
-                                    UPDATE order_lines
-                                    SET lens_params = %(lp)s::jsonb
-                                    WHERE id = %(lid)s::uuid
-                                """, {"lp": _jrs2.dumps(_vl_lp), "lid": _vl_lid})
-                                # Audit log
-                                try:
-                                    from modules.backoffice.audit_logger import audit, AuditAction
-                                    audit(AuditAction.PRODUCT_CHANGED,
-                                          entity="order_lines", entity_id=_vl_lid,
-                                          order_id=str(order.get("id","")),
-                                          user_id=st.session_state.get("user_name","backoffice"),
-                                          payload={"action":"supplier_reassigned",
-                                                   "old":_cur_sup,
-                                                   "new":_rs_lbls.get(_new_sup,""),
-                                                   "reason":_rs_reason})
-                                except Exception: pass
-                                st.success(f"✅ Reassigned to {_rs_lbls.get(_new_sup)}")
-                                st.rerun()
-                            except Exception as _rse: st.error(str(_rse))
-
-    st.markdown(
-        f"<div style='background:#0f172a;border:2px solid #3b82f6;border-radius:10px;"
-        f"padding:10px 18px;margin-bottom:12px;display:flex;align-items:center;"
-        f"justify-content:space-between;flex-wrap:wrap;gap:8px'>"
-        f"<div style='display:flex;align-items:center;gap:16px'>"
-        f"<span style='font-size:1.6rem;font-weight:900;color:#60a5fa;"
-        f"font-family:monospace;letter-spacing:1px'>{_order_no}</span>"
-        f"{'<span style="font-size:0.9rem;color:#94a3b8;font-family:monospace">' + _seq_label + '</span>' if _seq_label else ''}"
-        f"<span style='font-size:1rem;color:#e2e8f0;font-weight:600'>👤 {_patient}</span>"
-        f"</div>"
-        f"<div style='display:flex;align-items:center;gap:10px'>"
-        f"<span style='font-size:0.75rem;color:#64748b'>{_ord_date}</span>"
-        f"<span style='background:#1e3a5f;color:#93c5fd;padding:3px 10px;"
-        f"border-radius:4px;font-size:0.78rem;font-weight:700'>{_ord_status}</span>"
-        f"</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    _hc1, _hc2 = st.columns([6, 1])
-    with _hc2:
-        if st.button("← Back", width='stretch'):
-            st.session_state.bo_view_mode = "dashboard"
+    except Exception:
+        pass  # identity banner is cosmetic — never block the page
+    
+    with col2:
+        if st.button(" Back", use_container_width=True):
+            st.session_state.bo_view_mode = 'dashboard'
             st.session_state.bo_editing_line = None
             st.session_state.bo_show_allocation_window = False
             st.rerun()
-
-    # ── Status + party row ────────────────────────────────────────────────────
-    # Use get_live_status — single source of truth from order_status_live
-    try:
-        from modules.backoffice.order_status_live import get_live_status as _gls_ui, status_badge_html as _sbh
-        _norm_st = _gls_ui(order)
-        _status_badge_html = _sbh(_norm_st, size="0.78rem")
-    except Exception:
-        _norm_st = str(order.get("status") or "PENDING").upper()
-        _status_badge_html = f"<span style='background:#64748b;color:#fff;padding:2px 12px;border-radius:14px;font-size:0.78rem;font-weight:700'>{_norm_st}</span>"
-    _party    = order.get("patient_name") or order.get("party_name") or "—"
-    _otype    = (order.get("order_type") or "RETAIL").upper()
-    _TC = {"RETAIL":"#0891b2","WHOLESALE":"#8b5cf6","PURCHASE":"#f59e0b"}
-    _tc = _TC.get(_otype, "#64748b")
-    st.markdown(
-        f"<div style='display:flex;align-items:center;gap:10px;margin:6px 0 10px'>"
-        f"<span style='color:#cbd5e1;font-size:1rem;font-weight:700'>{_party}</span>"
-        f"{_status_badge_html}"
-        f"<span style='background:{_tc}22;color:{_tc};padding:2px 9px;border-radius:10px;"
-        f"font-size:0.65rem;font-weight:700'>{_otype}</span>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    # ── Live timestamp timeline (collapsible) ─────────────────────────────────
-    _STATION_ORDER = [
-        ("PENDING",       "📥", "Order Received",       "#3b82f6"),
-        ("UNDER_REVIEW",  "🔍", "Under Review",         "#f59e0b"),
-        ("CONFIRMED",     "✅", "Confirmed",             "#6366f1"),
-        ("IN_PRODUCTION", "⚙️", "In Production",        "#8b5cf6"),
-        ("READY",         "📦", "Ready",                "#10b981"),
-        ("BILLED",        "🧾", "Billed",               "#059669"),
-        ("DISPATCHED",    "🚚", "Dispatched",           "#0891b2"),
-        ("DELIVERED",     "✅", "Delivered",            "#10b981"),
-        ("CLOSED",        "🔒", "Closed",               "#334155"),
-    ]
-
-    def _get_ts_map(order_no):
-        try:
-            from modules.sql_adapter import run_query
-            rows = run_query("""
-                SELECT h.to_status, MIN(h.changed_at) AS changed_at,
-                       (array_agg(h.changed_by_name ORDER BY h.changed_at))[1] AS by
-                FROM order_status_history h
-                JOIN orders o ON o.id = h.order_id
-                WHERE o.order_no = %(ono)s
-                GROUP BY h.to_status
-            """, {"ono": order_no}) or []
-            _MAP = {"PENDING_VALIDATION":"PENDING","PROVISIONAL":"PENDING","ORDER_SAVED":"PENDING"}
-            result = {}
-            for r in rows:
-                sts = _MAP.get((r.get("to_status") or "").upper(),
-                               (r.get("to_status") or "").upper())
-                ts  = str(r.get("changed_at") or "")[:16].replace("T"," ")
-                by  = r.get("by") or "system"
-                if sts and sts not in result:
-                    result[sts] = {"ts": ts, "by": by}
-            # Always have PENDING from created_at
-            if "PENDING" not in result:
-                _ca = order.get("created_at") or order.get("order_date") or ""
-                if _ca:
-                    result["PENDING"] = {
-                        "ts": str(_ca)[:16].replace("T"," "),
-                        "by": "system"
-                    }
-            return result
-        except Exception:
-            return {}
-
-    _ts_map   = _get_ts_map(_order_no)
-
-    # Strip BILLED from timeline if no actual billing document exists
-    if "BILLED" in _ts_map:
-        try:
-            from modules.sql_adapter import run_query as _rq_tl
-            _oid_tl = str(order.get("id") or "")
-            _ono_tl = str(order.get("order_no") or "")
-            _bdocs = _rq_tl("""
-                SELECT 1 FROM challans
-                WHERE (order_ids::text[] @> ARRAY[%(oid)s::text]
-                    OR order_ids::text[] @> ARRAY[%(ono)s::text])
-                  AND status NOT IN ('CANCELLED','VOID')
-                UNION ALL
-                SELECT 1 FROM invoices
-                WHERE (order_ids::text[] @> ARRAY[%(oid)s::text]
-                    OR order_ids::text[] @> ARRAY[%(ono)s::text])
-                  AND status NOT IN ('CANCELLED','VOID')
-                LIMIT 1
-            """, {"oid": _oid_tl, "ono": _ono_tl}) or []
-            if not _bdocs:
-                _ts_map.pop("BILLED", None)
-        except Exception:
-            pass
-
-    _cur_idx  = next((i for i,(k,*_) in enumerate(_STATION_ORDER) if k == _norm_st), 0)
-    # Always show received + current timestamps inline above the expander
-    _recv_ts  = (_ts_map.get("PENDING") or {}).get("ts") or str(order.get("created_at",""))[:16]
-    _conf_ts  = (_ts_map.get("CONFIRMED") or {}).get("ts") or ""
-
-    _ts_pills = (
-        f"<span style='font-size:0.68rem;color:#94a3b8'>📥 Received: "
-        f"<b style='color:#3b82f6'>{_recv_ts or '—'}</b></span>"
-    )
-    if _conf_ts:
-        _ts_pills += (
-            f"&nbsp;&nbsp;·&nbsp;&nbsp;"
-            f"<span style='font-size:0.68rem;color:#94a3b8'>✅ Collected: "
-            f"<b style='color:#6366f1'>{_conf_ts}</b></span>"
+    
+    # Order info
+    col_a, col_b, col_c = st.columns(3)
+    
+    with col_a:
+        st.metric("Patient", order.get('patient_name', 'N/A'))
+    with col_b:
+        # Show status + production sub-stage in brackets when in-house order.
+        # For BILLED / CHALLANED / INVOICED orders the production stage is
+        # complete — show the billing status only (no stale job stage appended).
+        _disp_status  = order.get("status", "PENDING")
+        _order_st_up  = str(_disp_status).upper()
+        _billing_done = _order_st_up in (
+            "BILLED", "CHALLANED", "INVOICED",
+            "DISPATCHED", "DELIVERED", "CLOSED",
         )
-    st.markdown(f"<div style='margin-bottom:6px'>{_ts_pills}</div>", unsafe_allow_html=True)
+        _inhouse_lns  = order.get("inhouse_lines") or []
+        if _inhouse_lns and not _billing_done:
+            # Only show production sub-stage when order is still in the
+            # production / pre-billing phase. Once billed, job stages are frozen.
+            try:
+                from modules.sql_adapter import run_query as _rq_stg
+                _jm_stgs = _rq_stg("""
+                    SELECT ol.eye_side,
+                           COALESCE(jm.current_stage, 'JOB_CREATED') AS stage
+                    FROM order_lines ol
+                    JOIN orders o ON o.id = ol.order_id
+                    LEFT JOIN job_master jm ON jm.order_line_id = ol.id
+                    WHERE o.order_no = %(ono)s
+                      AND UPPER(COALESCE(ol.lens_params->>'manufacturing_route','')) = 'INHOUSE'
+                      AND COALESCE(ol.is_deleted, FALSE) = FALSE
+                    ORDER BY ol.eye_side
+                """, {"ono": order.get("order_no", "")})
+                if _jm_stgs:
+                    _STAGE_SHORT = {
+                        "JOB_CREATED":       "Job Created",
+                        "PRINTED":           "Printed",
+                        "JOB_PRINTED":       "Printed",
+                        "PRODUCTION_PICKED": "In Production",
+                        "PRODUCTION_DONE":   "Production Done",
+                        "INSPECTION":        "Inspection",
+                        "BLANK_ALLOCATED":   "Blank Allocated",
+                        "HARDCOAT_PICKED":   "Hardcoat Picked",
+                        "HARDCOAT_DONE":     "Hardcoat Done",
+                        "COLOURING_PICKED":  "Colouring Picked",
+                        "COLOURING_DONE":    "Colouring Done",
+                        "ARC_SENT":          "ARC Sent",
+                        "ARC_RECEIVED":      "ARC Received",
+                        "FINAL_QC":          "Final QC",
+                        "READY_FOR_PACK":    "Ready for Pack",
+                        "READY_TO_BILL":     "Ready to Bill",
+                        "FITTING_PENDING":   "Fitting Pending",
+                        "FITTING_DONE":      "Fitting Done",
+                        "REJECTED":          "Rejected",
+                        "BILLED":            "Billed",
+                        "CANCELLED":         "Cancelled",
+                    }
+                    _parts = []
+                    for _jr in _jm_stgs:
+                        _e = str(_jr.get("eye_side") or "").upper()
+                        _s = str(_jr.get("stage") or "JOB_CREATED").upper()
+                        _short = _STAGE_SHORT.get(_s, _s.replace("_"," ").title())
+                        _e_label = {"R":"RE","L":"LE"}.get(_e, _e)
+                        _parts.append(f"{_e_label}: {_short}")
+                    if _parts:
+                        _disp_status = f"{order.get('status','PENDING')} ({' | '.join(_parts)})"
+            except Exception:
+                pass
+        st.metric("Status", _disp_status)
 
-    # ── Live production train (order-level + inhouse job pipeline) ────────────
+    with col_c:
+        order_date = order.get('created_at', '')
+        if order_date:
+            date_str = str(order_date)[:10]
+        else:
+            date_str = 'N/A'
+
+        st.metric("Date", date_str)
+
+    # ── Customer / Authenticity Card details ─────────────────────────────
+    # Wholesale punching stores end-customer details in orders.extra_data so
+    # party/dealer name remains clean. Backoffice is the final correction
+    # point before production/card print, so expose the same fields here.
     try:
-        from modules.backoffice.order_status_window import _render_train_inline
-        _render_train_inline(order)
-    except Exception as _te:
-        # Fallback: basic status badge if train fails
-        st.caption(f"Status: {order.get('status','PENDING')}")
+        import json as _bo_ec_json
+        _extra_ec = order.get("extra_data") or {}
+        if isinstance(_extra_ec, str):
+            try:
+                _extra_ec = _bo_ec_json.loads(_extra_ec) or {}
+            except Exception:
+                _extra_ec = {}
+        if not isinstance(_extra_ec, dict):
+            _extra_ec = {}
+        _end_customer = dict(_extra_ec.get("end_customer") or {})
+        _is_wholesale_order = str(order.get("order_type") or "").upper() == "WHOLESALE"
+        _auth_name_default = (
+            _end_customer.get("name")
+            or ("" if _is_wholesale_order else order.get("patient_name"))
+            or ""
+        )
+        _auth_mobile_default = (
+            _end_customer.get("mobile")
+            or ("" if _is_wholesale_order else order.get("patient_mobile"))
+            or ""
+        )
+        _auth_ref_default = (
+            _end_customer.get("ref")
+            or order.get("customer_order_no")
+            or ""
+        )
+        with st.expander("🪪 Customer / Authenticity Card Details", expanded=False):
+            st.caption("Floats from punching. Used by authenticity card, labels and production print.")
+            _ec1, _ec2, _ec3 = st.columns(3)
+            _auth_name = _ec1.text_input(
+                "Customer name on card",
+                value=str(_auth_name_default or ""),
+                key=f"bo_auth_name_{order_id}",
+            )
+            _auth_mobile = _ec2.text_input(
+                "Customer mobile",
+                value=str(_auth_mobile_default or ""),
+                key=f"bo_auth_mobile_{order_id}",
+            )
+            _auth_ref = _ec3.text_input(
+                "Customer order no / ref",
+                value=str(_auth_ref_default or ""),
+                key=f"bo_auth_ref_{order_id}",
+            )
+            if st.button("💾 Save customer/card details", key=f"bo_auth_save_{order_id}",
+                         type="primary", use_container_width=True):
+                try:
+                    from modules.sql_adapter import run_write as _rw_auth
+                    _extra_new = dict(_extra_ec)
+                    _extra_new["end_customer"] = {
+                        "name": str(_auth_name or "").strip(),
+                        "mobile": str(_auth_mobile or "").strip(),
+                        "ref": str(_auth_ref or "").strip(),
+                    }
+                    _params_auth = {
+                        "oid": str(order.get("id") or order.get("order_id") or ""),
+                        "co": str(_auth_ref or "").strip(),
+                        "ed": _bo_ec_json.dumps(_extra_new),
+                    }
+                    if _is_wholesale_order:
+                        _rw_auth("""
+                            UPDATE orders
+                            SET customer_order_no=%(co)s,
+                                extra_data=%(ed)s::jsonb,
+                                updated_at=NOW()
+                            WHERE id=%(oid)s::uuid
+                        """, _params_auth)
+                    else:
+                        _params_auth.update({
+                            "pn": str(_auth_name or "").strip(),
+                            "pm": str(_auth_mobile or "").strip(),
+                        })
+                        _rw_auth("""
+                            UPDATE orders
+                            SET patient_name=%(pn)s,
+                                patient_mobile=%(pm)s,
+                                customer_order_no=%(co)s,
+                                extra_data=%(ed)s::jsonb,
+                                updated_at=NOW()
+                            WHERE id=%(oid)s::uuid
+                        """, _params_auth)
+                    order["customer_order_no"] = str(_auth_ref or "").strip()
+                    order["extra_data"] = _extra_new
+                    if not _is_wholesale_order:
+                        order["patient_name"] = str(_auth_name or "").strip()
+                        order["patient_mobile"] = str(_auth_mobile or "").strip()
+                    st.success("✅ Customer/card details saved")
+                    try:
+                        from . import order_loader as _ol_auth
+                        for _fn_name in ("load_single_order", "load_orders_from_database", "load_orders_summary"):
+                            _fn = getattr(_ol_auth, _fn_name, None)
+                            if _fn is not None and hasattr(_fn, "clear"):
+                                _fn.clear()
+                    except Exception:
+                        pass
+                    st.rerun()
+                except Exception as _auth_err:
+                    st.error(f"Save failed: {_auth_err}")
+    except Exception as _auth_panel_err:
+        logger.warning("Customer/authenticity panel failed: %s", _auth_panel_err, exc_info=True)
 
     
     #  NEW: Trigger product change dialog if modal is active
     if st.session_state.get('bo_product_change_modal', {}).get('active', False):
         product_change_dialog()
     
-    # ── Stamp tax_inclusive on every line from order_type ───────────────────────
-    # tax_inclusive is NOT persisted to DB — must be derived here on every load.
-    # RETAIL  : MRP is GST-inclusive  → True  (back-calculate GST from price)
-    # WHOLESALE/PURCHASE: price is GST-exclusive → False (GST added on top)
-    _order_type_enrich = (order.get("order_type") or "RETAIL").upper()
-    _tax_inc_flag = (_order_type_enrich == "RETAIL")
-    for _line in all_lines:
-        _line["tax_inclusive"] = _tax_inc_flag
-
-    if _order_type_enrich == "WHOLESALE":
-        try:
-            from modules.sql_adapter import run_query as _rq
-        except ImportError:
-            _rq = None
-
-        for line in all_lines:
-            # Skip SERVICE lines — consultation fee price must not be overwritten
-            # by the wholesale selling_price enrichment loop.
-            if str(line.get("eye_side","")).upper() in ("SERVICE","S"):
-                continue
-            if not line.get("product_id") or not _rq:
-                continue
-            try:
-                pid = str(line["product_id"])
-
-                # Priority 1: inventory_stock.selling_price (batch-level wholesale price)
-                _inv = _rq("""
-                    SELECT selling_price, mrp
-                    FROM inventory_stock
-                    WHERE product_id = %(pid)s::uuid AND is_active = true
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """, {"pid": pid})
-
-                if _inv and _inv[0].get("selling_price"):
-                    raw_price = float(_inv[0]["selling_price"] or 0)
-                else:
-                    # Priority 2: products table selling_price or unit_price
-                    _prod = _rq("""
-                        SELECT selling_price, unit_price, mrp
-                        FROM products
-                        WHERE id = %(pid)s::uuid
-                        LIMIT 1
-                    """, {"pid": pid})
-                    if _prod:
-                        row = _prod[0]
-                        raw_price = float(
-                            row.get("selling_price") or
-                            row.get("unit_price") or
-                            row.get("mrp") or 0
-                        )
-                    else:
-                        raw_price = 0.0
-
-                if raw_price <= 0:
-                    continue  # Don't overwrite with zero — keep existing
-
-                # Divide BOX price by box_size so unit_price is always per-PCS
-                _box_sz = max(1, int(line.get("box_size") or 1))
-                new_price = round(raw_price / _box_sz, 2)
-
-                line["selling_price"] = new_price
-                line["unit_price"]    = new_price
-
-            except Exception as _pe:
-                import logging
-                logging.warning(f"[BO] Price enrich failed for {line.get('product_name')}: {_pe}")
-
-    # Rebuild r_lines and l_lines AFTER price enrichment
-    r_lines = [line for line in all_lines if line.get('eye_side', '').upper() in ['R', 'RIGHT']]
-    l_lines = [line for line in all_lines if line.get('eye_side', '').upper() in ['L', 'LEFT']]
-    other_lines = [line for line in all_lines if line.get('eye_side', '').upper() not in ['R', 'RIGHT', 'L', 'LEFT']]
-
-    # ── Pending payment claims from customers ─────────────────────────
+    # Build all_lines BEFORE tabs so every tab can access it
+    all_lines = []
+    all_lines.extend(order.get('stock_lines', []))
+    all_lines.extend(order.get('inhouse_lines', []))
+    all_lines.extend(order.get('lab_order_lines', []))
+    all_lines.extend(order.get('service_lines', []))
+    # Normalize names on every loaded line; cached service rows from older
+    # sessions may still carry "Unknown Product" even though lens_params has
+    # the correct service label.
+    for _ln_name_fix in all_lines:
+        _ln_name_fix["product_name"] = _bo_line_display_name(_ln_name_fix)
+        _bo_normalize_line_numbers(_ln_name_fix)
+        _bo_enforce_wholesale_price(_ln_name_fix, order.get("order_type"))
+    # Defensive hydration: older cached order objects can miss service_lines
+    # even when DB has them. Pull service/other rows directly so backoffice
+    # totals and display never silently drop charges.
     try:
-        from modules.billing.payment_link_manager import render_pending_claims_dashboard
-        render_pending_claims_dashboard()
+        from modules.sql_adapter import run_query as _rq_bo_svc_lines, resolve_order_uuid as _resolve_order_uuid
+        _oid_bo_svc = _resolve_order_uuid(order.get("id") or order.get("order_id") or order.get("order_no")) or ""
+        _seen_lids_bo = {str(l.get("line_id") or l.get("id") or "") for l in all_lines}
+        if _oid_bo_svc:
+            _svc_db_rows = _rq_bo_svc_lines("""
+                SELECT ol.id::text AS line_id, ol.order_id::text AS order_id,
+                       ol.product_id::text AS product_id,
+                       COALESCE(p.product_name,
+                                ol.lens_params->>'service_display_name',
+                                ol.lens_params->>'display_product_name',
+                                ol.lens_params->>'service_description',
+                                'Service') AS product_name,
+                       COALESCE(p.brand, 'Services') AS brand,
+                       COALESCE(p.main_group, 'Services') AS main_group,
+                       COALESCE(p.category, 'Services') AS category,
+                       COALESCE(p.unit, 'SERVICE') AS unit,
+                       ol.eye_side,
+                       COALESCE(ol.quantity, 1) AS billing_qty,
+                       COALESCE(ol.allocated_qty, 0) AS allocated_qty,
+                       COALESCE(ol.ready_qty, 0) AS ready_qty,
+                       COALESCE(ol.billed_qty, 0) AS billed_qty,
+                       COALESCE(ol.unit_price, 0)::numeric AS unit_price,
+                       COALESCE(ol.billing_total, ol.total_price, 0)::numeric AS billing_total,
+                       COALESCE(ol.gst_percent, 0)::numeric AS gst_percent,
+                       COALESCE(ol.gst_amount, 0)::numeric AS gst_amount,
+                       COALESCE(ol.discount_amount, 0)::numeric AS discount_amount,
+                       COALESCE(ol.discount_percent, 0)::numeric AS discount_percent,
+                       ol.status,
+                       ol.batch_status,
+                       ol.lens_params,
+                       ol.boxing_params,
+                       TRUE AS is_service_line
+                FROM order_lines ol
+                LEFT JOIN products p ON p.id = ol.product_id
+                WHERE ol.order_id=%(oid)s::uuid
+                  AND COALESCE(ol.is_deleted, FALSE)=FALSE
+                  AND (
+                    COALESCE(ol.is_service_line, FALSE)=TRUE
+                    OR UPPER(COALESCE(ol.eye_side,'')) IN ('S','SERVICE')
+                  )
+            """, {"oid": _oid_bo_svc}) or []
+            _line_idx_bo = {
+                str(l.get("line_id") or l.get("id") or ""): _i
+                for _i, l in enumerate(all_lines)
+            }
+            for _sr_bo in _svc_db_rows:
+                _lid_bo = str(_sr_bo.get("line_id") or "")
+                _lp_bo = _sr_bo.get("lens_params") or {}
+                _sr_bo["manufacturing_route"] = (
+                    _lp_bo.get("manufacturing_route") if isinstance(_lp_bo, dict) else None
+                )
+                _sr_bo["product_name"] = _bo_line_display_name(dict(_sr_bo))
+                _sr_bo["unit"] = str(_sr_bo.get("unit") or "SERVICE").upper()
+                _sr_bo["box_size"] = 1
+                _bo_normalize_line_numbers(_sr_bo)
+                if _lid_bo and _lid_bo not in _seen_lids_bo:
+                    all_lines.append(dict(_sr_bo))
+                    order.setdefault("service_lines", []).append(dict(_sr_bo))
+                    _seen_lids_bo.add(_lid_bo)
+                elif _lid_bo in _line_idx_bo:
+                    # Service pricing is authoritative from DB. Do not let an
+                    # in-memory discount refresh turn ₹60+GST into ₹54.
+                    all_lines[_line_idx_bo[_lid_bo]].update(dict(_sr_bo))
     except Exception:
         pass
 
-    # Tabs for different sections
-    _show_dispatch = _ord_status.upper() in (
-        "BILLED","DISPATCHED","DELIVERED","CLOSED","PARTIALLY_BILLED"
-    )
+    # Live line hydration for billing/stage decisions. Production/vendor panels
+    # can update supplier_stage, ready_qty, status, and lens_params after the
+    # order card was loaded; Backoffice billing must use DB truth here.
+    try:
+        from modules.sql_adapter import run_query as _rq_bo_live_lines, resolve_order_uuid as _resolve_order_uuid_live
+        _oid_bo_live = _resolve_order_uuid_live(order.get("id") or order.get("order_id") or order.get("order_no")) or ""
+        if _oid_bo_live:
+            _live_rows_bo = _rq_bo_live_lines("""
+                SELECT
+                    ol.id::text AS line_id,
+                    ol.order_id::text AS order_id,
+                    ol.product_id::text AS product_id,
+                    COALESCE(p.product_name,
+                             ol.lens_params->>'display_product_name',
+                             ol.lens_params->>'service_display_name',
+                             ol.lens_params->>'service_description',
+                             'Line') AS product_name,
+                    COALESCE(p.brand, '') AS brand,
+                    COALESCE(p.main_group, '') AS main_group,
+                    COALESCE(p.category, '') AS category,
+                    COALESCE(p.unit, '') AS unit,
+                    ol.eye_side,
+                    COALESCE(ol.quantity, 1) AS billing_qty,
+                    COALESCE(ol.quantity, 1) AS quantity,
+                    COALESCE(ol.allocated_qty, 0) AS allocated_qty,
+                    COALESCE(ol.ready_qty, 0) AS ready_qty,
+                    COALESCE(ol.billed_qty, 0) AS billed_qty,
+                    COALESCE(ol.unit_price, 0)::numeric AS unit_price,
+                    COALESCE(ol.billing_total, ol.total_price, 0)::numeric AS billing_total,
+                    COALESCE(ol.total_price, ol.billing_total, 0)::numeric AS total_price,
+                    COALESCE(ol.gst_percent, 0)::numeric AS gst_percent,
+                    COALESCE(ol.gst_amount, 0)::numeric AS gst_amount,
+                    COALESCE(ol.discount_amount, 0)::numeric AS discount_amount,
+                    COALESCE(ol.discount_percent, 0)::numeric AS discount_percent,
+                    ol.status,
+                    ol.batch_status,
+                    ol.lens_params,
+                    ol.boxing_params,
+                    COALESCE(ol.is_service_line, FALSE) AS is_service_line,
+                    ol.sph, ol.cyl, ol.axis, ol.add_power,
+                    ol.production_ref
+                FROM order_lines ol
+                LEFT JOIN products p ON p.id = ol.product_id
+                WHERE ol.order_id = %(oid)s::uuid
+                  AND COALESCE(ol.is_deleted, FALSE) = FALSE
+            """, {"oid": _oid_bo_live}) or []
+            _live_idx = {str(l.get("line_id") or l.get("id") or ""): _i for _i, l in enumerate(all_lines)}
+            for _lr_bo in _live_rows_bo:
+                _lid_live = str(_lr_bo.get("line_id") or "")
+                _lp_live = _lr_bo.get("lens_params") or {}
+                if isinstance(_lp_live, dict):
+                    _lr_bo["manufacturing_route"] = _lp_live.get("manufacturing_route")
+                    _lr_bo["supplier_stage"] = (
+                        _lp_live.get("supplier_stage")
+                        or _lp_live.get("external_lab_stage")
+                        or _lr_bo.get("status")
+                    )
+                _lr_bo["product_name"] = _bo_line_display_name(dict(_lr_bo))
+                _bo_normalize_line_numbers(_lr_bo)
+                _bo_enforce_wholesale_price(_lr_bo, order.get("order_type"))
+                if _lid_live in _live_idx:
+                    all_lines[_live_idx[_lid_live]].update(dict(_lr_bo))
+                else:
+                    all_lines.append(dict(_lr_bo))
+    except Exception:
+        pass
 
-    # ── Jump to Billing tab if navigated from Production page ────────────
-    # production_page._go_to_billing() sets bo_jump_to_billing=True.
-    # We inject a JS snippet that programmatically clicks the 4th tab button
-    # (index 3 = "💰 Billing Summary") once, then clears the flag.
-    _jump_billing = st.session_state.pop("bo_jump_to_billing", False)
-    if _jump_billing:
-        st.components.v1.html("""
-        <script>
-        setTimeout(function() {
-            var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
-            if (tabs && tabs.length > 3) { tabs[3].click(); }
-        }, 300);
-        </script>
-        """, height=0)
-
-    if _show_dispatch:
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-            "📦 Order Items",
-            "📄 Documents",
-            "📊 Status",
-            "💰 Billing Summary",
-            "🚚 Supplier Orders",
-            "🚀 Dispatch",
-        ])
-    else:
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "📦 Order Items",
-            "📄 Documents",
-            "📊 Status",
-            "💰 Billing Summary",
-            "🚚 Supplier Orders",
-        ])
-        tab6 = None
-    
-    with tab1:
-        st.markdown("###  Order Line Items")
-
-        # ── Payment status strip (read-only) ──────────────────────────
+    # ── RETAIL: always show MRP — runs every render ──────────────────────────
+    # For RETAIL orders, unit_price MUST be MRP regardless of what is cached
+    # in the line dict. Uses price_qty_governor rule: RETAIL → mrp field.
+    # Runs unconditionally (no gate) so every render reflects DB truth.
+    _rt_order_type = str(order.get("order_type") or "RETAIL").upper()
+    if _rt_order_type == "RETAIL":
         try:
-            from modules.billing.payment_manager import render_payment_strip
-            render_payment_strip(order, all_lines)
-        except Exception:
-            pass
-        # ──────────────────────────────────────────────────────────────
+            from modules.sql_adapter import run_query as _rq_rt
+            from modules.sql_adapter import run_write as _rw_rt
+            from modules.core.price_qty_governor import normalize_to_pcs_price as _norm_rt
+            # One batch query for all non-service lines
+            _rt_pids = list({
+                str(l.get("product_id") or "")
+                for l in all_lines
+                if l.get("product_id")
+                and not l.get("is_service_line")
+                and not l.get("manual_price_override")
+                and str(l.get("eye_side") or "").upper() not in ("S", "SERVICE")
+            })
+            if _rt_pids:
+                _rt_mrp_rows = _rq_rt("""
+                    SELECT
+                        i.product_id::text,
+                        COALESCE(MAX(NULLIF(i.mrp, 0)), 0)          AS mrp,
+                        COALESCE(p.box_size, 1)                     AS box_size,
+                        COALESCE(p.gst_percent, 0)                  AS gst_pct
+                    FROM inventory_stock i
+                    JOIN products p ON p.id = i.product_id
+                    WHERE i.product_id = ANY(%(pids)s::uuid[])
+                      AND COALESCE(i.is_active, TRUE) = TRUE
+                    GROUP BY i.product_id, p.box_size, p.gst_percent
+                """, {"pids": _rt_pids}) or []
 
-        #  Sort lines - Right eye before Left eye
-        def eye_sort_key(line):
-            eye = line.get('eye_side', '').upper()
-            if eye == 'RIGHT' or eye == 'R':
-                return 0
-            elif eye == 'LEFT' or eye == 'L':
-                return 1
-            else:
-                return 2
-        
-        all_lines.sort(key=eye_sort_key)
-        
-        #  Group by product - R and L together
-        product_groups = {}
-        
-        for idx, line in enumerate(all_lines):
-            # Skip OTHER/SERVICE lines — they render in the frame card below
-            _eye_pg = str(line.get('eye_side') or '').upper()
-            if _eye_pg not in ('R','RIGHT','L','LEFT'):
-                continue
-
-            pair_id = (
-                line.get('pair_id')
-                or f"{get_display_order_id(order)}_{line.get('product_id','')}"
-            )
-
-            if pair_id not in product_groups:
-                product_groups[pair_id] = {
-                    'product_name': line.get('product_name', 'N/A'),
-                    'brand': line.get('brand', 'N/A'),
-                    'R': None,
-                    'L': None,
-                    'R_idx': None,
-                    'L_idx': None
+                _rt_mrp_map = {
+                    r["product_id"]: {
+                        "mrp": float(r.get("mrp") or 0),
+                        "box_size": max(1, int(r.get("box_size") or 1)),
+                        "gst_pct":  float(r.get("gst_pct") or 0),
+                    }
+                    for r in _rt_mrp_rows
                 }
 
-            if _eye_pg in ('RIGHT','R'):
-                product_groups[pair_id]['R'] = line
-                product_groups[pair_id]['R_idx'] = idx
-            elif _eye_pg in ('LEFT','L'):
-                product_groups[pair_id]['L'] = line
-                product_groups[pair_id]['L_idx'] = idx
+                for _rt_line in all_lines:
+                    if bool(_rt_line.get("is_service_line")):
+                        continue
+                    if bool(_rt_line.get("manual_price_override")):
+                        continue
+                    if str(_rt_line.get("eye_side") or "").upper() in ("S", "SERVICE"):
+                        continue
+                    _rt_pid = str(_rt_line.get("product_id") or "")
+                    _rt_info  = _rt_mrp_map.get(_rt_pid, {})
+                    _rt_mrp   = float(_rt_info.get("mrp") or 0)
+                    _rt_bsz   = int(_rt_info.get("box_size") or _rt_line.get("box_size") or 1)
+                    _rt_gst   = float(_rt_info.get("gst_pct") or _rt_line.get("gst_percent") or 0)
+                    _rt_src   = "retail_mrp"
 
-        # Display each product with R and L side by side
-        if not product_groups:
-            if not all_lines:
-                st.warning("⚠️ No order lines found in DB for this order. Check if lines were saved correctly.")
-            elif not other_lines:
-                # all_lines exist but none are R/L and none are B/OTHER — genuinely unexpected
-                st.warning(f"⚠️ {len(all_lines)} lines found but no product groups built. Check eye_side values.")
-                for _dl in all_lines[:3]:
-                    st.caption(f"Line: product={_dl.get('product_name','?')} eye={_dl.get('eye_side','?')} route={_dl.get('manufacturing_route','?')}")
-            # else: all lines are B/OTHER (frames, accessories, solutions) — they render
-            # in the FRAMES & OTHER ITEMS section below. No warning needed.
-
-        for product_id, group in product_groups.items():
-            # Compact product header — base name only (strip SKU suffix)
-            _hdr_name = str(group['product_name'] or '').split(' | ')[0]
-            _hdr_brand = str(group.get('brand') or '')
-            st.markdown(
-                f"<div style='display:flex;align-items:baseline;gap:10px;margin-bottom:2px'>"
-                f"<span style='font-weight:700;font-size:1rem;color:#e2e8f0'>{_hdr_name}</span>"
-                + (f"<span style='font-size:0.72rem;color:#475569'>{_hdr_brand}</span>" if _hdr_brand and _hdr_brand != 'N/A' else "")
-                + "</div>",
-                unsafe_allow_html=True
-            )
-            
-            #  NEW: Add product sync option
-            render_product_sync_option(group, product_id)
-            
-            st.markdown("---")
-            
-            # ==================== RIGHT & LEFT EYE DYNAMIC LAYOUT ====================
-            #  FIX: Dynamic column layout - stretch to fill horizontal space
-            has_right = bool(group['R'])
-            has_left = bool(group['L'])
-            
-            # Create columns only for eyes that have data
-            if has_right and has_left:
-                # Both eyes ordered - use 2 columns
-                col_r, col_l = st.columns(2)
-            elif has_right:
-                # Only right eye - use full width
-                col_r = st.container()
-                col_l = None
-            elif has_left:
-                # Only left eye - use full width
-                col_r = None
-                col_l = st.container()
-            else:
-                # Neither eye ordered
-                col_r = None
-                col_l = None
-            
-            # ── Shared eye block renderer ────────────────────────────
-            def _render_eye_block_ui(line, idx, eye_label):
-                import math as _math, json as _lpj, base64 as _b64
-
-                # ── Parse lens_params once ───────────────────────────
-                _lp = line.get("lens_params") or {}
-                if isinstance(_lp, str):
-                    try: _lp = _lpj.loads(_lp)
-                    except: _lp = {}
-
-                # ── Line-level freeze check (single source of truth) ─
-                # True once a blank is allocated + job card saved,
-                # OR when the order is in the billing pipeline.
-                # All edit paths below check this flag — nothing bypasses it.
-                _line_frozen = (
-                    _any_frozen  # CONFIRMED+ or billing pipeline = frozen
-                    or bool(
-                        line.get("surfacing_data") or
-                        (isinstance(_lp, dict) and _lp.get("surfacing_data"))
+                    # Ophthalmic RX products often have no inventory_stock
+                    # price row; their retail price lives in
+                    # ophthalmic_lens_specs.srp_per_pair.  Use the final
+                    # backoffice/punching lens params to find the exact
+                    # index/coating/treatment, then convert pair → per lens.
+                    if _rt_mrp <= 0:
+                        _rt_lp = _rt_line.get("lens_params") or {}
+                        if isinstance(_rt_lp, str):
+                            try:
+                                import json as _json_rt
+                                _rt_lp = _json_rt.loads(_rt_lp or "{}")
+                            except Exception:
+                                _rt_lp = {}
+                        _rt_idx = (
+                            _rt_lp.get("lens_index")
+                            or _rt_lp.get("index")
+                            or _rt_line.get("index_value")
+                        )
+                        _rt_coat = (
+                            _rt_lp.get("coating")
+                            or _rt_lp.get("coating_type")
+                            or _rt_line.get("coating")
+                        )
+                        _rt_treat = (
+                            _rt_lp.get("treatment")
+                            or _rt_line.get("treatment")
+                            or "Clear"
+                        )
+                        if _rt_pid and _rt_idx and _rt_coat:
+                            _rt_spec_rows = _rq_rt("""
+                                SELECT
+                                    COALESCE(srp_per_pair, 0) AS srp_pair,
+                                    COALESCE(wlp_per_pair, 0) AS wlp_pair
+                                FROM ophthalmic_lens_specs
+                                WHERE product_id = %(pid)s::uuid
+                                  AND index_value = %(idx)s::numeric
+                                  AND coating = %(coat)s
+                                  AND COALESCE(treatment, 'Clear') = COALESCE(%(treat)s, 'Clear')
+                                  AND COALESCE(is_active, TRUE) = TRUE
+                                LIMIT 1
+                            """, {
+                                "pid": _rt_pid,
+                                "idx": str(_rt_idx),
+                                "coat": str(_rt_coat),
+                                "treat": str(_rt_treat or "Clear"),
+                            }) or []
+                            if _rt_spec_rows:
+                                _rt_pair = float(
+                                    _rt_spec_rows[0].get("srp_pair")
+                                    or _rt_spec_rows[0].get("wlp_pair")
+                                    or 0
+                                )
+                                if _rt_pair > 0:
+                                    _rt_mrp = round(_rt_pair / 2, 2)
+                                    _rt_bsz = 1
+                                    _rt_src = "retail_oph_srp"
+                    if _rt_mrp <= 0:
+                        continue
+                    # Normalize: if stored as BOX price, convert to PCS
+                    _rt_pcs_mrp = round(_rt_mrp / _rt_bsz, 4) if _rt_bsz > 1 else _rt_mrp
+                    _rt_qty     = int(_rt_line.get("billing_qty") or _rt_line.get("quantity") or 1)
+                    _rt_total   = round(_rt_pcs_mrp * _rt_qty, 2)
+                    _rt_prev_total = float(
+                        _rt_line.get("billing_total")
+                        or _rt_line.get("total_price")
+                        or 0
                     )
+                    # Always set — RETAIL rule: price = MRP, GST inclusive
+                    _rt_line["unit_price"]   = _rt_pcs_mrp
+                    _rt_line["billing_total"] = _rt_total
+                    _rt_line["total_price"]   = _rt_total
+                    _rt_line["tax_inclusive"]  = True
+                    _rt_line["gst_percent"]    = _rt_gst
+                    _rt_line["price_source"]   = _rt_src
+                    _rt_lid = str(_rt_line.get("line_id") or _rt_line.get("id") or "")
+                    if _rt_lid and abs(_rt_prev_total - _rt_total) > 0.01:
+                        # PRICE WRITE GUARD (retail price-stamp): refuse to
+                        # overwrite a good price with 0. The resolver can
+                        # legitimately return 0 if no price source matches —
+                        # writing that to the DB is exactly the bug we are
+                        # blocking. Mirrors from sibling line if possible.
+                        _rt_line["unit_price"] = _rt_pcs_mrp
+                        _gok_rt, _, _mp_rt, _mg_rt = _guard_line_price_before_write(
+                            _rt_line, order, all_lines=all_lines,
+                            context="retail-stamp",
+                        )
+                        if not _gok_rt:
+                            # guard already showed error; skip this write
+                            # and continue rendering other lines
+                            continue
+                        if _mp_rt is not None:
+                            _rt_pcs_mrp = float(_mp_rt)
+                            _rt_total   = round(_rt_pcs_mrp * float(_rt_line.get("quantity") or 1), 2)
+                            if _mg_rt is not None:
+                                _rt_gst = float(_mg_rt)
+                        try:
+                            _rw_rt("""
+                                UPDATE order_lines
+                                SET unit_price=%(up)s,
+                                    total_price=%(tp)s,
+                                    billing_total=%(tp)s,
+                                    gst_percent=%(gp)s
+                                WHERE id=%(lid)s::uuid
+                            """, {
+                                "up": _rt_pcs_mrp,
+                                "tp": _rt_total,
+                                "gp": _rt_gst,
+                                "lid": _rt_lid,
+                            })
+                            _bo_refresh_order_total_value(str(order.get("id") or order_id))
+                        except Exception:
+                            pass
+        except Exception:
+            pass   # never block render
+
+    # Price-source hard guard for stale session orders. The DB loader already
+    # returns corrected wholesale prices, but an order opened before a reload can
+    # remain in st.session_state with old MRP/retail unit_price. Re-stamp lines
+    # here before any Order Summary or Billing Summary math.
+    _order_type_guard = str(order.get("order_type") or "RETAIL").upper()
+    for _ln_price_guard in all_lines:
+        try:
+            _ln_price_guard["order_type"] = _order_type_guard
+            # Explicit guard — only apply wholesale price enforcement to WHOLESALE orders
+            if _order_type_guard != "WHOLESALE" \
+                    or bool(_ln_price_guard.get("is_service_line")) \
+                    or str(_ln_price_guard.get("order_type") or "").upper() == "RETAIL":
+                continue
+            _pid_guard = str(_ln_price_guard.get("product_id") or "")
+            if not _pid_guard:
+                continue
+            _lp_guard = _ln_price_guard.get("lens_params") or {}
+            if isinstance(_lp_guard, str):
+                import json as _json_pg
+                try:
+                    _lp_guard = _json_pg.loads(_lp_guard)
+                except Exception:
+                    _lp_guard = {}
+            _manual_price_guard = (
+                "manual" in str(_ln_price_guard.get("price_source") or "").lower()
+                or bool(_ln_price_guard.get("manual_price_override"))
+                or bool((_lp_guard or {}).get("manual_price_override"))
+                or bool((_lp_guard or {}).get("price_locked"))
+            )
+            if _manual_price_guard:
+                continue
+            from modules.core.price_source_resolver import resolve_db_price as _resolve_db_price_bo
+            from modules.core.price_qty_governor import compute_line_gst as _compute_line_gst_bo
+
+            _resolved_bo = _resolve_db_price_bo(
+                _pid_guard,
+                "WHOLESALE",
+                product=_ln_price_guard,
+                prefer_batch=True,
+            )
+            _pcs_bo = float(_resolved_bo.get("pcs_price") or 0)
+            _cur_bo = float(_ln_price_guard.get("unit_price") or 0)
+            if _pcs_bo > 0 and (_cur_bo <= 0 or abs(_cur_bo - _pcs_bo) > 0.5):
+                _qty_bo = int(_ln_price_guard.get("billing_qty") or _ln_price_guard.get("quantity") or 0)
+                _disc_pc_bo = float(_ln_price_guard.get("discount_percent") or 0)
+                _gross_bo = round(_pcs_bo * _qty_bo, 2)
+                _disc_bo = round(_gross_bo * _disc_pc_bo / 100, 2) if _disc_pc_bo > 0 else float(_ln_price_guard.get("discount_amount") or 0)
+                _net_bo = round(max(0.0, _gross_bo - _disc_bo), 2)
+                _gst_bo = _compute_line_gst(
+                    _net_bo / max(_qty_bo, 1),
+                    _qty_bo,
+                    float(_ln_price_guard.get("gst_percent") or 0),
+                    "WHOLESALE",
                 )
+                _ln_price_guard["unit_price"] = _pcs_bo
+                _ln_price_guard["billing_total"] = _gst_bo["subtotal"]
+                _ln_price_guard["total_price"] = _gst_bo["subtotal"]
+                _ln_price_guard["gst_amount"] = _gst_bo["gst_amount"]
+                _ln_price_guard["discount_amount"] = _disc_bo
+                _ln_price_guard["price_source"] = str(_resolved_bo.get("source") or "price_guard")
+                _ln_price_guard["tax_inclusive"] = False
+        except Exception as _pg_e:
+            # FIX: previously `except Exception: pass` — that is exactly how
+            # this whole class of "saved with unit_price=0" bug stays hidden.
+            # Log loudly. Caller continues to next line (one broken line must
+            # not break the whole render), but ops can see the failure.
+            import logging, traceback
+            logging.getLogger(__name__).warning(
+                "[wholesale price-guard] failed on line "
+                "product_id=%s eye=%s : %s\n%s",
+                _ln_price_guard.get("product_id"),
+                _ln_price_guard.get("eye_side"),
+                _pg_e, traceback.format_exc(),
+            )
+            pass
 
-                _raw_colour  = str(_lp.get("colour") or "").strip()
-                _colour      = "" if _raw_colour.lower() in ("none","no","") else _raw_colour
-                _fit_req     = bool(_lp.get("fitting_required"))
-                _fit_type    = str(_lp.get("fitting_type") or "").strip()
-                _instruct    = str(_lp.get("instructions") or "").strip()
-                _tint_b64    = str(_lp.get("tint_sample_b64") or "").strip()
-                _frame_t     = str(_lp.get("frame_type") or "").strip()
-                _thick       = str(_lp.get("thickness") or "").strip()
+    # ═══════════════════════════════════════════════════════════════════════
+    # Auto-refresh discount + run validators on order load
+    # ═══════════════════════════════════════════════════════════════════════
+    # Why this exists: previously the discount engine only fired inside
+    # product_change_dialog, and validators were never run in backoffice at
+    # all. That meant:
+    #   - Discounts showed stale numbers when an order was reopened
+    #   - Staff didn't see validation issues until billing / save
+    # Both refresh here on every order load so the displayed totals and any
+    # validation issues are current.
+    #
+    # We gate by a session key so we don't re-fire on every Streamlit rerun
+    # within the same order — only when the order_id changes or staff
+    # explicitly clicks "Refresh checks".
+    _bo_validation_cache_version = "retail_service_gst_validation_20260522"
+    _bo_checks_key = f"_bo_disc_val_done_{order_id}_{_bo_validation_cache_version}"
+    _bo_legacy_checks_key = f"_bo_disc_val_done_{order_id}"
+    _bo_legacy_val_key = f"_bo_val_result_{order_id}"
+    if st.session_state.get(_bo_legacy_checks_key) and not st.session_state.get(_bo_checks_key):
+        st.session_state.pop(_bo_legacy_checks_key, None)
+        st.session_state.pop(_bo_legacy_val_key, None)
+    _bo_force_recheck = st.session_state.pop("_bo_force_recheck", False)
+    if _bo_force_recheck or not st.session_state.get(_bo_checks_key):
+        # Resolve party_id with fallback (same pattern as product_change_dialog)
+        _bo_party_id = str(order.get("party_id") or "").strip()
+        if not _bo_party_id:
+            _party_name_bo = str(
+                order.get("party_name") or order.get("patient_name") or ""
+            ).strip()
+            if _party_name_bo:
+                try:
+                    from modules.sql_adapter import run_query as _rq_disc
+                    _pr = _rq_disc(
+                        "SELECT id::text AS id FROM parties "
+                        "WHERE party_name = %(n)s AND COALESCE(is_active,TRUE) = TRUE "
+                        "LIMIT 1",
+                        {"n": _party_name_bo},
+                    ) or []
+                    if _pr:
+                        _bo_party_id = str(_pr[0].get("id") or "")
+                except Exception:
+                    pass
+        _bo_order_type = str(order.get("order_type") or "RETAIL").upper()
 
-                eye_title = "👁 RIGHT EYE" if eye_label == "R" else "👁 LEFT EYE"
-                eye_color = "#0f2744"     if eye_label == "R" else "#0f2a1a"
-                eye_border= "#3b82f644"  if eye_label == "R" else "#10b98144"
+        # --- Discount refresh ---
+        try:
+            from modules.pricing.discount_flow import apply_order_discounts
+            # Only re-apply to non-service, non-locked lines. Manual price
+            # overrides and price-locked lines should NOT be re-discounted.
+            _disc_lines = [
+                l for l in all_lines
+                if not bool(l.get("is_service_line"))
+                and not bool(l.get("manual_price_override"))
+                and not bool((l.get("lens_params") or {}).get("price_locked")
+                             if isinstance(l.get("lens_params"), dict) else False)
+            ]
+            if _disc_lines:
+                apply_order_discounts(
+                    _disc_lines,
+                    party_id=_bo_party_id,
+                    order_type=_bo_order_type,
+                )
+        except Exception as _de:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"[backoffice] discount refresh failed: {_de}"
+            )
 
+        # --- Validator run ---
+        _bo_validation_result = None
+        try:
+            from modules.validation_gateway import validate_before_submit
+            # Validator requires order_id, party_name, lines. Existing order
+            # dict uses different keys depending on origin (id / order_id /
+            # order_no). Build a normalized payload.
+            _resolved_oid = (
+                order.get("order_id")
+                or order.get("id")
+                or order.get("order_no")
+                or order_id
+            )
+            _val_order = dict(order)
+            _val_order["order_id"]   = str(_resolved_oid or "")
+            _val_order["lines"]      = all_lines
+            _val_order["party_name"] = str(
+                order.get("party_name")
+                or order.get("patient_name")
+                or order.get("customer_name")
+                or order.get("order_no")
+                or "Customer"
+            )
+            # PartyValidator reads the canonical key "party".  Wholesale
+            # orders often arrive with party_name only, so mirror the resolved
+            # value there instead of showing a false "Party name missing" error.
+            _val_order["party"] = _val_order["party_name"]
+            _bo_validation_result = validate_before_submit(_val_order)
+        except Exception as _ve:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"[backoffice] validator run failed: {_ve}"
+            )
+            _bo_validation_result = None
+
+        # Stash result for the floating panel below + mark done
+        st.session_state[f"_bo_val_result_{order_id}"] = _bo_validation_result
+        st.session_state[_bo_checks_key] = True
+
+    # Render floating validator/discount status panel (above tabs)
+    _val_res = st.session_state.get(f"_bo_val_result_{order_id}")
+    # FIX: exclude soft-deleted lines from the displayed discount sum (same
+    # class of bug as the Billing Verification / Order Summary totals).
+    _disc_total_show = sum(
+        float(l.get("discount_amount") or 0) for l in all_lines if not bool(l.get("is_deleted"))
+    )
+    with st.container():
+        _vc1, _vc2, _vc3 = st.columns([5, 2, 2])
+        with _vc1:
+            if _val_res and isinstance(_val_res, dict):
+                _errs = _val_res.get("errors") or []
+                _warns = _val_res.get("warnings") or []
+                if _errs:
+                    st.error(
+                        "⛔ **Validation errors (" + str(len(_errs)) + "):**\n\n"
+                        + "\n".join("- " + (e.get("message") if isinstance(e, dict) else str(e))
+                                    for e in _errs[:6])
+                        + ("\n- ...and more" if len(_errs) > 6 else "")
+                    )
+                if _warns:
+                    st.warning(
+                        "⚠️ **Warnings (" + str(len(_warns)) + "):**\n\n"
+                        + "\n".join("- " + (w.get("message") if isinstance(w, dict) else str(w))
+                                    for w in _warns[:6])
+                        + ("\n- ...and more" if len(_warns) > 6 else "")
+                    )
+                if not _errs and not _warns:
+                    st.success("✅ All validators passed.")
+            else:
+                st.caption("Validators: not run for this order yet.")
+        with _vc2:
+            st.metric(
+                "Discount",
+                f"₹{_disc_total_show:,.2f}",
+                help="Auto-refreshed from discount engine on order load.",
+            )
+        with _vc3:
+            if st.button(
+                "🔄 Refresh checks",
+                key=f"bo_force_recheck_{order_id}",
+                use_container_width=True,
+                help="Re-runs discount engine and validators for this order.",
+            ):
+                st.session_state.pop(_bo_checks_key, None)
+                st.session_state["_bo_force_recheck"] = True
+                st.rerun()
+    st.divider()
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # Tabs for different sections
+    # Auto-jump to billing tab if coming from production page OR after challan creation
+    _jump_billing = (
+        st.session_state.pop("bo_jump_to_billing", False)
+        or st.session_state.pop("bo_show_billing_tab", False)
+    )
+
+    # When jumped from production page, highlight the billing tab path
+    if _jump_billing:
+        st.info(
+            "💰 **Navigated from Production page** — "
+            "open the **Billing Summary** tab below to create challan.",
+            icon="💰"
+        )
+
+    _order_status_gate = str(order.get("status") or "").upper()
+    if _order_status_gate in ("HOLD", "CREDIT_HOLD", "PENDING_PAYMENT"):
+        st.markdown(
+            "<div style='background:#1a0a00;border:1px solid #f97316;"
+            "border-radius:8px;padding:12px 16px;margin:8px 0'>"
+            "<span style='color:#fb923c;font-weight:800'>⏸ Order is on hold</span>"
+            "<span style='display:block;color:#94a3b8;font-size:.82rem;margin-top:4px'>"
+            "Assignment, editing, challan, invoice and production movement are blocked. "
+            "Release the hold first, then reopen and save/confirm if needed.</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        try:
+            from modules.backoffice.guidance import render_hold_confirm_panel
+            _hold_oid = str(order.get("id") or order.get("order_id") or "")
+            _hold_ono = str(order.get("order_no") or "")
+            render_hold_confirm_panel(_hold_oid, _hold_ono, _order_status_gate)
+        except Exception as _hold_ex:
+            st.error(f"Hold panel unavailable: {_hold_ex}")
+        return
+
+    # Streamlit tabs render every tab body on every rerun, which made Backoffice
+    # detail sticky because Order Items + Status + Billing + Dispatch all hit DB.
+    # Use a section selector and render only the chosen body.
+    _bo_section_key = f"bo_detail_section_{order_id}"
+    _bo_sections = ["📦 Order Items", "📊 Status", "💰 Billing Summary", "🚀 Dispatch"]
+    if _jump_billing:
+        st.session_state[_bo_section_key] = "💰 Billing Summary"
+    if st.session_state.get(_bo_section_key) not in _bo_sections:
+        st.session_state[_bo_section_key] = "📦 Order Items"
+    _bo_active_section = st.radio(
+        "Backoffice section",
+        _bo_sections,
+        key=_bo_section_key,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    tab1 = tab3 = tab4 = tab7 = st.container()
+    
+    # Consume the one-shot print-suppression guard now that Backoffice has loaded.
+    st.session_state.pop("_navigating_to_billing", None)
+
+    if _bo_active_section == "📦 Order Items":
+        with tab1:
+            st.markdown("###  Order Line Items")
+        
+            #  Sort lines - Right eye before Left eye
+            def eye_sort_key(line):
+                eye = line.get('eye_side', '').upper()
+                if eye == 'RIGHT' or eye == 'R':
+                    return 0
+                elif eye == 'LEFT' or eye == 'L':
+                    return 1
+                else:
+                    return 2
+        
+            all_lines.sort(key=eye_sort_key)
+        
+            # ── Read-only notice when order is confirmed / in pipeline ────────────
+            # Compute frozen state early so it can gate edit buttons below.
+            # CONFIRMED is intentionally NOT in this set: after a production rollback
+            # the order returns to CONFIRMED so backoffice staff can re-edit.
+            # Only statuses that indicate active pipeline work or billing lock the UI.
+            _order_status_upper_t1 = str(order.get("status","")).upper()
+            _pipeline_locked_t1 = {
+                "IN_PRODUCTION","READY","CHALLANED","INVOICED",
+                "DISPATCHED","DELIVERED","CLOSED",
+            }
+            _has_challan_t1 = False
+            try:
+                # WIN 2: cache challan result in session_state for this order+render
+                # so the second identical check (save gate, line ~4550) costs 0 DB hits.
+                # Cache is cleared in the save block and after any challan action.
+                _ch_cache_key = f"_bo_challan_exists_{order_id}"
+                if _ch_cache_key not in st.session_state:
+                    from modules.sql_adapter import run_query as _rq_t1
+                    _ch_t1 = _rq_t1("""
+                        SELECT 1 FROM challans c
+                        WHERE (c.order_ids::text[] @> ARRAY[%(oid)s::text]
+                            OR c.order_ids::text[] @> ARRAY[%(ono)s::text])
+                          AND c.status NOT IN ('CANCELLED','VOID')
+                        LIMIT 1
+                    """, {"oid": str(order.get("id") or ""), "ono": str(order.get("order_no") or "")})
+                    st.session_state[_ch_cache_key] = bool(_ch_t1)
+                _has_challan_t1 = st.session_state[_ch_cache_key]
+            except Exception:
+                pass
+            _non_svc_t1 = [l for l in all_lines
+                           if not l.get("is_service_line")
+                           and str(l.get("eye_side","")).upper() not in ("S","SERVICE")]
+            _has_supplier_sent_t1 = False
+            try:
+                for _lck_line in _non_svc_t1:
+                    _lck_lp = _lck_line.get("lens_params") or {}
+                    if isinstance(_lck_lp, str):
+                        try:
+                            _lck_lp = json.loads(_lck_lp)
+                        except Exception:
+                            _lck_lp = {}
+                    if not isinstance(_lck_lp, dict):
+                        _lck_lp = {}
+                    _lck_route = str(
+                        _lck_line.get("manufacturing_route")
+                        or _lck_lp.get("manufacturing_route")
+                        or ""
+                    ).upper()
+                    _lck_supplier_stage = str(
+                        _lck_line.get("supplier_stage")
+                        or _lck_lp.get("supplier_stage")
+                        or _lck_lp.get("external_lab_stage")
+                        or ""
+                    ).upper()
+                    _lck_repl_status = str(_lck_lp.get("replenishment_status") or "").upper()
+                    _lck_ref = str(
+                        _lck_lp.get("supplier_order_no")
+                        or _lck_lp.get("supplier_confirmation_no")
+                        or _lck_lp.get("replenishment_po_no")
+                        or _lck_line.get("supplier_order_id")
+                        or ""
+                    ).strip()
+                    _real_supplier_progress = (
+                        bool(_lck_ref)
+                        or _lck_supplier_stage in (
+                            "SUPPLIER_CONFIRMED", "AWAITING_SUPPLY",
+                            "RECEIVED", "INSPECTION", "READY_FOR_BILLING",
+                        )
+                    )
+                    if _lck_route in ("VENDOR", "EXTERNAL_LAB") and _real_supplier_progress:
+                        _has_supplier_sent_t1 = True
+                        break
+                    if _lck_route == "STOCK" and _lck_repl_status in ("PO_SENT", "ORDERED", "PROCURED", "RECEIVED"):
+                        _has_supplier_sent_t1 = True
+                        break
+            except Exception:
+                _has_supplier_sent_t1 = False
+            _tab1_edit_locked = (
+                len(_non_svc_t1) > 0
+                and (
+                    _order_status_upper_t1 in _pipeline_locked_t1
+                    or _has_challan_t1
+                    or _has_supplier_sent_t1
+                )
+            )
+
+            if _tab1_edit_locked:
+                if _has_challan_t1:
+                    _lock_reason = "a challan has been raised for this order"
+                    _lock_action = "Cancel the challan from the Billing Summary tab first."
+                elif _has_supplier_sent_t1:
+                    _lock_reason = "one or more items have already been sent to supplier / external lab"
+                    _lock_action = "Use the production set-back flow before changing product, power, or quantity."
+                else:
+                    _lock_reason = f"order status is **{_order_status_upper_t1}**"
+                    _lock_action = "Use Supervisor Override for power corrections if needed."
                 st.markdown(
-                    f"<div style='background:{eye_color};border-left:4px solid "
-                    f"{'#3b82f6' if eye_label=='R' else '#10b981'};"
-                    f"color:#e2e8f0;padding:8px 14px;border-radius:8px;"
-                    f"font-weight:700;font-size:0.95rem;margin-bottom:8px'>"
-                    f"{eye_title}</div>",
+                    f"<div style='background:#0a1a0a;border:1px solid #166534;"
+                    f"border-left:4px solid #22c55e;border-radius:8px;"
+                    f"padding:10px 16px;margin-bottom:12px'>"
+                    f"<div style='color:#86efac;font-weight:800;font-size:0.88rem'>"
+                    f"✅ Order confirmed — view only</div>"
+                    f"<div style='color:#94a3b8;font-size:0.78rem;margin-top:4px'>"
+                    f"Product, power, and quantity edits are <b style='color:#fbbf24'>not available</b> "
+                    f"because {_lock_reason}. {_lock_action}"
+                    f"</div>"
+                    f"<div style='color:#64748b;font-size:0.72rem;margin-top:6px'>"
+                    f"✅ Payment collection &nbsp;·&nbsp; 💬 WhatsApp &nbsp;·&nbsp; "
+                    f"🖨️ Print receipt &nbsp;·&nbsp; 💳 Payment link — all available in tabs above."
+                    f"</div></div>",
                     unsafe_allow_html=True,
                 )
 
-                with st.container(border=True):
+            #  Group by product - R and L together
+            product_groups = {}
+        
+            for idx, line in enumerate(all_lines):
+                eye = line.get('eye_side', '').upper()
+                if eye not in ['RIGHT', 'R', 'LEFT', 'L']:
+                    continue
 
-                    # ══ ROW 1: Product + Power ════════════════════════
-                    _r1a, _r1b = st.columns([3, 2])
-                    with _r1a:
-                        st.markdown(
-                            f"<div style='background:#0f172a;border:1px solid #1e293b;"
-                            f"border-radius:8px;padding:10px 14px'>"
-                            f"<div style='color:#60a5fa;font-weight:700;font-size:0.88rem'>"
-                            f"{line.get('product_name','—')}</div>"
-                            f"<div style='color:#475569;font-size:0.7rem;margin-top:3px'>"
-                            f"{line.get('brand','—')} · {line.get('main_group','—')} · {line.get('unit','PCS')}"
-                            f"</div></div>",
-                            unsafe_allow_html=True)
-                        if not _line_frozen:
-                            if st.button("✏️ Change Product",
-                                         key=f"change_product_{eye_label}_{idx}",
-                                         width='stretch'):
+                pair_id = (
+                    line.get('pair_id')
+                    or f"{get_display_order_id(order)}_{line.get('product_id','')}"
+                )
+
+
+                if pair_id not in product_groups:
+                    product_groups[pair_id] = {
+                        'product_name': line.get('product_name', 'N/A'),
+                        'brand': line.get('brand', 'N/A'),
+                        'R': None,
+                        'L': None,
+                        'R_idx': None,
+                        'L_idx': None
+                    }
+
+                if eye in ['RIGHT', 'R']:
+                    product_groups[pair_id]['R'] = line
+                    product_groups[pair_id]['R_idx'] = idx
+
+                elif eye in ['LEFT', 'L']:
+                    product_groups[pair_id]['L'] = line
+                    product_groups[pair_id]['L_idx'] = idx
+
+            # Display each product with R and L side by side
+            for product_id, group in product_groups.items():
+                # Compact product header - just sync option, no big header
+                render_product_sync_option(group, product_id)
+            
+                # ==================== RIGHT & LEFT EYE DYNAMIC LAYOUT ====================
+                #  FIX: Dynamic column layout - stretch to fill horizontal space
+                has_right = bool(group['R'])
+                has_left = bool(group['L'])
+            
+                # Create columns only for eyes that have data
+                if has_right and has_left:
+                    # Both eyes ordered - use 2 columns
+                    col_r, col_l = st.columns(2)
+                elif has_right:
+                    # Only right eye - use full width
+                    col_r = st.container()
+                    col_l = None
+                elif has_left:
+                    # Only left eye - use full width
+                    col_r = None
+                    col_l = st.container()
+                else:
+                    # Neither eye ordered
+                    col_r = None
+                    col_l = None
+            
+                # ── WIN 4: pre-fetch mrp / selling_price / stock_qty / supplier ──────
+                # Replaces one SELECT per line inside _render_eye_block_ui with one
+                # batch query for all product_ids on this order. The closure below
+                # reads from _live_price_cache instead of hitting the DB per line.
+                _live_price_cache = {}
+                try:
+                    from modules.sql_adapter import run_query as _rq_lpc
+                    _lpc_pids = list({
+                        str(l.get("product_id") or "")
+                        for l in all_lines
+                        if l.get("product_id") and not bool(l.get("is_deleted"))
+                    })
+                    if _lpc_pids:
+                        _lpc_rows = _rq_lpc(
+                            """
+                            SELECT
+                                p.id::text                              AS product_id,
+                                COALESCE(MAX(NULLIF(i.mrp,0)), 0)       AS mrp,
+                                COALESCE(MAX(NULLIF(i.selling_price,0)), 0) AS selling_price,
+                                COALESCE(SUM(COALESCE(i.quantity, 0)), 0)   AS stock_qty,
+                                COALESCE(
+                                  (SELECT pt.party_name
+                                   FROM product_supplier_map psm
+                                   JOIN parties pt ON pt.id = psm.supplier_id
+                                   WHERE psm.product_id = p.id
+                                     AND COALESCE(pt.is_active, TRUE) = TRUE
+                                   ORDER BY psm.created_at DESC LIMIT 1),
+                                  (SELECT pt.party_name FROM parties pt
+                                   WHERE pt.id = p.preferred_supplier_id LIMIT 1),
+                                  ''
+                                ) AS supplier
+                            FROM products p
+                            LEFT JOIN inventory_stock i
+                                   ON i.product_id = p.id
+                                  AND COALESCE(i.is_active, TRUE) = TRUE
+                            WHERE p.id = ANY(%(pids)s::uuid[])
+                            GROUP BY p.id
+                            """,
+                            {"pids": _lpc_pids},
+                        ) or []
+                        _live_price_cache = {r["product_id"]: r for r in _lpc_rows}
+                except Exception:
+                    _live_price_cache = {}
+
+                # ── Smart compact eye block renderer ──────────────────────
+                def _render_eye_block_ui(line, idx, eye_label):
+                    import math as _math, json as _ej
+
+                    bdr_color = "#ef4444" if eye_label=="R" else "#64748b"
+                    eye_title = "RE — Right Eye" if eye_label=="R" else "LE — Left Eye"
+
+                    # Build power string
+                    _pw_parts = []
+                    try:
+                        if line.get("sph") is not None: _pw_parts.append(f"SPH {float(line['sph']):+.2f}")
+                        _c = line.get("cyl")
+                        if _c is not None and abs(float(_c or 0)) > 0.01: _pw_parts.append(f"CYL {float(_c):+.2f}")
+                        _ax = line.get("axis")
+                        if _ax and int(float(_ax or 0)): _pw_parts.append(f"AX {int(float(_ax))}°")
+                        _ad = line.get("add_power")
+                        if _ad and float(_ad or 0) > 0: _pw_parts.append(f"ADD {float(_ad):+.2f}")
+                    except Exception as _e:
+                        logger.warning("Suppressed error: %s", _e)
+                    _pw_str = "  ".join(_pw_parts) if _pw_parts else "—"
+
+                    # Build lens params summary
+                    _lp_e = line.get("lens_params") or {}
+                    if isinstance(_lp_e, str):
+                        try: _lp_e = _ej.loads(_lp_e)
+                        except Exception as _e:
+                            logger.warning("Suppressed error: %s", _e)
+                            _lp_e = {}
+                    _coat = str(_lp_e.get("coating") or _lp_e.get("coating_type") or "").strip()
+                    _idx  = str(_lp_e.get("lens_index") or _lp_e.get("index_value") or "").strip()
+                    _dia  = str(_lp_e.get("diameter") or "").strip()
+                    _frm  = str(_lp_e.get("frame_type") or "").strip()
+                    _chips = "  ·  ".join(x for x in [_idx, _coat, _dia, _frm] if x)
+                    _prod_ref = str(line.get("production_ref") or "").strip()
+                    _order_no_for_ref = str(order.get("order_no") or "").strip()
+                    _prod_ref_html = (
+                        f"<div style='font-size:0.64rem;color:#fbbf24;margin-bottom:4px'>"
+                        f"Ref: {_prod_ref}</div>"
+                        if _prod_ref and _prod_ref != _order_no_for_ref else ""
+                    )
+
+                    # Qty / allocation
+                    _qty     = int(line.get("billing_qty") or line.get("quantity") or 1)
+                    _alloc   = int(line.get("allocated_qty") or 0)
+                    _to_ord  = max(0, _qty - _alloc)
+                    _route_e = str(line.get("manufacturing_route") or _lp_e.get("manufacturing_route") or "").upper()
+                    if _route_e in ("VENDOR", "EXTERNAL_LAB"):
+                        _alloc_c = "#38bdf8"
+                        _sup_nm = str(_lp_e.get("supplier_name") or _lp_e.get("external_lab_name") or "").strip()
+                        _alloc_s = f"🏭 Supplier: {_sup_nm}" if _sup_nm else "🏭 Supplier route"
+                    elif _route_e == "INHOUSE":
+                        _alloc_c = "#a78bfa"
+                        _alloc_s = "🔬 In-house production"
+                    elif _route_e == "FITTING":
+                        _alloc_c = "#f59e0b"
+                        _alloc_s = "🔧 Fitting service"
+                    elif _route_e == "SERVICE":
+                        _alloc_c = "#22c55e"
+                        _alloc_s = "✅ Direct service"
+                    else:
+                        _alloc_c = "#10b981" if _alloc >= _qty else ("#f59e0b" if _alloc > 0 else "#ef4444")
+                        _alloc_s = f"✅ {_alloc}/{_qty} allocated" if _alloc >= _qty else                            f"⚡ {_alloc}/{_qty} partial" if _alloc > 0 else f"⬜ Not allocated"
+
+                    # Fetch live pricing + stock + supplier — WIN 4: use batch pre-fetch cache
+                    _pid_live = str(line.get("product_id") or "").strip()
+                    _mrp_live = _sp_live = _stock_live = 0.0
+                    _supplier_live = ""
+                    _is_stock_item = any(k in str(line.get("main_group","")).lower()
+                                         for k in ("contact","frame","sunglass","accessory","stock"))
+                    _order_type_live = str(order.get("order_type") or "RETAIL").upper()
+                    if _pid_live:
+                        try:
+                            _cached_lp = _live_price_cache.get(_pid_live)
+                            if _cached_lp:
+                                _mrp_live      = float(_cached_lp.get("mrp") or 0)
+                                _sp_live       = float(_cached_lp.get("selling_price") or 0)
+                                _stock_live    = float(_cached_lp.get("stock_qty") or 0)
+                                _supplier_live = str(_cached_lp.get("supplier") or "")
+                            else:
+                                from modules.sql_adapter import run_query as _rq_live
+                                _price_row = _rq_live(
+                                    """SELECT
+                                          COALESCE(MAX(NULLIF(i.mrp,0)), 0) AS mrp,
+                                          COALESCE(MAX(NULLIF(i.selling_price,0)), 0) AS selling_price,
+                                          COALESCE(SUM(COALESCE(i.quantity, 0)),0) AS stock_qty,
+                                          COALESCE(
+                                            (SELECT pt.party_name
+                                             FROM product_supplier_map psm
+                                             JOIN parties pt ON pt.id = psm.supplier_id
+                                             WHERE psm.product_id = p.id
+                                               AND COALESCE(pt.is_active,TRUE)=TRUE
+                                             ORDER BY psm.created_at DESC
+                                             LIMIT 1),
+                                            (SELECT pt.party_name
+                                             FROM parties pt
+                                             WHERE pt.id = p.preferred_supplier_id
+                                             LIMIT 1),
+                                            ''
+                                          ) AS supplier
+                                   FROM products p
+                                   LEFT JOIN inventory_stock i ON i.product_id = p.id
+                                     AND COALESCE(i.is_active,TRUE)=TRUE
+                                   WHERE p.id = %(pid)s::uuid
+                                   GROUP BY p.id""",
+                                    {"pid": _pid_live}
+                                )
+                                if _price_row:
+                                    _mrp_live      = float(_price_row[0].get("mrp") or 0)
+                                    _sp_live       = float(_price_row[0].get("selling_price") or 0)
+                                    _stock_live    = float(_price_row[0].get("stock_qty") or 0)
+                                    _supplier_live = str(_price_row[0].get("supplier") or "")
+                        except Exception:
+                            pass
+
+                    # Build price info for black box
+                    _price_html = ""
+                    if _mrp_live > 0:
+                        _price_html += f"<span style='color:#94a3b8;font-size:0.65rem'>MRP </span>"                                    f"<span style='color:#f1f5f9;font-size:0.72rem;font-weight:700'>₹{_mrp_live:,.0f}</span>  "
+                    if _order_type_live == "WHOLESALE" and _sp_live > 0:
+                        _price_html += f"<span style='color:#94a3b8;font-size:0.65rem'>WS </span>"                                    f"<span style='color:#a78bfa;font-size:0.72rem;font-weight:700'>₹{_sp_live:,.0f}</span>  "
+                    if _is_stock_item and _stock_live >= 0:
+                        _stk_c = "#10b981" if _stock_live > 0 else "#ef4444"
+                        _price_html += f"<span style='color:#94a3b8;font-size:0.65rem'>Stock </span>"                                    f"<span style='color:{_stk_c};font-size:0.72rem;font-weight:700'>{int(_stock_live)}</span>  "
+                    if _supplier_live:
+                        _price_html += f"<span style='color:#94a3b8;font-size:0.65rem'>Supplier </span>"                                    f"<span style='color:#fbbf24;font-size:0.7rem'>{_supplier_live}</span>"
+
+                    # ONE compact HTML card
+                    st.markdown(f"""
+    <div style='border-top:3px solid {bdr_color};border-radius:0 0 6px 6px;
+                padding:8px 10px;background:#0f172a;margin-bottom:2px'>
+      <div style='font-size:0.7rem;font-weight:800;color:{bdr_color};
+                  letter-spacing:.08em;margin-bottom:4px'>{eye_title}</div>
+      <div style='font-size:0.8rem;font-weight:700;color:#f1f5f9;margin-bottom:1px'>
+        {line.get("product_name","N/A")}</div>
+      <div style='font-size:0.67rem;color:#64748b;margin-bottom:5px'>
+        {line.get("brand","N/A")} · {line.get("main_group","N/A")} · {line.get("unit","PCS")}</div>
+      {_prod_ref_html}
+      <div style='font-size:0.75rem;font-family:monospace;color:#7dd3fc;
+                  background:#0c1a3a;padding:3px 8px;border-radius:4px;margin-bottom:4px'
+        >{_pw_str}</div>
+      {'<div style="font-size:0.67rem;color:#94a3b8;margin-bottom:4px">'+_chips+'</div>' if _chips else ''}
+      {'<div style="margin-bottom:4px;padding:3px 0;border-top:1px solid #1e293b">'+_price_html+'</div>' if _price_html else ''}
+      <div style='display:flex;justify-content:space-between;align-items:center;
+                  font-size:0.7rem;margin-top:2px'>
+        <span style='color:{_alloc_c}'>{_alloc_s}</span>
+        <span style='color:#64748b;background:#1e293b;padding:1px 6px;border-radius:4px'>
+          Qty: {_qty}</span>
+      </div>
+      {'<div style="color:#f59e0b;font-size:0.67rem;margin-top:2px">⚠️ '+str(_to_ord)+' to order</div>' if (_to_ord > 0 and _route_e not in ("VENDOR","EXTERNAL_LAB","INHOUSE","FITTING","SERVICE")) else ''}
+    </div>""", unsafe_allow_html=True)
+
+                    # ── 3 action buttons — hidden when order is confirmed/in-pipeline ─
+                    if not _tab1_edit_locked:
+                        _ab1, _ab2, _ab3, _ab4 = st.columns(4)
+                        with _ab1:
+                            if st.button("✏️ Product", key=f"chg_{eye_label}_{idx}",
+                                         use_container_width=True, help="Change product"):
                                 st.session_state['bo_product_change_modal'] = {
                                     'active': True, 'line': line,
                                     'idx': idx, 'eye_label': eye_label, 'order': order
                                 }
                                 st.rerun()
-                        else:
-                            st.caption("🔒 Locked")
+                        with _ab2:
+                            _pw_key = f"_bo_pwedit_{eye_label}_{idx}"
+                            if st.button("🔭 Power", key=f"pw_{eye_label}_{idx}",
+                                         use_container_width=True, help="Edit prescription power"):
+                                st.session_state[_pw_key] = not st.session_state.get(_pw_key, False)
+                        with _ab3:
+                            _lp_key = f"_bo_lpedit_{eye_label}_{idx}"
+                            if st.button("🔧 Lens Params", key=f"lp_{eye_label}_{idx}",
+                                         use_container_width=True, help="Edit index, coating, frame etc"):
+                                st.session_state[_lp_key] = not st.session_state.get(_lp_key, False)
+                        with _ab4:
+                            _bp_key = f"_bo_bpedit_{eye_label}_{idx}"
+                            if st.button("📐 Boxing", key=f"bp_{eye_label}_{idx}",
+                                         use_container_width=True, help="Edit frame / boxing measurements"):
+                                st.session_state[_bp_key] = not st.session_state.get(_bp_key, False)
 
-                    with _r1b:
-                        _cyl = line.get('cyl')
-                        _add_p = line.get('add_power')
-                        _has_cyl = (_cyl is not None and
-                                    not (isinstance(_cyl, float) and _math.isnan(_cyl))
-                                    and abs(float(_cyl or 0)) > 0.01)
-                        _has_add = (_add_p is not None and
-                                    not (isinstance(_add_p, float) and _math.isnan(_add_p))
-                                    and float(_add_p or 0) > 0)
-                        _pw = []
-                        if line.get('sph') is not None:
-                            _pw.append(f"<span style='color:#94a3b8'>SPH</span> <b>{fmt_signed(line.get('sph'))}</b>")
-                        if _has_cyl:
-                            _pw.append(f"<span style='color:#94a3b8'>CYL</span> <b>{fmt_signed(_cyl)}</b>")
-                            if line.get('axis') is not None:
-                                _pw.append(f"<span style='color:#94a3b8'>AX</span> <b>{line.get('axis')}</b>")
-                        if _has_add:
-                            _pw.append(f"<span style='color:#94a3b8'>ADD</span> <b>{fmt_signed(_add_p)}</b>")
-                        st.markdown(
-                            f"<div style='background:#0f172a;border:1px solid #1e293b;"
-                            f"border-radius:8px;padding:10px 14px'>"
-                            f"<div style='color:#64748b;font-size:0.62rem;margin-bottom:4px'>🔭 RX POWER</div>"
-                            f"<div style='color:#e2e8f0;font-size:0.82rem;line-height:2'>"
-                            f"{'  &nbsp; '.join(_pw) if _pw else '<span style="color:#334155">—</span>'}"
-                            f"</div></div>",
-                            unsafe_allow_html=True)
-                        is_editing = st.session_state.get('bo_editing_line') == idx
-                        if _line_frozen:
-                            # Clear stale editing state so form doesn't sneak through
-                            if is_editing:
-                                st.session_state.bo_editing_line = None
-                            _freeze_reason = (
-                                "Order in billing queue — recall to CONFIRMED to edit"
-                                if _billing_frozen else
-                                "Power locked — job card saved"
-                            )
-                            st.markdown(
-                                f"<div style='background:#1a0a00;border:1px solid #f97316;"
-                                f"border-radius:6px;padding:5px 10px;margin-top:6px'>"
-                                f"<span style='color:#fb923c;font-size:0.78rem;font-weight:700'>"
-                                f"🔒 {_freeze_reason}</span></div>",
-                                unsafe_allow_html=True)
-                        elif not is_editing:
-                            if st.button("✏️ Edit Power",
-                                         key=f"edit_{eye_label}_{idx}",
-                                         width='stretch'):
-                                st.session_state.bo_editing_line = idx
-                                st.rerun()
-                        else:
-                            render_power_edit_ui(line, idx, order)
+                    if _tab1_edit_locked:
+                        return
 
-                    # ══ ROW 2: Lens spec badges ═══════════════════════
-                    _badges = []
-                    if _frame_t and _frame_t.lower() not in ("full", "full rim"):
-                        _badges.append(f"<span style='background:#1e293b;color:#94a3b8;padding:3px 9px;border-radius:20px;font-size:0.7rem'>🖼 {_frame_t}</span>")
-                    if _thick and _thick.lower() not in ("regular",""):
-                        _badges.append(f"<span style='background:#1e293b;color:#94a3b8;padding:3px 9px;border-radius:20px;font-size:0.7rem'>📏 {_thick}</span>")
-                    if _fit_req:
-                        _fit_lbl = f"Fitting" + (f" · {_fit_type}" if _fit_type else "")
-                        _badges.append(f"<span style='background:#2d1b69;color:#c4b5fd;border:1px solid #7c3aed;padding:3px 9px;border-radius:20px;font-size:0.7rem;font-weight:700'>🔧 {_fit_lbl}</span>")
-                    if _colour:
-                        _badges.append(f"<span style='background:#4a0526;color:#f9a8d4;border:1px solid #be185d;padding:3px 9px;border-radius:20px;font-size:0.7rem;font-weight:700'>🎨 {_colour}</span>")
-
-                    if _badges:
-                        st.markdown(
-                            "<div style='display:flex;flex-wrap:wrap;gap:6px;padding:6px 0'>"
-                            + "".join(_badges) + "</div>",
-                            unsafe_allow_html=True)
-
-                    # Tint sample image
-                    if _tint_b64:
+                    # ── Power edit panel (inline toggle) ─────────────────
+                    if st.session_state.get(f"_bo_pwedit_{eye_label}_{idx}"):
                         try:
-                            _img_bytes = _b64.b64decode(_tint_b64)
-                            _ti1, _ti2 = st.columns([1, 3])
-                            with _ti1:
-                                st.image(_img_bytes, caption="🎨 Tint", width=100)
-                            with _ti2:
-                                st.markdown(
-                                    f"<div style='color:#f9a8d4;font-size:0.75rem;padding-top:8px'>"
-                                    f"Tint sample attached<br>"
-                                    f"<span style='color:#64748b'>Match colour before processing</span>"
-                                    f"</div>", unsafe_allow_html=True)
+                            from modules.backoffice.backoffice_panels import render_power_edit_ui
+                            render_power_edit_ui(line, idx, order)
+                        except Exception as _pwe:
+                            st.error(f"Power edit error: {_pwe}")
+
+                    # ── Lens Parameters edit (inline toggle) ─────────────
+                    if st.session_state.get(f"_bo_lpedit_{eye_label}_{idx}"):
+                        import json as _lpj
+                        _lp_cur = line.get("lens_params") or {}
+                        if isinstance(_lp_cur, str):
+                            try: _lp_cur = _lpj.loads(_lp_cur)
+                            except Exception as _e:
+                                logger.warning("Suppressed error: %s", _e)
+                                _lp_cur = {}
+                        st.markdown("<div style='background:#0c1a2e;border-radius:6px;padding:8px;margin:4px 0'>",
+                                    unsafe_allow_html=True)
+                        _lc1, _lc2, _lc3 = st.columns(3)
+                        _new_idx   = _lc1.text_input("Index",
+                            value=str(_lp_cur.get("lens_index") or _lp_cur.get("index_value") or ""),
+                            key=f"lp_idx_{eye_label}_{idx}")
+                        _new_coat  = _lc2.text_input("Coating",
+                            value=str(_lp_cur.get("coating") or _lp_cur.get("coating_type") or ""),
+                            key=f"lp_coat_{eye_label}_{idx}")
+                        _new_dia   = _lc3.text_input("Diameter",
+                            value=str(_lp_cur.get("diameter") or ""),
+                            key=f"lp_dia_{eye_label}_{idx}")
+                        _lc4, _lc5, _lc6 = st.columns(3)
+                        _new_frm   = _lc4.text_input("Frame Type",
+                            value=str(_lp_cur.get("frame_type") or ""),
+                            key=f"lp_frm_{eye_label}_{idx}")
+                        _new_fh    = _lc5.text_input("Fitting Height",
+                            value=str(_lp_cur.get("fitting_height") or ""),
+                            key=f"lp_fh_{eye_label}_{idx}")
+                        _new_corr  = _lc6.text_input("Corridor",
+                            value=str(_lp_cur.get("corridor") or ""),
+                            key=f"lp_corr_{eye_label}_{idx}")
+                        _new_note  = st.text_input("Instructions / Note",
+                            value=str(_lp_cur.get("instructions") or ""),
+                            key=f"lp_note_{eye_label}_{idx}")
+                        st.markdown("</div>", unsafe_allow_html=True)
+                        if st.button("💾 Save Lens Params", key=f"lp_save_{eye_label}_{idx}",
+                                     type="primary", use_container_width=True):
+                            _lp_cur.update({
+                                "lens_index": _new_idx, "index_value": _new_idx,
+                                "coating": _new_coat, "coating_type": _new_coat,
+                                "diameter": _new_dia, "frame_type": _new_frm,
+                                "fitting_height": _new_fh, "corridor": _new_corr,
+                                "instructions": _new_note,
+                            })
+                            line["lens_params"] = _lp_cur
+                            try:
+                                from modules.sql_adapter import run_write as _rw_lp
+                                import json as _lpj2
+                                _rw_lp("UPDATE order_lines SET lens_params=%(lp)s::jsonb WHERE id=%(lid)s::uuid",
+                                       {"lp": _lpj2.dumps(_lp_cur),
+                                        "lid": str(line.get("line_id") or line.get("id") or "")})
+                                st.success("✅ Lens params saved")
+                                st.session_state[f"_bo_lpedit_{eye_label}_{idx}"] = False
+                                st.rerun()
+                            except Exception as _lpe:
+                                st.error(f"Save failed: {_lpe}")
+
+                    # ── Frame / Boxing edit (inline toggle) ─────────────
+                    if st.session_state.get(f"_bo_bpedit_{eye_label}_{idx}"):
+                        import json as _bpj
+                        _bp_cur = line.get("boxing_params") or {}
+                        if isinstance(_bp_cur, str):
+                            try: _bp_cur = _bpj.loads(_bp_cur)
+                            except Exception as _e:
+                                logger.warning("Suppressed error: %s", _e)
+                                _bp_cur = {}
+                        st.markdown("<div style='background:#0c1a2e;border-radius:6px;padding:8px;margin:4px 0'>",
+                                    unsafe_allow_html=True)
+                        st.markdown("**📐 Frame / Boxing Measurements**")
+                        _bd1, _bd2, _bd3, _bd4, _bd5 = st.columns(5)
+                        _a_box = _bd1.number_input("A", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("a_box") or _bp_cur.get("A") or 0.0),
+                            step=0.1, format="%.1f", key=f"bp_a_{eye_label}_{idx}")
+                        _b_box = _bd2.number_input("B", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("b_box") or _bp_cur.get("B") or 0.0),
+                            step=0.1, format="%.1f", key=f"bp_b_{eye_label}_{idx}")
+                        _ed = _bd3.number_input("ED", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("ed") or _bp_cur.get("ED") or 0.0),
+                            step=0.1, format="%.1f", key=f"bp_ed_{eye_label}_{idx}")
+                        _ed_axis = _bd4.number_input("ED Axis", min_value=0, max_value=180,
+                            value=int(float(_bp_cur.get("ed_axis") or _bp_cur.get("ED Axis") or 0)),
+                            step=1, key=f"bp_ed_axis_{eye_label}_{idx}")
+                        _dbl = _bd5.number_input("DBL", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("dbl") or _bp_cur.get("DBL") or 0.0),
+                            step=0.1, format="%.1f", key=f"bp_dbl_{eye_label}_{idx}")
+
+                        _pd1, _pd2, _pd3, _pd4, _pd5 = st.columns(5)
+                        _r_pd = _pd1.number_input("R PD", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("r_pd") or _bp_cur.get("R PD") or 0.0),
+                            step=0.5, format="%.1f", key=f"bp_rpd_{eye_label}_{idx}")
+                        _l_pd = _pd2.number_input("L PD", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("l_pd") or _bp_cur.get("L PD") or 0.0),
+                            step=0.5, format="%.1f", key=f"bp_lpd_{eye_label}_{idx}")
+                        _ipd = _pd3.number_input("IPD", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("ipd") or _bp_cur.get("IPD") or 0.0),
+                            step=0.5, format="%.1f", key=f"bp_ipd_{eye_label}_{idx}")
+                        _fh_r = _pd4.number_input("Fit HT R", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("fitting_ht_r") or _bp_cur.get("fit_ht_r") or _bp_cur.get("Fit HT R") or 0.0),
+                            step=0.5, format="%.1f", key=f"bp_fhr_{eye_label}_{idx}")
+                        _fh_l = _pd5.number_input("Fit HT L", min_value=0.0, max_value=99.9,
+                            value=float(_bp_cur.get("fitting_ht_l") or _bp_cur.get("fit_ht_l") or _bp_cur.get("Fit HT L") or 0.0),
+                            step=0.5, format="%.1f", key=f"bp_fhl_{eye_label}_{idx}")
+
+                        _ang1, _ang2, _ang3 = st.columns(3)
+                        _panto = _ang1.number_input("Panto", min_value=0.0, max_value=25.0,
+                            value=float(_bp_cur.get("panto") or _bp_cur.get("Panto") or 0.0),
+                            step=0.5, format="%.1f", key=f"bp_panto_{eye_label}_{idx}")
+                        _tilt = _ang2.number_input("Tilt", min_value=0.0, max_value=25.0,
+                            value=float(_bp_cur.get("tilt") or _bp_cur.get("Tilt") or 0.0),
+                            step=0.5, format="%.1f", key=f"bp_tilt_{eye_label}_{idx}")
+                        _bvd = _ang3.number_input("BVD", min_value=0.0, max_value=30.0,
+                            value=float(_bp_cur.get("bvd") or _bp_cur.get("BVD") or 0.0),
+                            step=0.5, format="%.1f", key=f"bp_bvd_{eye_label}_{idx}")
+                        st.markdown("</div>", unsafe_allow_html=True)
+                        if st.button("💾 Save Boxing", key=f"bp_save_{eye_label}_{idx}",
+                                     type="primary", use_container_width=True):
+                            _bp_new = {
+                                "a_box": round(_a_box, 1), "b_box": round(_b_box, 1),
+                                "ed": round(_ed, 1), "ed_axis": int(_ed_axis),
+                                "dbl": round(_dbl, 1), "r_pd": round(_r_pd, 1),
+                                "l_pd": round(_l_pd, 1), "ipd": round(_ipd, 1),
+                                "fitting_ht_r": round(_fh_r, 1), "fitting_ht_l": round(_fh_l, 1),
+                                "panto": round(_panto, 1), "tilt": round(_tilt, 1),
+                                "bvd": round(_bvd, 1),
+                            }
+                            line["boxing_params"] = _bp_new
+                            try:
+                                from modules.sql_adapter import run_write as _rw_bp
+                                _rw_bp("UPDATE order_lines SET boxing_params=%(bp)s::jsonb WHERE id=%(lid)s::uuid",
+                                       {"bp": _bpj.dumps(_bp_new),
+                                        "lid": str(line.get("line_id") or line.get("id") or "")})
+                                st.success("✅ Boxing saved")
+                                st.session_state[f"_bo_bpedit_{eye_label}_{idx}"] = False
+                                st.rerun()
+                            except Exception as _bpe:
+                                st.error(f"Save failed: {_bpe}")
+
+                    # ── Admin price / discount override ─────────────────
+                    try:
+                        from modules.security.roles import ADMIN as _ADMIN_ROLE, MANAGER as _MANAGER_ROLE, has_role as _has_role_price
+                        _can_edit_price = _has_role_price(_ADMIN_ROLE, _MANAGER_ROLE)
+                    except Exception:
+                        _can_edit_price = False
+                    if _can_edit_price and not bool(line.get("is_service_line")):
+                        with st.expander("💰 Price / Discount Override", expanded=False):
+                            st.caption("Admin/Manager only. Sets manual price lock so discount refresh will not overwrite this line.")
+                            _qty_price = int(line.get("billing_qty") or line.get("quantity") or 1)
+                            _pr1, _pr2, _pr3 = st.columns(3)
+                            _new_unit_price = _pr1.number_input(
+                                "Unit price",
+                                min_value=0.0,
+                                value=float(line.get("unit_price") or 0),
+                                step=10.0,
+                                key=f"bo_price_up_{eye_label}_{idx}",
+                            )
+                            _new_disc_pct = _pr2.number_input(
+                                "Discount %",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(line.get("discount_percent") or 0),
+                                step=0.5,
+                                key=f"bo_price_dp_{eye_label}_{idx}",
+                            )
+                            _new_gst_pct = _pr3.number_input(
+                                "GST %",
+                                min_value=0.0,
+                                max_value=28.0,
+                                value=float(line.get("gst_percent") or 0),
+                                step=0.5,
+                                key=f"bo_price_gst_{eye_label}_{idx}",
+                            )
+                            _gross_manual = round(float(_new_unit_price or 0) * _qty_price, 2)
+                            _disc_manual = round(_gross_manual * float(_new_disc_pct or 0) / 100, 2)
+                            _net_manual = round(max(0.0, _gross_manual - _disc_manual), 2)
+                            try:
+                                from modules.core.price_qty_governor import compute_line_gst as _bo_compute_gst
+                                _gst_calc = _bo_compute_gst(
+                                    (_net_manual / max(_qty_price, 1)),
+                                    _qty_price,
+                                    _new_gst_pct,
+                                    _order_type_live,
+                                )
+                                _gst_manual = float(_gst_calc.get("gst_amount") or 0)
+                                _grand_manual = float(_gst_calc.get("grand_total") or _net_manual)
+                            except Exception:
+                                _gst_manual = round(_net_manual * float(_new_gst_pct or 0) / 100, 2)
+                                _grand_manual = _net_manual if _order_type_live == "RETAIL" else round(_net_manual + _gst_manual, 2)
+                            st.caption(
+                                f"Gross ₹{_gross_manual:,.2f} · Discount ₹{_disc_manual:,.2f} · "
+                                f"Billing ₹{_net_manual:,.2f} · GST ₹{_gst_manual:,.2f} · Grand ₹{_grand_manual:,.2f}"
+                            )
+                            _override_reason = st.text_input(
+                                "Reason / note",
+                                value=str((line.get("lens_params") or {}).get("manual_price_reason") if isinstance(line.get("lens_params"), dict) else ""),
+                                key=f"bo_price_reason_{eye_label}_{idx}",
+                            )
+                            _complimentary_ok = st.checkbox(
+                                "Allow zero price intentionally",
+                                value=False,
+                                key=f"bo_price_zero_ok_{eye_label}_{idx}",
+                            )
+                            if st.button("💾 Save Price Override", key=f"bo_price_save_{eye_label}_{idx}",
+                                         type="primary", use_container_width=True):
+                                if _new_unit_price <= 0 and not _complimentary_ok:
+                                    st.error("Unit price is zero. Tick intentional zero price, or enter a price.")
+                                else:
+                                    try:
+                                        import json as _price_json
+                                        from modules.sql_adapter import run_write as _rw_price
+                                        _lp_price = line.get("lens_params") or {}
+                                        if isinstance(_lp_price, str):
+                                            try: _lp_price = _price_json.loads(_lp_price) or {}
+                                            except Exception: _lp_price = {}
+                                        _lp_price["manual_price_override"] = True
+                                        _lp_price["price_locked"] = True
+                                        _lp_price["manual_price_reason"] = str(_override_reason or "").strip()
+                                        _lp_price["discount_status"] = "APPLIED" if _disc_manual > 0 else "MANUAL"
+                                        _rw_price("""
+                                            UPDATE order_lines
+                                            SET unit_price=%(up)s,
+                                                total_price=%(tp)s,
+                                                billing_total=%(tp)s,
+                                                gst_percent=%(gp)s,
+                                                gst_amount=%(ga)s,
+                                                discount_percent=%(dp)s,
+                                                discount_amount=%(da)s,
+                                                discount_rule=%(dr)s,
+                                                lens_params=%(lp)s::jsonb
+                                            WHERE id=%(lid)s::uuid
+                                        """, {
+                                            "up": float(_new_unit_price or 0),
+                                            "tp": _net_manual,
+                                            "gp": float(_new_gst_pct or 0),
+                                            "ga": _gst_manual,
+                                            "dp": float(_new_disc_pct or 0),
+                                            "da": _disc_manual,
+                                            "dr": "Manual Price Override" if (_disc_manual or _override_reason) else "",
+                                            "lp": _price_json.dumps(_lp_price),
+                                            "lid": str(line.get("line_id") or line.get("id") or ""),
+                                        })
+                                        line["unit_price"] = float(_new_unit_price or 0)
+                                        line["total_price"] = _net_manual
+                                        line["billing_total"] = _net_manual
+                                        line["gst_percent"] = float(_new_gst_pct or 0)
+                                        line["gst_amount"] = _gst_manual
+                                        line["discount_percent"] = float(_new_disc_pct or 0)
+                                        line["discount_amount"] = _disc_manual
+                                        line["discount_rule"] = "Manual Price Override" if (_disc_manual or _override_reason) else ""
+                                        line["lens_params"] = _lp_price
+                                        try:
+                                            from modules.backoffice.backoffice_helpers import refresh_order_pricing_rules
+                                            refresh_order_pricing_rules(order, persist=True)
+                                        except Exception as _price_sync_err:
+                                            logger.warning("Price override pricing sync failed: %s", _price_sync_err)
+                                        _bo_refresh_order_total_value(str(order.get("id") or order.get("order_id") or ""))
+                                        st.session_state.pop(f"_bo_disc_val_done_{order_id}", None)
+                                        st.success("✅ Price override saved")
+                                        st.rerun()
+                                    except Exception as _price_err:
+                                        st.error(f"Price save failed: {_price_err}")
+
+                    # ── Services expander (all orders) ────────────────────
+                    with st.expander("🔧 Services", expanded=False):
+                        st.info(
+                            "Service adding is now handled from Billing Summary → "
+                            "Add missed service / collectable before billing. "
+                            "This keeps Colouring, Fitting, Courier and other charges "
+                            "on one punching-style flow and prevents duplicate service lines."
+                        )
+                        _SCT = {
+                            "COLOURING": {"label":"Colouring/Tint","icon":"🎨","color":"#8b5cf6","default_gst":18},
+                            "FITTING":   {"label":"Fitting",       "icon":"🔧","color":"#f59e0b","default_gst":18},
+                            "COURIER":   {"label":"Courier",       "icon":"🚚","color":"#3b82f6","default_gst":18},
+                            "OTHER":     {"label":"Other",         "icon":"➕","color":"#64748b","default_gst":18},
+                            "MISC":      {"label":"Other",         "icon":"➕","color":"#64748b","default_gst":18},
+                            "CONSULTATION": {"label":"Consultation","icon":"🩺","color":"#22c55e","default_gst":0},
+                            "EYE_TESTING":  {"label":"Eye Testing", "icon":"👁️","color":"#10b981","default_gst":0},
+                        }
+                        try:
+                            from modules.backoffice.service_master import fetch_service_types, service_price, suggested_provider_for_service
+                            _svc_master_rows = fetch_service_types(active_only=True)
                         except Exception:
-                            st.caption("⚠️ Tint image could not be loaded")
+                            _svc_master_rows = []
+                            service_price = lambda svc, ot, *args, **kwargs: float((svc or {}).get("default_price") or 0)
+                            suggested_provider_for_service = lambda code: None
+                        _svc_master_rows = _bo_complete_service_rows(_svc_master_rows)
 
-                    # Lab instructions
-                    if _instruct:
-                        st.markdown(
-                            f"<div style='background:#1a1200;border-left:3px solid #f59e0b;"
-                            f"padding:6px 12px;border-radius:0 6px 6px 0;margin:4px 0'>"
-                            f"<span style='color:#f59e0b;font-size:0.68rem;font-weight:700'>📝 LAB NOTES</span>"
-                            f"<div style='color:#fcd34d;font-size:0.78rem;margin-top:2px'>{_instruct}</div>"
-                            f"</div>", unsafe_allow_html=True)
+                        _svc_by_group = {}
+                        for _svcm in _svc_master_rows:
+                            _svc_by_group.setdefault(str(_svcm.get("service_group") or "OTHER").upper(), []).append(_svcm)
 
-                    # ══ ROW 3: Qty + Allocation ═══════════════════════
-                    _r3a, _r3b = st.columns([1, 2])
-                    with _r3a:
-                        st.markdown("<div style='color:#64748b;font-size:0.65rem;margin-bottom:2px'>📦 QTY</div>", unsafe_allow_html=True)
+                        # Load existing service lines for this order
+                        try:
+                            from modules.sql_adapter import resolve_order_uuid as _resolve_order_uuid
+                            _order_id_svc = _resolve_order_uuid(order.get("id") or order.get("order_id") or order.get("order_no")) or ""
+                        except Exception:
+                            _order_id_svc = ""
+                        _existing_svc = {}
+                        if _order_id_svc:
+                            try:
+                                from modules.sql_adapter import run_query as _rq_svc
+                                _svc_rows = _rq_svc(
+                                    """SELECT ol.id::text, ol.lens_params->>'charge_type' AS charge_type,
+                                              COALESCE(p.product_name,
+                                                       ol.lens_params->>'service_display_name',
+                                                       ol.lens_params->>'display_product_name',
+                                                       ol.lens_params->>'service_description',
+                                                       'Service') AS product_name,
+                                              ol.unit_price, ol.gst_percent
+                                       FROM order_lines ol
+                                       LEFT JOIN products p ON p.id = ol.product_id
+                                       WHERE ol.order_id=%(oid)s::uuid
+                                         AND COALESCE(ol.is_service_line,FALSE)=TRUE
+                                         AND UPPER(COALESCE(ol.eye_side,'')) IN ('S','SERVICE')
+                                         AND COALESCE(ol.is_deleted,FALSE)=FALSE""",
+                                    {"oid": _order_id_svc}
+                                ) or []
+                                for _sr in _svc_rows:
+                                    _ct = str(_sr.get("charge_type") or "").upper()
+                                    if _ct:
+                                        _existing_svc[_ct] = _sr
+                            except Exception:
+                                pass
+
+                        _svc_order = []
+                        for _svc_type in _svc_order:
+                            if _svc_type not in _svc_by_group and _svc_type not in _existing_svc:
+                                continue
+                            _scfg = _SCT.get(_svc_type, {})
+                            _s_icon  = _scfg.get("icon","🔧")
+                            _s_label = _scfg.get("label", _svc_type.title())
+                            _s_color = _scfg.get("color","#64748b")
+                            _s_gst   = float(_scfg.get("default_gst", 18))
+                            _s_existing = _existing_svc.get(_svc_type)
+
+                            st.markdown(
+                                f"<div style='font-size:0.72rem;font-weight:700;color:{_s_color};"
+                                f"margin-top:6px'>{_s_icon} {_s_label}</div>",
+                                unsafe_allow_html=True
+                            )
+                            _group_rows = _svc_by_group.get(_svc_type, [])
+                            _s_opts = ["None"] + [r.get("service_name") for r in _group_rows]
+                            _svc_by_name = {r.get("service_name"): r for r in _group_rows}
+                            _s_sel = st.selectbox(
+                                f"{_s_label}",
+                                _s_opts,
+                                index=0,
+                                key=f"svc_{_svc_type}_{eye_label}_{idx}",
+                                label_visibility="collapsed"
+                            )
+
+                            if _s_sel and _s_sel != "None":
+                                _svc_def = _svc_by_name.get(_s_sel) or {}
+                                _svc_code = _svc_def.get("service_code") or _svc_type
+                                _default_amt = service_price(
+                                    _svc_def,
+                                    _order_type_live,
+                                    party_id=str(order.get("party_id") or ""),
+                                ) if _svc_def else 0.0
+                                if float(_default_amt or 0) <= 0:
+                                    _default_amt = float(_svc_def.get("default_price") or 0)
+                                _s_gst = float(_svc_def.get("gst_percent") or _s_gst)
+                                _provider_hint = suggested_provider_for_service(_svc_code) if _svc_code else None
+                                try:
+                                    from modules.security.roles import ADMIN as _ADMIN_ROLE, MANAGER as _MANAGER_ROLE, has_role as _has_role_bo
+                                    _can_override_service_price = _has_role_bo(_ADMIN_ROLE, _MANAGER_ROLE)
+                                except Exception:
+                                    _can_override_service_price = False
+                                _sc1, _sc2, _scq, _sc3 = st.columns([2, 1.2, 1.0, 1])
+                                if _provider_hint:
+                                    st.caption(
+                                        f"Suggested provider: {_provider_hint.get('provider_name')} "
+                                        f"· purchase ₹{float(_provider_hint.get('purchase_rate') or 0):,.0f}"
+                                    )
+                                _s_amt = _sc2.number_input(
+                                    "₹ Rate / pair", min_value=0.0, step=10.0,
+                                    value=float(_default_amt or 0.0),
+                                    key=f"svc_amt_{_svc_type}_{eye_label}_{idx}_{_s_sel}",
+                                    disabled=not _can_override_service_price,
+                                    help="Admin/Manager can override. Others use Service Master price."
+                                )
+                                _svc_qty_factor = _scq.selectbox(
+                                    "Qty ⚠️ required",
+                                    [0.5, 1.0, 1.5, 2.0, 3.0],
+                                    index=1,
+                                    format_func=lambda v: (
+                                        f"{v:g} pair — 1 eye" if v == 0.5 else
+                                        f"{v:g} pair — both eyes" if v == 1.0 else
+                                        f"{v:g} pair"
+                                    ),
+                                    key=f"svc_qty_factor_{_svc_type}_{eye_label}_{idx}",
+                                    help="0.5 pair = treating 1 eye only. 1 pair = treating both eyes. Mandatory.",
+                                )
+                                _s_gst_inp = _sc3.number_input(
+                                    "GST%", min_value=0.0, max_value=28.0,
+                                    value=_s_gst, step=0.5,
+                                    key=f"svc_gst_{_svc_type}_{eye_label}_{idx}"
+                                )
+                                _svc_instruction = ""
+                                _svc_photo_b64 = ""
+                                _svc_photo_name = ""
+                                if _svc_type in ("COLOURING", "FITTING", "OTHER", "MISC", "CONSULTATION", "EYE_TESTING"):
+                                    _svc_instruction = st.text_area(
+                                        "Special instruction for provider",
+                                        placeholder="Tint shade, colour sample instruction, fitting note, urgency...",
+                                        key=f"svc_instr_{_svc_type}_{eye_label}_{idx}",
+                                        height=70,
+                                    )
+                                    if _svc_type == "COLOURING":
+                                        _svc_photo = st.file_uploader(
+                                            "Colour sample photograph",
+                                            type=["jpg", "jpeg", "png", "webp"],
+                                            key=f"svc_colour_sample_{_svc_type}_{eye_label}_{idx}",
+                                        )
+                                        if _svc_photo:
+                                            import base64 as _svc_b64
+                                            _svc_photo_b64 = _svc_b64.b64encode(_svc_photo.read()).decode("ascii")
+                                            _svc_photo_name = _svc_photo.name
+                                with _sc1:
+                                    if st.button(f"➕ Add {_s_label}",
+                                                 key=f"svc_add_{_svc_type}_{eye_label}_{idx}",
+                                                 use_container_width=True):
+                                        if _s_amt >= 0 and _order_id_svc:
+                                            try:
+                                                import uuid as _suuid, json as _sj
+                                                from modules.sql_adapter import run_write as _rw_svc
+                                                _line_base = round(float(_s_amt or 0) * float(_svc_qty_factor or 1), 2)
+                                                # Courier/Other/Consultation → direct billing.
+                                                # Colouring/Fitting → production.
+                                                _direct = (_svc_type == "COURIER")
+                                                if _svc_type not in ("COLOURING", "FITTING"):
+                                                    _direct = True
+                                                _svc_route = _service_route_for_group(_svc_type, _direct)
+                                                _lp_svc = _sj.dumps({
+                                                    "charge_type": _svc_type,
+                                                    "service_type": _svc_type,
+                                                    "service_code": _svc_code,
+                                                    "service_description": _s_sel,
+                                                    "service_display_name": f"{_s_label}: {_s_sel}",
+                                                    "display_product_name": f"{_s_label}: {_s_sel}",
+                                                    "service_production_type": "" if _direct else _svc_type,
+                                                    "service_origin": "backoffice",
+                                                    "manufacturing_route": _svc_route,
+                                                    "suggested_provider_id": (_provider_hint or {}).get("id"),
+                                                    "suggested_provider_name": (_provider_hint or {}).get("provider_name"),
+                                                    "suggested_provider_phone": (_provider_hint or {}).get("contact"),
+                                                    "service_instruction": _svc_instruction,
+                                                    "colour_sample_photo": _svc_photo_b64,
+                                                    "colour_sample_filename": _svc_photo_name,
+                                                    "price_overridden": bool(_can_override_service_price and abs(float(_s_amt or 0) - float(_default_amt or 0)) > 0.001),
+                                                    "service_qty_factor": float(_svc_qty_factor or 1),
+                                                    "service_rate_per_pair": float(_s_amt or 0),
+                                                })
+                                                _total, _gst_a = _bo_service_line_amounts(
+                                                    _line_base, _s_gst_inp, _order_type_live
+                                                )
+                                                _svc_pid = ""
+                                                try:
+                                                    _prod_name_svc = f"{_s_label}: {_s_sel}"
+                                                    _svc_pid = _ensure_bo_service_product(_svc_type, _prod_name_svc, _s_gst_inp)
+                                                except Exception:
+                                                    _svc_pid = None
+                                                _dup_key_svc = f"bo_dup_svc_confirm_{_order_id_svc}_{_svc_code}"
+                                                if _s_existing and not st.session_state.get(_dup_key_svc):
+                                                    st.warning(f"{_s_label} already exists on this order. Click again to add another copy.")
+                                                    st.session_state[_dup_key_svc] = True
+                                                    st.stop()
+                                                _rw_svc("""
+                                                    INSERT INTO order_lines
+                                                      (id, order_id, product_id, eye_side,
+                                                       unit_price, total_price, billing_total,
+                                                       gst_percent, gst_amount,
+                                                       quantity, billing_qty,
+                                                       allocated_qty, is_service_line,
+                                                       batch_status, lens_params)
+                                                    VALUES
+                                                      (%(id)s::uuid, %(oid)s::uuid, %(pid)s::uuid, 'S',
+                                                       %(up)s, %(tp)s, %(tp)s,
+                                                       %(gp)s, %(ga)s,
+                                                       1, 1,
+                                                       %(aq)s, TRUE,
+                                                       %(bs)s, %(lp)s::jsonb)
+                                                """, {
+                                                    "id":  str(_suuid.uuid4()),
+                                                    "oid": _order_id_svc,
+                                                    "pid": _svc_pid,
+                                                    "up":  _line_base,
+                                                    "tp":  _total,
+                                                    "gp":  _s_gst_inp,
+                                                    "ga":  _gst_a,
+                                                    "aq":  1 if _direct else 0,
+                                                    "bs":  "READY" if _direct else "PENDING",
+                                                    "lp":  _lp_svc,
+                                                })
+                                                try:
+                                                    from modules.backoffice.backoffice_helpers import ensure_order_production_refs
+                                                    ensure_order_production_refs(order_id=_order_id_svc)
+                                                except Exception as _svc_ref_err:
+                                                    logger.warning("Quick service production_ref fill failed: %s", _svc_ref_err)
+                                                st.session_state.pop(_dup_key_svc, None)
+                                                st.success(f"✅ {_s_label} added — ₹{_total:.0f}")
+                                                st.rerun()
+                                            except Exception as _se:
+                                                st.error(f"Failed: {_se}")
+                                        else:
+                                            st.warning("Select a service first")
+
+                            # Show existing service line if any
+                            if _s_existing:
+                                st.markdown(
+                                    f"<div style='font-size:0.67rem;color:#10b981;"
+                                    f"background:#022c22;padding:2px 6px;border-radius:4px;"
+                                    f"margin-top:2px'>✅ Active: ₹{float(_s_existing.get('unit_price',0)):,.0f}"
+                                    f" — {_s_existing.get('product_name','')}</div>",
+                                    unsafe_allow_html=True
+                                )
+
+                    # ── Expander: Qty + Allocation (hidden by default) ──
+                    with st.expander("📦 Qty & Allocation", expanded=False):
+                        # Quantity
                         current_qty = int(line.get("billing_qty") or 1)
                         new_qty = st.number_input(
-                            "Qty", min_value=1, value=current_qty, step=1,
-                            key=f"clean_qty_{eye_label}_{idx}",
-                            label_visibility="collapsed")
+                            "Quantity", min_value=1, value=current_qty, step=1,
+                            key=f"qty_{eye_label}_{idx}"
+                        )
                         if new_qty != current_qty:
                             line["billing_qty"]      = int(new_qty)
                             line["batch_allocation"] = []
                             line["allocated_qty"]    = 0
                             line["batch_status"]     = "PENDING"
-                            suggested = line.get("suggested_allocation")
-                            if suggested:
-                                if sum(b.get("allocated_qty", 0) for b in suggested) == int(new_qty):
-                                    line["batch_allocation"] = suggested
-                                else:
-                                    st.warning("⚠️ Qty changed — allocation discarded")
                             refresh_line_state(line)
                             recalculate_order_totals(order)
-                            from .backoffice_helpers import categorize_order_lines
-                            categorize_order_lines(order)
+                            st.success(f"✅ Qty → {new_qty}")
                             st.rerun()
-
-                    with _r3b:
-                        allocated   = int(line.get("allocated_qty") or 0)
-                        billing_qty = int(line.get("billing_qty") or 0)
-                        pending     = max(0, billing_qty - allocated)
-                        _alloc_ok   = allocated >= billing_qty > 0
-                        _ac = "#10b981" if _alloc_ok else ("#f59e0b" if allocated > 0 else "#ef4444")
-                        _al = f"✅ {allocated}/{billing_qty}" if _alloc_ok else (
-                              f"⚡ {allocated}/{billing_qty}" if allocated > 0 else "⬜ Not allocated")
-                        st.markdown(
-                            f"<div style='background:#0f172a;border:1px solid {_ac}44;"
-                            f"border-radius:8px;padding:8px 10px'>"
-                            f"<div style='color:#64748b;font-size:0.62rem'>🗂️ ALLOCATION</div>"
-                            f"<div style='color:{_ac};font-weight:700;font-size:0.8rem'>{_al}</div>"
-                            + (f"<div style='color:#f59e0b;font-size:0.65rem'>⚠️ {pending} to order</div>" if pending > 0 else "")
-                            + "</div>", unsafe_allow_html=True)
-                        if st.button("🗂️ Manage Stock",
-                                     key=f"alloc_{eye_label}_{idx}",
-                                     width='stretch'):
+                        # Allocation
+                        if st.button("🗂️ Manage Allocation", key=f"alloc_exp_{eye_label}_{idx}",
+                                     use_container_width=True):
                             st.session_state.bo_show_allocation_window = True
-                            st.session_state.bo_allocation_line_idx    = idx
+                            st.session_state.bo_allocation_line_idx = idx
                             st.rerun()
 
-                    # ══ Edit Lens Params (fitting / colour / instructions) ═
-                    _lp_edit_key = f"lp_edit_{eye_label}_{idx}"
-                    _lp_exp_label = "✏️ Edit Fitting / Colouring / Instructions"
-                    if _fit_req or _colour:
-                        _lp_exp_label = (
-                            "✏️ Edit Lens Params"
-                            + (" · 🔧" if _fit_req else "")
-                            + (f" · 🎨 {_colour}" if _colour else "")
-                        )
-                    # ── Lens Params lock — reuse _line_frozen computed above ────
-                    _lp_locked = _line_frozen
-                    if _lp_locked:
-                        _lp_exp_label = "🔒 " + _lp_exp_label
-
-                    with st.expander(_lp_exp_label, expanded=False):
-                        if _lp_locked:
-                            st.markdown(
-                                "<div style='background:#1a0a00;border:1px solid #f97316;"
-                                "border-radius:6px;padding:8px 14px;margin-bottom:8px'>"
-                                "<span style='color:#fb923c;font-weight:700'>🔒 Locked — job card saved</span>"
-                                "<span style='color:#fed7aa;font-size:0.8rem;margin-left:8px'>"
-                                "Cancel job card first (Documents → Job Cards).</span>"
-                                "</div>",
-                                unsafe_allow_html=True
-                            )
-                        _COLOURS = [
-                            "None",
-                            "Brown 10%","Brown 20%","Brown 30%","Brown 40%",
-                            "Brown 50%","Brown 60%","Brown 70%","Brown 75%",
-                            "Grey 20%","Grey 30%","Grey 40%","Grey 50%",
-                            "Grey 60%","Grey 75%",
-                            "Green 30%","Green 50%",
-                            "Blue 30%","Blue 50%",
-                            "Pink / Rose 20%","Pink / Rose 40%",
-                            "Yellow / Amber",
-                            "Gradient Brown","Gradient Grey","Gradient Blue",
-                            "Gradient Green","Gradient Pink",
-                            "Photochromic Brown","Photochromic Grey",
-                            "Solid Black","Solid Brown","Solid Grey",
-                            "Other (Manual)",
-                        ]
-                        _cur_colour = _lp.get("colour") or "None"
-                        if _cur_colour not in _COLOURS:
-                            _cur_colour = "Other (Manual)"
-                        _cur_fit   = bool(_lp.get("fitting_required"))
-                        _cur_ftype = _lp.get("fitting_type") or "Full Rim"
-                        _cur_inst  = _lp.get("instructions") or ""
-                        _cur_frame = _lp.get("frame_type") or "Full"
-                        _cur_thick = _lp.get("thickness") or "Regular"
-                        _cur_b64   = _lp.get("tint_sample_b64") or ""
-
-                        import json as _lpj2, base64 as _b64e
-
-                        _ea, _eb = st.columns(2)
-                        with _ea:
-                            _e_colour = st.selectbox(
-                                "🎨 Colour / Tint",
-                                options=_COLOURS,
-                                index=_COLOURS.index(_cur_colour),
-                                key=f"lpe_colour_{eye_label}_{idx}")
-                            if _e_colour == "Other (Manual)":
-                                _e_colour_manual = st.text_input(
-                                    "Colour description",
-                                    value=_lp.get("colour_manual") or "",
-                                    key=f"lpe_cmanual_{eye_label}_{idx}")
-                            else:
-                                _e_colour_manual = ""
-                        with _eb:
-                            _e_fit = st.checkbox(
-                                "🔧 Fitting Required",
-                                value=_cur_fit,
-                                key=f"lpe_fit_{eye_label}_{idx}")
-                            if _e_fit:
-                                _e_ftype = st.radio(
-                                    "Fitting Type",
-                                    ["Full Rim","Supra","Three Piece"],
-                                    index=["Full Rim","Supra","Three Piece"].index(
-                                        _cur_ftype if _cur_ftype in ["Full Rim","Supra","Three Piece"]
-                                        else "Full Rim"),
-                                    horizontal=True,
-                                    key=f"lpe_ftype_{eye_label}_{idx}")
-                            else:
-                                _e_ftype = ""
-
-                        _ef1, _ef2 = st.columns(2)
-                        with _ef1:
-                            _e_frame = st.radio(
-                                "Frame Type",
-                                ["Full","Rimless","Supra"],
-                                index=["Full","Rimless","Supra"].index(
-                                    _cur_frame if _cur_frame in ["Full","Rimless","Supra"] else "Full"),
-                                horizontal=True,
-                                key=f"lpe_frame_{eye_label}_{idx}")
-                        with _ef2:
-                            _e_thick = st.radio(
-                                "Thickness",
-                                ["Regular","Thin","Cartier Thick"],
-                                index=["Regular","Thin","Cartier Thick"].index(
-                                    _cur_thick if _cur_thick in ["Regular","Thin","Cartier Thick"] else "Regular"),
-                                horizontal=True,
-                                key=f"lpe_thick_{eye_label}_{idx}")
-
-                        _e_inst = st.text_area(
-                            "📝 Lab Instructions",
-                            value=_cur_inst,
-                            height=60,
-                            key=f"lpe_inst_{eye_label}_{idx}")
-
-                        # Tint sample
-                        _e_b64 = _cur_b64
-                        _up = st.file_uploader(
-                            "🖼 Tint Sample Photo",
-                            type=["jpg","jpeg","png","webp"],
-                            key=f"lpe_tint_{eye_label}_{idx}",
-                            help="Attach colour reference photo")
-                        if _up:
-                            _e_b64 = _b64e.b64encode(_up.read()).decode()
-                            st.image(_b64e.b64decode(_e_b64), width=120, caption="Preview")
-                        elif _cur_b64:
-                            try:
-                                st.image(_b64e.b64decode(_cur_b64), width=100, caption="Current sample")
-                            except Exception:
-                                st.caption("⚠️ Could not display current sample")
-
-                        if st.button("💾 Save Lens Params",
-                                     key=f"lpe_save_{eye_label}_{idx}",
-                                     type="primary",
-                                     width='stretch',
-                                     disabled=_lp_locked):
-                            _new_lp = {
-                                **_lp,
-                                "colour":          _e_colour if _e_colour != "Other (Manual)" else _e_colour_manual,
-                                "colour_manual":   _e_colour_manual,
-                                "fitting_required": _e_fit,
-                                "fitting_type":    _e_ftype,
-                                "frame_type":      _e_frame,
-                                "thickness":       _e_thick,
-                                "instructions":    _e_inst,
-                                "tint_sample_b64": _e_b64,
-                                "tinted":          _e_colour not in ("None", ""),
-                            }
-                            _line_id = str(line.get("id") or "")
-                            if _line_id:
-                                try:
-                                    from modules.sql_adapter import run_write as _rw_lp
-                                    _rw_lp(
-                                        "UPDATE order_lines SET lens_params=%(lp)s::jsonb "
-                                        "WHERE id=%(id)s::uuid",
-                                        {"lp": _lpj2.dumps(_new_lp), "id": _line_id}
-                                    )
-                                    line["lens_params"] = _new_lp
-                                    st.success("✅ Saved")
-                                    st.rerun()
-                                except Exception as _lpe_err:
-                                    st.error(f"Save failed: {_lpe_err}")
-                            else:
-                                st.warning("⚠️ Line ID missing — save order first")
-
-                    # ══ Remove Line (always available for unbilled lines) ══
-                    _line_id_str  = str(line.get("line_id") or line.get("id") or "")
-                    _billed_qty   = int(line.get("billed_qty") or 0)
-                    _alloc_qty    = int(line.get("allocated_qty") or 0)
-
-                    if _billed_qty == 0:
-                        _del_confirm_key = f"bo_del_confirm_{_line_id_str}"
-                        with st.expander("🗑️ Remove this line", expanded=False):
-                            if _billed_qty > 0:
-                                st.caption("🔒 Already billed — use Credit Note to correct")
-                            elif st.session_state.get(_del_confirm_key):
-                                st.warning(
-                                    f"Remove **{eye_label} — {line.get('product_name', '')}** "
-                                    f"from this order? This cannot be undone."
-                                )
-                                _dc1, _dc2 = st.columns(2)
-                                with _dc1:
-                                    if st.button(
-                                        "✅ Yes, Remove",
-                                        key=f"bo_del_yes_{_line_id_str}",
-                                        type="primary",
-                                        width='stretch',
-                                    ):
-                                        try:
-                                            from modules.sql_adapter import run_write as _rw_del, run_query as _rq_del
-                                            # Step 1: Fetch batch_allocation to reverse stock
-                                            _line_for_del = next(
-                                                (l for l in all_lines if str(l.get("line_id","") or l.get("id","")) == _line_id_str),
-                                                {}
-                                            )
-                                            _batch_alloc = _line_for_del.get("batch_allocation") or []
-                                            _lp_del = _line_for_del.get("lens_params") or {}
-                                            if isinstance(_lp_del, str):
-                                                import json as _jdel
-                                                try: _lp_del = _jdel.loads(_lp_del)
-                                                except: _lp_del = {}
-                                            if not _batch_alloc:
-                                                _batch_alloc = _lp_del.get("batch_allocation") or []
-
-                                            # Step 2: Atomic soft-delete — RETURNING ensures
-                                            # idempotency (double-click / retry safe)
-                                            _deleted_rows = _rq_del("""
-                                                UPDATE order_lines
-                                                SET is_deleted = TRUE,
-                                                    deleted_at = NOW(),
-                                                    deleted_by = 'backoffice_edit',
-                                                    stock_reversed = TRUE
-                                                WHERE id = %(lid)s::uuid
-                                                  AND COALESCE(billed_qty, 0) = 0
-                                                  AND COALESCE(is_deleted, FALSE) = FALSE
-                                                RETURNING id
-                                            """, {"lid": _line_id_str})
-
-                                            # Step 3: Only reverse stock if this delete
-                                            # actually fired (guards double-click / retry)
-                                            if _deleted_rows:
-                                                for _ba in _batch_alloc:
-                                                    _ba_pid  = str(_line_for_del.get("product_id") or "")
-                                                    _ba_bno  = str(_ba.get("batch_no") or "")
-                                                    _ba_qty  = int(_ba.get("allocated_qty") or _ba.get("qty") or 0)
-                                                    if _ba_pid and _ba_qty > 0:
-                                                        try:
-                                                            # Per stock flow doc: delete = release SOFT reservation only
-                                                            # allocated_qty ↓ — NOT quantity (that only changes at dispatch)
-                                                            _rw_del("""
-                                                                UPDATE inventory_stock
-                                                                SET allocated_qty = GREATEST(0, COALESCE(allocated_qty, 0) - %(qty)s)
-                                                                WHERE product_id = %(pid)s::uuid
-                                                                  AND (%(bno)s = '' OR batch_no = %(bno)s)
-                                                                LIMIT 1
-                                                            """, {"pid": _ba_pid, "bno": _ba_bno, "qty": _ba_qty})
-                                                        except Exception:
-                                                            pass
-
-                                            # Audit log the deletion
-                                            try:
-                                                from modules.backoffice.audit_logger import audit, AuditAction
-                                                from modules.security.roles import current_user as _cu
-                                                _del_user = (_cu() or {}).get("name","backoffice")
-                                                audit(
-                                                    AuditAction.PRODUCT_CHANGED,
-                                                    entity    = "order_lines",
-                                                    entity_id = _line_id_str,
-                                                    order_id  = str(order.get("id","")),
-                                                    user_id   = _del_user,
-                                                    payload   = {
-                                                        "action":       "line_deleted",
-                                                        "product":      line.get("product_name",""),
-                                                        "eye_side":     eye_label,
-                                                        "qty_restored": sum(
-                                                            int(_ba.get("allocated_qty") or 0)
-                                                            for _ba in (_line_for_del.get("batch_allocation") or [])
-                                                        ),
-                                                    }
-                                                )
-                                            except Exception:
-                                                pass
-
-                                            st.session_state.pop(_del_confirm_key, None)
-                                            st.success(f"✅ {eye_label} line removed — stock restored")
-                                            st.rerun()
-                                        except Exception as _del_err:
-                                            st.error(f"Delete failed: {_del_err}")
-                                with _dc2:
-                                    if st.button(
-                                        "← Cancel",
-                                        key=f"bo_del_no_{_line_id_str}",
-                                        width='stretch',
-                                    ):
-                                        st.session_state.pop(_del_confirm_key, None)
-                                        st.rerun()
-                            else:
-                                _is_last_unbilled = (
-                                    sum(
-                                        1 for _al in all_lines
-                                        if not _al.get("is_deleted")
-                                        and int(_al.get("billed_qty") or 0) == 0
-                                    ) <= 1
-                                )
-                                if _is_last_unbilled:
-                                    st.warning("⚠️ Last unbilled line — order will be empty after removal")
-                                if st.button(
-                                    "🗑️ Remove Line",
-                                    key=f"bo_del_btn_{_line_id_str}",
-                                    width='stretch',
-                                    help="Remove this line (unbilled only)",
-                                ):
-                                    st.session_state[_del_confirm_key] = True
-                                    st.rerun()
-
-                    # ══ JSON debug ════════════════════════════════════
-                    with st.expander("🔍 Raw JSON", expanded=False):
-                        st.json({
-                            "line_id":       str(line.get("id") or ""),
-                            "eye_side":      line.get("eye_side"),
-                            "sph":           line.get("sph"),
-                            "cyl":           None if (isinstance(line.get("cyl"), float) and _math.isnan(line.get("cyl") or 0)) else line.get("cyl"),
-                            "axis":          line.get("axis"),
-                            "add":           line.get("add_power"),
-                            "qty":           line.get("billing_qty"),
-                            "alloc_qty":     line.get("allocated_qty"),
-                            "unit_price":    line.get("unit_price"),
-                            "route":         line.get("manufacturing_route"),
-                            "lens_params":   _lp,
-                            "boxing_params": line.get("boxing_params") or {},
-                        })
-
-            # ── Render R and L using the shared helper ───────────────
-            if has_right:
-                with col_r:
-                    try:
-                        _render_eye_block_ui(group['R'], group['R_idx'], 'R')
-                    except Exception as _re:
-                        import traceback
-                        st.error(f"R Eye render error: {_re}")
-                        st.code(traceback.format_exc())
-
-            if has_left:
-                with col_l:
-                    try:
-                        _render_eye_block_ui(group['L'], group['L_idx'], 'L')
-                    except Exception as _le:
-                        import traceback
-                        st.error(f"L Eye render error: {_le}")
-                        st.code(traceback.format_exc())
-        
-        # ══════════════════════════════════════════════════════
-        # ORDER-LEVEL SERVICE CHARGES (Fitting / Colouring / Courier)
-        # One panel per order — not per eye
-        # ══════════════════════════════════════════════════════
-        _FITTING_PRICES = {
-            "Full Rim SV":              30,
-            "Full Rim V2":              70,
-            "Full Rim Poly":            60,
-            "Full Rim High Index":     100,
-            "Supra SV":                 60,
-            "Supra V2":                100,
-            "Supra Poly":              120,
-            "Supra High Index":        150,
-            "Rimless SV / Poly":       100,
-            "Rimless V2":              140,
-            "Rimless V2 High Index":   180,
-            "Custom / Manual":           0,
-        }
-        _COLOURING_PRICES = {
-            "Solid Tint":              100,
-            "Gradient Tint":           120,
-            "Custom / Manual":           0,
-        }
-
-        _oid_sv = str(order.get("id") or "")
-        _ckey_sv = f"svc_charges_{_oid_sv}"
-        if _ckey_sv not in st.session_state:
-            try:
-                from modules.backoffice.order_charges_panel import fetch_charges
-                st.session_state[_ckey_sv] = fetch_charges(_oid_sv)
-            except Exception:
-                st.session_state[_ckey_sv] = []
-        _oc_sv   = st.session_state.get(_ckey_sv, [])
-        _ctot_sv = sum(float(x.get("total_amount") or 0) for x in _oc_sv)
-        _fc_fit  = next((x for x in _oc_sv if x["charge_type"] == "FITTING"),   None)
-        _fc_col  = next((x for x in _oc_sv if x["charge_type"] == "COLOURING"), None)
-        _fc_cour = next((x for x in _oc_sv if x["charge_type"] == "COURIER"),   None)
-
-        # Collect fitting/colour hints from any line
-        _any_fit_req = any(
-            bool((l.get("lens_params") or {}).get("fitting_required"))
-            for l in all_lines)
-        _any_colours = list({
-            str((l.get("lens_params") or {}).get("colour") or "").strip()
-            for l in all_lines
-            if str((l.get("lens_params") or {}).get("colour") or "").strip().lower()
-               not in ("", "none", "no")
-        })
-
-        _svc_pending = bool((_any_fit_req and not _fc_fit) or (_any_colours and not _fc_col))
-        _svc_lbl = (
-            f"💰 Service Charges  ✅  ₹{_ctot_sv:,.0f}" if _ctot_sv > 0 else
-            "💰 Service Charges  ⚠️ pricing required"    if _svc_pending else
-            "💰 Service Charges"
-        )
-
-        with st.expander(_svc_lbl, expanded=bool(_svc_pending and _ctot_sv == 0)):
-
-            # ── Fitting row ─────────────────────────────────────────
-            st.markdown(
-                "<div style='background:#0f172a;border:1px solid #334155;"
-                "border-radius:8px;padding:10px 14px;margin-bottom:8px'>",
-                unsafe_allow_html=True)
-            _fh1, _fh2 = st.columns([0.4, 3.6])
-            with _fh1:
-                st.markdown("<div style='font-size:1.5rem;text-align:center;padding-top:6px'>🔧</div>",
-                            unsafe_allow_html=True)
-            with _fh2:
-                if _fc_fit:
-                    _fb = float(_fc_fit.get("amount") or 0)
-                    _ft = float(_fc_fit.get("total_amount") or 0)
-                    _fg = float(_fc_fit.get("gst_percent") or 0)
-                    _fd = _fc_fit.get("description") or "Fitting"
-                    _fc1sv, _fc2sv = st.columns([3, 1])
-                    with _fc1sv:
-                        st.markdown(
-                            f"<div style='color:#c4b5fd;font-weight:700'>{_fd}</div>"
-                            f"<div style='color:#64748b;font-size:0.72rem'>"
-                            f"₹{_fb:,.0f} + {_fg:.0f}% GST = "
-                            f"<span style='color:#10b981;font-weight:700'>₹{_ft:,.0f}</span></div>",
-                            unsafe_allow_html=True)
-                    with _fc2sv:
-                        if st.button("🗑 Remove", key=f"del_fit_{_oid_sv}",
-                                     width='stretch'):
-                            try:
-                                from modules.backoffice.order_charges_panel import delete_charge
-                                delete_charge(str(_fc_fit["id"]))
-                            except Exception: pass
-                            st.session_state.pop(_ckey_sv, None); st.rerun()
-                else:
-                    _fit_form_key = f"fit_form_{_oid_sv}"
-                    if not st.session_state.get(_fit_form_key):
-                        _hint = ""
-                        if _any_fit_req:
-                            _lp0 = (all_lines[0].get("lens_params") or {}) if all_lines else {}
-                            _ft0 = _lp0.get("fitting_type") or ""
-                            _hint = f"Fitting required · {_ft0}" if _ft0 else "Fitting required"
-                        if _hint:
-                            st.markdown(f"<div style='color:#a78bfa;font-size:0.72rem;margin-bottom:4px'>{_hint}</div>",
-                                        unsafe_allow_html=True)
-                        if st.button("＋ Add Fitting Charge", key=f"open_fit_{_oid_sv}",
-                                     width='stretch'):
-                            st.session_state[_fit_form_key] = True; st.rerun()
-                    else:
-                        _fit_options = list(_FITTING_PRICES.keys())
-                        def _on_fit_sel_change():
-                            _sel = st.session_state.get(f"fit_sel_{_oid_sv}")
-                            _p   = _FITTING_PRICES.get(_sel, 0)
-                            st.session_state[f"fit_amt_{_oid_sv}"] = float(_p)
-
-                        _fit_sel = st.selectbox("Fitting Type", _fit_options,
-                                                key=f"fit_sel_{_oid_sv}",
-                                                on_change=_on_fit_sel_change)
-                        _fit_preset = _FITTING_PRICES[_fit_sel]
-                        # Seed amount in session_state if not yet set
-                        if f"fit_amt_{_oid_sv}" not in st.session_state:
-                            st.session_state[f"fit_amt_{_oid_sv}"] = float(_fit_preset)
-                        _ff1, _ff2, _ff3 = st.columns([2, 1, 1])
-                        with _ff1:
-                            _fit_amt = st.number_input(
-                                "Amount ₹", min_value=0.0, step=5.0,
-                                key=f"fit_amt_{_oid_sv}",
-                                help="Pre-filled from price master — edit if needed")
-                        with _ff2:
-                            _fit_gst = st.number_input("GST %", min_value=0.0,
-                                                        max_value=28.0, value=18.0,
-                                                        step=0.5, key=f"fit_gst_{_oid_sv}")
-                        with _ff3:
-                            if _fit_amt > 0:
-                                _fit_tot = _fit_amt + round(_fit_amt * _fit_gst / 100, 2)
-                                st.markdown(
-                                    f"<div style='color:#10b981;font-size:0.75rem;padding-top:28px'>"
-                                    f"Total: ₹{_fit_tot:,.0f}</div>",
-                                    unsafe_allow_html=True)
-                        _fs1, _fs2 = st.columns(2)
-                        with _fs1:
-                            if st.button("✅ Save Fitting", type="primary",
-                                         key=f"fit_save_{_oid_sv}", width='stretch'):
-                                if _fit_amt > 0:
-                                    try:
-                                        from modules.backoffice.order_charges_panel import save_charge
-                                        save_charge(_oid_sv, "FITTING",
-                                                    f"Fitting · {_fit_sel}",
-                                                    _fit_amt, _fit_gst, "", "",
-                                                    st.session_state.get("user_name","System"))
-                                    except Exception as _e: st.error(str(_e))
-                                    st.session_state.pop(_fit_form_key, None)
-                                    st.session_state.pop(_ckey_sv, None); st.rerun()
-                                else: st.error("Enter amount > 0")
-                        with _fs2:
-                            if st.button("✕ Cancel", key=f"fit_cancel_{_oid_sv}",
-                                         width='stretch'):
-                                st.session_state.pop(_fit_form_key, None); st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            # ── Colouring row ───────────────────────────────────────
-            st.markdown(
-                "<div style='background:#0f172a;border:1px solid #334155;"
-                "border-radius:8px;padding:10px 14px;margin-bottom:8px'>",
-                unsafe_allow_html=True)
-            _ch1, _ch2 = st.columns([0.4, 3.6])
-            with _ch1:
-                st.markdown("<div style='font-size:1.5rem;text-align:center;padding-top:6px'>🎨</div>",
-                            unsafe_allow_html=True)
-            with _ch2:
-                if _fc_col:
-                    _cb = float(_fc_col.get("amount") or 0)
-                    _ct2= float(_fc_col.get("total_amount") or 0)
-                    _cg = float(_fc_col.get("gst_percent") or 0)
-                    _cd = _fc_col.get("description") or "Colouring"
-                    _cc1sv, _cc2sv = st.columns([3, 1])
-                    with _cc1sv:
-                        st.markdown(
-                            f"<div style='color:#f9a8d4;font-weight:700'>{_cd}</div>"
-                            f"<div style='color:#64748b;font-size:0.72rem'>"
-                            f"₹{_cb:,.0f} + {_cg:.0f}% GST = "
-                            f"<span style='color:#10b981;font-weight:700'>₹{_ct2:,.0f}</span></div>",
-                            unsafe_allow_html=True)
-                    with _cc2sv:
-                        if st.button("🗑 Remove", key=f"del_col_{_oid_sv}",
-                                     width='stretch'):
-                            try:
-                                from modules.backoffice.order_charges_panel import delete_charge
-                                delete_charge(str(_fc_col["id"]))
-                            except Exception: pass
-                            st.session_state.pop(_ckey_sv, None); st.rerun()
-                else:
-                    _col_form_key = f"col_form_{_oid_sv}"
-                    if not st.session_state.get(_col_form_key):
-                        if _any_colours:
-                            _col_hint = "  ·  ".join(_any_colours)
-                            st.markdown(
-                                f"<div style='color:#f9a8d4;font-size:0.72rem;margin-bottom:4px'>"
-                                f"🎨 {_col_hint}</div>", unsafe_allow_html=True)
-                        if st.button("＋ Add Colouring Charge", key=f"open_col_{_oid_sv}",
-                                     width='stretch'):
-                            st.session_state[_col_form_key] = True; st.rerun()
-                    else:
-                        _col_options = list(_COLOURING_PRICES.keys())
-                        def _on_col_sel_change():
-                            _sel = st.session_state.get(f"col_sel_{_oid_sv}")
-                            _p   = _COLOURING_PRICES.get(_sel, 0)
-                            st.session_state[f"col_amt_{_oid_sv}"] = float(_p)
-
-                        _col_sel = st.selectbox("Colouring Type", _col_options,
-                                                key=f"col_sel_{_oid_sv}",
-                                                on_change=_on_col_sel_change)
-                        _col_preset = _COLOURING_PRICES[_col_sel]
-                        # Seed amount in session_state if not yet set
-                        if f"col_amt_{_oid_sv}" not in st.session_state:
-                            st.session_state[f"col_amt_{_oid_sv}"] = float(_col_preset)
-                        # Show colour from lens_params as info
-                        if _any_colours:
-                            st.markdown(
-                                f"<div style='color:#f9a8d4;font-size:0.72rem;margin-bottom:4px'>"
-                                f"Colour ordered: {' · '.join(_any_colours)}</div>",
-                                unsafe_allow_html=True)
-                        _cf1, _cf2, _cf3 = st.columns([2, 1, 1])
-                        with _cf1:
-                            _col_amt = st.number_input(
-                                "Amount ₹", min_value=0.0, step=5.0,
-                                key=f"col_amt_{_oid_sv}",
-                                help="Pre-filled from price master — edit if needed")
-                        with _cf2:
-                            _col_gst = st.number_input("GST %", min_value=0.0,
-                                                        max_value=28.0, value=18.0,
-                                                        step=0.5, key=f"col_gst_{_oid_sv}")
-                        with _cf3:
-                            if _col_amt > 0:
-                                _col_tot = _col_amt + round(_col_amt * _col_gst / 100, 2)
-                                st.markdown(
-                                    f"<div style='color:#10b981;font-size:0.75rem;padding-top:28px'>"
-                                    f"Total: ₹{_col_tot:,.0f}</div>",
-                                    unsafe_allow_html=True)
-                        _cs1, _cs2 = st.columns(2)
-                        with _cs1:
-                            if st.button("✅ Save Colouring", type="primary",
-                                         key=f"col_save_{_oid_sv}", width='stretch'):
-                                if _col_amt > 0:
-                                    _col_desc = f"Colouring · {_col_sel}"
-                                    if _any_colours:
-                                        _col_desc += f" ({', '.join(_any_colours)})"
-                                    try:
-                                        from modules.backoffice.order_charges_panel import save_charge
-                                        save_charge(_oid_sv, "COLOURING", _col_desc,
-                                                    _col_amt, _col_gst, "", "",
-                                                    st.session_state.get("user_name","System"))
-                                    except Exception as _e: st.error(str(_e))
-                                    st.session_state.pop(_col_form_key, None)
-                                    st.session_state.pop(_ckey_sv, None); st.rerun()
-                                else: st.error("Enter amount > 0")
-                        with _cs2:
-                            if st.button("✕ Cancel", key=f"col_cancel_{_oid_sv}",
-                                         width='stretch'):
-                                st.session_state.pop(_col_form_key, None); st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            # ── Courier row ─────────────────────────────────────────
-            st.markdown(
-                "<div style='background:#0f172a;border:1px solid #334155;"
-                "border-radius:8px;padding:10px 14px'>",
-                unsafe_allow_html=True)
-            _kr1, _kr2 = st.columns([0.4, 3.6])
-            with _kr1:
-                st.markdown("<div style='font-size:1.5rem;text-align:center;padding-top:6px'>📦</div>",
-                            unsafe_allow_html=True)
-            with _kr2:
-                if _fc_cour:
-                    _kb  = float(_fc_cour.get("amount") or 0)
-                    _kt  = float(_fc_cour.get("total_amount") or 0)
-                    _kg  = float(_fc_cour.get("gst_percent") or 0)
-                    _kcc = _fc_cour.get("courier_company") or ""
-                    _ktn = _fc_cour.get("tracking_no") or ""
-                    _kc1, _kc2 = st.columns([3, 1])
-                    with _kc1:
-                        st.markdown(
-                            f"<div style='color:#7dd3fc;font-weight:700'>"
-                            f"📦 {_kcc}" + (f" · {_ktn}" if _ktn else "") + "</div>"
-                            f"<div style='color:#64748b;font-size:0.72rem'>"
-                            f"₹{_kb:,.0f} + {_kg:.0f}% GST = "
-                            f"<span style='color:#10b981;font-weight:700'>₹{_kt:,.0f}</span></div>",
-                            unsafe_allow_html=True)
-                    with _kc2:
-                        if st.button("🗑 Remove", key=f"del_cour_{_oid_sv}",
-                                     width='stretch'):
-                            try:
-                                from modules.backoffice.order_charges_panel import delete_charge
-                                delete_charge(str(_fc_cour["id"]))
-                            except Exception: pass
-                            st.session_state.pop(_ckey_sv, None); st.rerun()
-                else:
-                    _COURIER_PRICES = {
-                        "₹40  — Local":    40,
-                        "₹60  — Standard": 60,
-                        "₹80  — Express":  80,
-                        "₹100 — Priority": 100,
-                        "₹150 — Urgent":   150,
-                        "Custom / Manual":   0,
-                    }
-                    _cour_form_key = f"cour_form_{_oid_sv}"
-                    if not st.session_state.get(_cour_form_key):
-                        if st.button("＋ Add Courier Charges", key=f"open_cour_{_oid_sv}",
-                                     width='stretch'):
-                            st.session_state[_cour_form_key] = True; st.rerun()
-                    else:
-                        _kf1, _kf2 = st.columns(2)
-                        with _kf1:
-                            try:
-                                from modules.backoffice.order_charges_panel import fetch_courier_companies
-                                _clist = fetch_courier_companies()
-                            except Exception:
-                                _clist = ["Blue Dart","DTDC","Delhivery","Ekart","Other"]
-                            _k_cc = st.selectbox("Courier Company", _clist, key=f"cour_cc_{_oid_sv}")
-                        with _kf2:
-                            _k_tn = st.text_input("Tracking No.", placeholder="AWB / docket no.",
-                                                   key=f"cour_tn_{_oid_sv}")
-
-                        def _on_cour_sel_change():
-                            _sel = st.session_state.get(f"cour_sel_{_oid_sv}")
-                            _p   = _COURIER_PRICES.get(_sel, 0)
-                            st.session_state[f"cour_amt_{_oid_sv}"] = float(_p)
-
-                        _cour_sel = st.selectbox("Charge Slab", list(_COURIER_PRICES.keys()),
-                                                  key=f"cour_sel_{_oid_sv}",
-                                                  on_change=_on_cour_sel_change)
-                        if f"cour_amt_{_oid_sv}" not in st.session_state:
-                            st.session_state[f"cour_amt_{_oid_sv}"] = float(_COURIER_PRICES[_cour_sel])
-
-                        _kf3, _kf4, _kf5 = st.columns([2, 1, 1])
-                        with _kf3:
-                            _k_amt = st.number_input("Courier Charges ₹", min_value=0.0,
-                                                      step=10.0, key=f"cour_amt_{_oid_sv}")
-                        with _kf4:
-                            _k_gst = st.number_input("GST %", min_value=0.0, max_value=28.0,
-                                                      value=18.0, step=0.5, key=f"cour_gst_{_oid_sv}")
-                        with _kf5:
-                            if _k_amt > 0:
-                                _k_tot = _k_amt + round(_k_amt * _k_gst / 100, 2)
-                                st.markdown(
-                                    f"<div style='color:#10b981;font-size:0.75rem;padding-top:28px'>"
-                                    f"Total: ₹{_k_tot:,.0f}</div>", unsafe_allow_html=True)
-                        _ks1, _ks2 = st.columns(2)
-                        with _ks1:
-                            if st.button("✅ Save Courier", type="primary",
-                                         key=f"cour_save_{_oid_sv}", width='stretch'):
-                                if _k_amt > 0:
-                                    try:
-                                        from modules.backoffice.order_charges_panel import save_charge
-                                        save_charge(_oid_sv, "COURIER",
-                                                    f"Courier · {_k_cc}",
-                                                    _k_amt, _k_gst, _k_cc, _k_tn,
-                                                    st.session_state.get("user_name","System"))
-                                    except Exception as _e: st.error(str(_e))
-                                    st.session_state.pop(_cour_form_key, None)
-                                    st.session_state.pop(_ckey_sv, None); st.rerun()
-                                else: st.error("Enter amount > 0")
-                        with _ks2:
-                            if st.button("✕ Cancel", key=f"cour_cancel_{_oid_sv}",
-                                         width='stretch'):
-                                st.session_state.pop(_cour_form_key, None); st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            # ── Charges total ────────────────────────────────────────
-            if _ctot_sv > 0:
-                st.markdown(
-                    f"<div style='background:#0d1f0d;border:1px solid #10b98144;"
-                    f"border-radius:8px;padding:10px 16px;margin-top:4px;"
-                    f"display:flex;justify-content:space-between;align-items:center'>"
-                    f"<span style='color:#64748b;font-size:0.78rem'>Total Service Charges (excl. GST)</span>"
-                    f"<span style='color:#10b981;font-weight:800;font-size:1.1rem'>"
-                    f"₹{_ctot_sv:,.2f}</span></div>",
-                    unsafe_allow_html=True)
-
-        #  RENDER ALLOCATION WINDOW IF ACTIVE
-        if st.session_state.get('bo_show_allocation_window', False):
-            line_idx = st.session_state.get('bo_allocation_line_idx')
-            
-            if line_idx is not None and line_idx < len(all_lines):
-                line = all_lines[line_idx]
-                render_allocation_window(line, line_idx, order)
-
-        # ========== FINAL SAVE TO ORDER ==========
-        st.markdown("---")
-        st.markdown("###  Order Summary")
-
-        if st.button(" System Health Check", width='stretch'):
-
-            issues = run_system_health_check(order)
-
-            if not issues:
-                st.success(" System OK. No issues found.")
-            else:
-                st.error(" Issues Found:")
-                for i in issues:
-                    st.write("", i)
-        
-        # Calculate order totals with R/L breakdown
-        total_items = len(all_lines)
-        
-        # Use live _calc_line_display_total[2] — correct inclusive/exclusive total
-        r_billing  = round(sum(_calc_line_display_total(l)[2] for l in r_lines), 2)
-        r_discount = sum(float(line.get('discount_amount', 0) or 0) for line in r_lines)
-        
-        l_billing  = round(sum(_calc_line_display_total(l)[2] for l in l_lines), 2)
-        l_discount = sum(float(line.get('discount_amount', 0) or 0) for line in l_lines)
-        
-        other_billing  = round(sum(_calc_line_display_total(l)[2] for l in other_lines), 2)
-        other_discount = sum(float(line.get('discount_amount', 0) or 0) for line in other_lines)
-        
-        # Grand totals
-        # Live billing total — same computation as footer and line display
-        total_billing  = sum(_calc_line_display_total(l)[2] for l in all_lines)
-        total_discount = r_discount + l_discount + other_discount
-        
-        # Summary metrics row
-        col_total1, col_total2, col_total3 = st.columns(3)
-        with col_total1:
-            st.metric("Total Items", total_items)
-        with col_total2:
-            st.metric("Total Discount", f"{total_discount:.2f}")
-        with col_total3:
-            st.metric("**Final Amount**", f"**{total_billing:.2f}**")
-        
-        # Detailed R/L Breakdown - Compact View
-        st.markdown("---")
-        
-        # Right Eye Block
-        with st.container(border=True):
-            st.markdown("####  Right Eye")
-            st.caption(f"{len(r_lines)} items | Subtotal: {r_billing:.2f}")
-            
-            if r_lines:
-                # Header row
-                hcols = st.columns([3, 2, 1, 1, 1, 1, 1])
-                hcols[0].caption("Product")
-                hcols[1].caption("Qty (Box+PCS)")
-                hcols[2].caption("Unit Price")
-                hcols[3].caption("Discount")
-                hcols[4].caption("GST%")
-                hcols[5].caption("GST Amt")
-                hcols[6].caption("Total")
-                st.markdown("<hr style='margin:2px 0 6px 0'>", unsafe_allow_html=True)
-                for idx, line in enumerate(r_lines, 1):
-                    # ── Box + PCS breakdown ──
-                    qty        = int(line.get('billing_qty', 0) or 0)
-                    box_size   = int(line.get('box_size') or 1)
-                    unit       = str(line.get('unit') or 'PCS').upper()
-                    if unit == 'BOX' and box_size > 1:
-                        boxes    = qty // box_size
-                        pcs_rem  = qty % box_size
-                        qty_disp = f"{boxes}B" + (f"+{pcs_rem}P" if pcs_rem else "") + f" ({qty}pcs)"
-                    else:
-                        qty_disp = f"{qty} PCS"
-                    # ── GST fields ──
-                    gst_pct     = float(line.get('gst_percent_used') or line.get('gst_percent') or 0)
-                    gst_amt     = float(line.get('gst_amount') or 0)
-                    tax_inc     = line.get('tax_inclusive', True)
-                    gst_label   = f"{gst_pct:.0f}%" + (" (incl)" if tax_inc else " (+)") if gst_pct else "⚠️ Not set"
-                    disc_pct    = float(line.get('discount_percent') or 0)
-                    unit_price  = float(line.get('unit_price') or 0)
-                    _, _gst_d, total = _calc_line_display_total(line)
-                    lcols = st.columns([3, 2, 1, 1, 1, 1, 1])
-                    lcols[0].write(f"{idx}. {line.get('product_name', 'N/A')}")
-                    lcols[1].write(qty_disp)
-                    lcols[2].write(f"₹{unit_price:,.2f}")
-                    lcols[3].write(f"{disc_pct:.1f}%" if disc_pct else "—")
-                    lcols[4].write(gst_label)
-                    lcols[5].write(f"₹{_gst_d:,.2f}" if _gst_d else ("⚠️" if gst_pct else "—"))
-                    lcols[6].write(f"₹{total:,.2f}")
-            else:
-                st.caption("No Right Eye items")
-        
-        # Left Eye Block
-        with st.container(border=True):
-            st.markdown("####  Left Eye")
-            st.caption(f"{len(l_lines)} items | Subtotal: {l_billing:.2f}")
-            
-            if l_lines:
-                # Header row
-                hcols = st.columns([3, 2, 1, 1, 1, 1, 1])
-                hcols[0].caption("Product")
-                hcols[1].caption("Qty (Box+PCS)")
-                hcols[2].caption("Unit Price")
-                hcols[3].caption("Discount")
-                hcols[4].caption("GST%")
-                hcols[5].caption("GST Amt")
-                hcols[6].caption("Total")
-                st.markdown("<hr style='margin:2px 0 6px 0'>", unsafe_allow_html=True)
-                for idx, line in enumerate(l_lines, 1):
-                    qty        = int(line.get('billing_qty', 0) or 0)
-                    box_size   = int(line.get('box_size') or 1)
-                    unit       = str(line.get('unit') or 'PCS').upper()
-                    if unit == 'BOX' and box_size > 1:
-                        boxes    = qty // box_size
-                        pcs_rem  = qty % box_size
-                        qty_disp = f"{boxes}B" + (f"+{pcs_rem}P" if pcs_rem else "") + f" ({qty}pcs)"
-                    else:
-                        qty_disp = f"{qty} PCS"
-                    gst_pct     = float(line.get('gst_percent_used') or line.get('gst_percent') or 0)
-                    gst_amt     = float(line.get('gst_amount') or 0)
-                    tax_inc     = line.get('tax_inclusive', True)
-                    gst_label   = f"{gst_pct:.0f}%" + (" (incl)" if tax_inc else " (+)") if gst_pct else "⚠️ Not set"
-                    disc_pct    = float(line.get('discount_percent') or 0)
-                    unit_price  = float(line.get('unit_price') or 0)
-                    _, _gst_d, total = _calc_line_display_total(line)
-                    lcols = st.columns([3, 2, 1, 1, 1, 1, 1])
-                    lcols[0].write(f"{idx}. {line.get('product_name', 'N/A')}")
-                    lcols[1].write(qty_disp)
-                    lcols[2].write(f"₹{unit_price:,.2f}")
-                    lcols[3].write(f"{disc_pct:.1f}%" if disc_pct else "—")
-                    lcols[4].write(gst_label)
-                    lcols[5].write(f"₹{_gst_d:,.2f}" if _gst_d else ("⚠️" if gst_pct else "—"))
-                    lcols[6].write(f"₹{total:,.2f}")
-            else:
-                st.caption("No Left Eye items")
-        
-        # Other Items Section - Compact (if any)
-        # ═══════════════════════════════════════════════════════
-        # 🖼 FRAMES & OTHER ITEMS — unified card panel
-        # Same card design as R/L lens cards.
-        # Each card: product info + attributes + allotment + edit
-        # ═══════════════════════════════════════════════════════
-        if other_lines:
-            st.markdown(
-                "<div style='background:#0a1628;border-left:4px solid #8b5cf6;"
-                "color:#c4b5fd;padding:8px 14px;border-radius:8px;"
-                "font-weight:700;font-size:0.95rem;margin-bottom:8px'>"
-                "🖼 FRAMES & OTHER ITEMS</div>",
-                unsafe_allow_html=True,
-            )
-
-            for _oi, line in enumerate(other_lines):
-                _oid_o  = str(order.get("id") or "")
-                _lid_o  = str(line.get("line_id") or line.get("id") or f"o{_oi}")
-                _pname  = str(line.get("product_name") or "—")
-                _brand  = str(line.get("brand") or "")
-                _mg     = str(line.get("main_group") or "")
-                _qty    = int(line.get("billing_qty") or 0)
-                _uprice = float(line.get("unit_price") or 0)
-                _billed = int(line.get("billed_qty") or 0)
-                _lp_o   = line.get("lens_params") or {}
-                if isinstance(_lp_o, str):
-                    import json as _jlo; 
-                    try: _lp_o = _jlo.loads(_lp_o)
-                    except: _lp_o = {}
-                _colour = str(_lp_o.get("colour_mix") or line.get("colour_mix") or "").strip()
-                _group  = str(_lp_o.get("frame_group") or line.get("frame_group") or "").strip()
-                _sku    = str(_lp_o.get("batch_no") or line.get("batch_no") or "").strip()
-                _alloc_qty = int(line.get("allocated_qty") or 0)
-                # Route resolution priority:
-                #   1. bo_assignments session state (operator confirmed)
-                #   2. manufacturing_route on line dict (loaded from DB / set by save)
-                #   3. If batch_no/SKU set → STOCK (frame was picked from inventory)
-                #   4. Otherwise → VENDOR (needs to be ordered)
-                _lk_o   = f"{line.get('product_id','unk')}_{line.get('eye_side','B')}_{_oi}"
-                _asgn_o = st.session_state.get("bo_assignments", {}).get(_lk_o, {})
-                _route_raw = (
-                    _asgn_o.get("route")
-                    or line.get("manufacturing_route")
-                    or ("STOCK" if _sku else "VENDOR")
-                )
-                _route  = str(_route_raw).upper()
-                _sub_d, _gst_a, _total = _calc_line_display_total(line)
-                _gst_pct = float(line.get("gst_percent_used") or line.get("gst_percent") or 0)
-                _tax_inc = line.get("tax_inclusive", True)
-                _frozen_o = _any_frozen or _billing_frozen
-                _is_frm = ("frame" in _mg.lower() or "sunglass" in _mg.lower()
-                           or (str(line.get("eye_side","")).upper() == "OTHER" and _sku))
-                _prod_id_o = str(line.get("product_id") or "")
-
-                with st.container(border=True):
-
-                    # ══ ROW 1: Product info + Route/Stock status (2 cols) ══════
-                    _r1a, _r1b = st.columns([3, 2])
-
-                    with _r1a:
-                        # Line 1: product name + brand + group
-                        _base_name = _pname.split(" | ")[0]
-                        st.markdown(
-                            f"<div style='background:#0f172a;border:1px solid #1e293b;"
-                            f"border-radius:8px;padding:10px 14px'>"
-                            f"<div style='color:#a78bfa;font-weight:700;font-size:0.88rem'>"
-                            f"{_base_name}</div>"
-                            f"<div style='color:#475569;font-size:0.7rem;margin-top:3px'>"
-                            f"{_brand + ' · ' if _brand else ''}{_mg} · {line.get('unit','PCS')}"
-                            f"</div></div>",
-                            unsafe_allow_html=True
-                        )
-
-                    with _r1b:
-                        # Route status badge — reflects actual manufacturing_route
-                        # STOCK: fully allocated from inventory → show green
-                        # VENDOR: going to supplier → show amber, no allotment count
-                        # PARTIAL: some from stock, rest from vendor → show orange
-                        # Frame is "from stock" if:
-                        #   a) route is STOCK AND fully allocated (normal lens path), OR
-                        #   b) route is STOCK AND batch_no is set (frame picked from inventory —
-                        #      allocated_qty starts at 0 until save writes it to DB)
-                        _is_fully_allocated = (
-                            _route == "STOCK"
-                            and (_alloc_qty >= _qty or bool(_sku))
-                        )
-                        _is_vendor = _route in ("VENDOR", "PENDING")
-                        if _is_fully_allocated:
-                            _badge_bg    = "#0f2a1a"; _badge_bdr = "#22c55e"
-                            _badge_color = "#86efac"
-                            _badge_icon  = "📦"; _badge_label = "From Stock"
-                            if _alloc_qty >= _qty:
-                                _badge_sub = f"Allotted: {_alloc_qty}/{_qty} pcs" + (f" · SKU: <code>{_sku}</code>" if _sku else "")
-                            else:
-                                # batch_no set but not yet written to DB — will be committed on Save
-                                _badge_sub = (f"SKU: <code>{_sku}</code> · " if _sku else "") + "Pending save"
-                        elif _is_vendor:
-                            _badge_bg    = "#1a1000"; _badge_bdr = "#f59e0b"
-                            _badge_color = "#fcd34d"
-                            _badge_icon  = "🏭"; _badge_label = "Via Supplier"
-                            _supp_name   = str(line.get("supplier_name") or "")
-                            _badge_sub   = _supp_name if _supp_name else "Assign supplier below"
-                        else:
-                            _badge_bg    = "#1a0f00"; _badge_bdr = "#f97316"
-                            _badge_color = "#fb923c"
-                            _badge_icon  = "📦"; _badge_label = _route.replace("_"," ").title()
-                            _badge_sub   = f"Allotted: {_alloc_qty}/{_qty} pcs"
-                        st.markdown(
-                            f"<div style='background:{_badge_bg};border:1px solid {_badge_bdr};"
-                            f"border-radius:8px;padding:10px 14px'>"
-                            f"<div style='color:{_badge_color};font-weight:700;font-size:0.8rem'>"
-                            f"{_badge_icon} {_badge_label}</div>"
-                            f"<div style='color:{_badge_color};font-size:0.72rem;margin-top:3px'>"
-                            f"{_badge_sub}</div></div>",
-                            unsafe_allow_html=True
-                        )
-
-                    # ══ ROW 2: Attribute badges (1 line) ════════════════════
-                    _attr_badges = []
-                    if _sku:   _attr_badges.append(f"<span style='background:#1e1b4b;color:#a5b4fc;border:1px solid #4f46e5;padding:2px 9px;border-radius:20px;font-size:0.7rem'>SKU: {_sku}</span>")
-                    if _group: _attr_badges.append(f"<span style='background:#1e293b;color:#94a3b8;padding:2px 9px;border-radius:20px;font-size:0.7rem'>🏷 {_group}</span>")
-                    if _colour:_attr_badges.append(f"<span style='background:#4a0526;color:#f9a8d4;border:1px solid #be185d;padding:2px 9px;border-radius:20px;font-size:0.7rem'>🎨 {_colour}</span>")
-                    _attr_badges.append(f"<span style='background:#0f172a;color:#64748b;padding:2px 9px;border-radius:20px;font-size:0.7rem'>Qty: {_qty} · ₹{_uprice:,.0f} · {_gst_pct:.0f}%{'i' if _tax_inc else '+'} · <b style=\'color:#e2e8f0\'>₹{_total:,.0f}</b></span>")
-                    if _attr_badges:
-                        st.markdown(
-                            "<div style='display:flex;flex-wrap:wrap;gap:5px;padding:4px 0'>"
-                            + "".join(_attr_badges) + "</div>",
-                            unsafe_allow_html=True
-                        )
-
-                    # ══ ROW 3: Edit controls (collapsed expanders) ══════════
-                    if _frozen_o:
-                        st.caption("🔒 " + ("Order confirmed — locked" if _is_confirmed_frozen else "In billing pipeline"))
-                    elif _billed > 0:
-                        st.caption(f"🔒 Billed ({_billed} pcs) — use Credit Note to adjust")
-                    else:
-                        from modules.sql_adapter import run_query as _rq_frm
-
-                        # ── Edit controls in 2 expanders ────────────────────
-                        _ec1, _ec2 = st.columns(2)
-
-                        with _ec1:
-                            with st.expander("🔄 Change Product", expanded=False):
-                                # Cascading: main_group → product → attributes
-                                try:
-                                    _groups = _rq_frm("""
-                                        SELECT DISTINCT main_group FROM products
-                                        WHERE COALESCE(is_active, true) = true
-                                          AND main_group IS NOT NULL
-                                        ORDER BY main_group
-                                    """) or []
-                                    _group_list = [r["main_group"] for r in _groups]
-                                except Exception:
-                                    _group_list = [_mg] if _mg else []
-
-                                _sel_mg = st.selectbox(
-                                    "Category",
-                                    _group_list,
-                                    index=(_group_list.index(_mg) if _mg in _group_list else 0),
-                                    key=f"cp_mg_{_lid_o}_{_oid_o[:6]}"
-                                )
-
-                                # Products in that main_group with stock
-                                try:
-                                    _prod_rows = _rq_frm("""
-                                        SELECT DISTINCT ON (p.id)
-                                               p.id::text AS product_id,
-                                               p.product_name, p.brand
-                                        FROM products p
-                                        JOIN inventory_stock ist ON ist.product_id = p.id
-                                        WHERE p.main_group = %(mg)s
-                                          AND COALESCE(ist.quantity, 0) > 0
-                                          AND COALESCE(ist.is_active, true) = true
-                                          AND COALESCE(p.is_active, true) = true
-                                        ORDER BY p.id, p.product_name
-                                    """, {"mg": _sel_mg}) or []
-                                except Exception:
-                                    _prod_rows = []
-
-                                if not _prod_rows:
-                                    st.info(f"No stock in {_sel_mg}")
-                                else:
-                                    _p_ids  = [r["product_id"] for r in _prod_rows]
-                                    _p_lbls = {r["product_id"]: r["product_name"] for r in _prod_rows}
-                                    _def_pid = _prod_id_o if _prod_id_o in _p_ids else _p_ids[0]
-                                    _new_pid = st.selectbox(
-                                        "Product",
-                                        _p_ids,
-                                        index=_p_ids.index(_def_pid),
-                                        format_func=lambda x: _p_lbls.get(x, x),
-                                        key=f"cp_pid_{_lid_o}_{_oid_o[:6]}"
-                                    )
-
-                                    # SKUs for selected product
-                                    try:
-                                        _sku_rows2 = _rq_frm("""
-                                            SELECT batch_no,
-                                                   COALESCE(frame_group,'')  AS frame_group,
-                                                   COALESCE(colour_mix,'')   AS colour_mix,
-                                                   COALESCE(mrp, selling_price, 0)::numeric AS mrp,
-                                                   quantity::int AS quantity
-                                            FROM inventory_stock
-                                            WHERE product_id = %(pid)s::uuid
-                                              AND COALESCE(quantity,0) > 0
-                                              AND COALESCE(is_active,true) = true
-                                            ORDER BY frame_group, colour_mix, batch_no
-                                        """, {"pid": _new_pid}) or []
-                                    except Exception:
-                                        _sku_rows2 = []
-
-                                    if _sku_rows2:
-                                        _sk2_ids  = [r["batch_no"] for r in _sku_rows2]
-                                        _sk2_map  = {r["batch_no"]: r for r in _sku_rows2}
-                                        _sk2_lbls = {
-                                            r["batch_no"]: " | ".join(filter(None,[
-                                                r["batch_no"], r["frame_group"],
-                                                r["colour_mix"], f"Qty:{r['quantity']}"
-                                            ])) for r in _sku_rows2
-                                        }
-                                        _def_sk2 = _sku if _sku in _sk2_ids else _sk2_ids[0]
-                                        _sel_sk2 = st.selectbox(
-                                            "SKU / Colour",
-                                            _sk2_ids,
-                                            index=_sk2_ids.index(_def_sk2),
-                                            format_func=lambda x: _sk2_lbls.get(x,x),
-                                            key=f"cp_sku_{_lid_o}_{_oid_o[:6]}"
-                                        )
-                                        _sel_sk2_row = _sk2_map.get(_sel_sk2, {})
-                                        _cp_price = st.number_input(
-                                            "Price ₹", min_value=0.0,
-                                            value=float(_sel_sk2_row.get("mrp") or _uprice) or _uprice,
-                                            step=50.0, format="%.2f",
-                                            key=f"cp_price_{_lid_o}_{_oid_o[:6]}"
-                                        )
-                                        if st.button(
-                                            "✅ Apply",
-                                            key=f"cp_apply_{_lid_o}_{_oid_o[:6]}",
-                                            type="primary", disabled=(_cp_price==0)
-                                        ):
-                                            _nn2 = " | ".join(filter(None,[
-                                                _p_lbls[_new_pid], _sel_sk2,
-                                                _sel_sk2_row.get("frame_group",""),
-                                                _sel_sk2_row.get("colour_mix","")
-                                            ]))
-                                            line.update({
-                                                "product_id":   _new_pid,
-                                                "product_name": _nn2,
-                                                "batch_no":     _sel_sk2,
-                                                "colour_mix":   _sel_sk2_row.get("colour_mix",""),
-                                                "frame_group":  _sel_sk2_row.get("frame_group",""),
-                                                "unit_price":   _cp_price,
-                                                "total_price":  _cp_price * _qty,
-                                                "billing_total":_cp_price * _qty,
-                                            })
-                                            _lp2 = dict(_lp_o)
-                                            _lp2.update({
-                                                "batch_no":_sel_sk2,
-                                                "colour_mix":_sel_sk2_row.get("colour_mix",""),
-                                                "frame_group":_sel_sk2_row.get("frame_group",""),
-                                                "display_product_name":_nn2,
-                                            })
-                                            line["lens_params"]      = _lp2
-                                            line["batch_allocation"] = [{"batch_no":_sel_sk2,
-                                                "allocated_qty":_qty,"selling_price":_cp_price,"qty":_qty}]
-                                            try:
-                                                from modules.backoffice.audit_logger import audit, AuditAction
-                                                from modules.security.roles import current_user as _cuu
-                                                audit(AuditAction.PRODUCT_CHANGED,
-                                                      entity="order_lines",entity_id=_lid_o,
-                                                      order_id=_oid_o,
-                                                      user_id=(_cuu() or {}).get("name","backoffice"),
-                                                      payload={"action":"product_replaced",
-                                                               "old_product":_pname,"new_product":_nn2,
-                                                               "old_price":_uprice,"new_price":_cp_price})
-                                            except Exception: pass
-                                            st.success(f"✅ {_nn2}")
-                                            st.rerun()
-
-                        with _ec2:
-                            with st.expander("✏️ Price / Qty", expanded=False):
-                                _pe1, _pe2 = st.columns(2)
-                                _ep = _pe1.number_input("Price ₹",min_value=0.0,
-                                    value=_uprice,step=10.0,format="%.2f",
-                                    key=f"ep_{_lid_o}_{_oid_o[:6]}")
-                                _eq = _pe2.number_input("Qty",min_value=1,
-                                    value=max(_qty,1),step=1,
-                                    key=f"eq_{_lid_o}_{_oid_o[:6]}")
-                                if st.button("✅ Update",key=f"eupd_{_lid_o}_{_oid_o[:6]}",
-                                             type="primary"):
-                                    line.update({"unit_price":_ep,"billing_qty":_eq,
-                                                 "total_price":_ep*_eq,"billing_total":_ep*_eq})
-                                    st.success(f"₹{_ep:,.0f} × {_eq}")
-                                    st.rerun()
-
-        # ── Add Product panel (any non-R/L line can be added here) ─────────
-        if not _billing_frozen:
-            with st.expander("➕ Add Product to Order", expanded=False):
-                st.caption("Add a frame, accessory, solution, or any other product to this order.")
-                from modules.sql_adapter import run_query as _rq_add
-                try:
-                    _add_groups = _rq_add("""
-                        SELECT DISTINCT p.main_group FROM products p
-                        JOIN inventory_stock ist ON ist.product_id = p.id
-                        WHERE COALESCE(p.is_active,true)=true
-                          AND COALESCE(ist.quantity,0) > 0
-                          AND COALESCE(ist.is_active,true)=true
-                          AND p.main_group NOT IN ('Ophthalmic Lens','Contact Lens','RGP Lens')
-                        ORDER BY p.main_group
-                    """) or []
-                    _add_group_list = [r["main_group"] for r in _add_groups]
-                except Exception:
-                    _add_group_list = []
-
-                if _add_group_list:
-                    _add_mg = st.selectbox("Category",_add_group_list,
-                                           key=f"add_mg_{str(order.get('id',''))[:8]}")
-                    try:
-                        _add_prods = _rq_add("""
-                            SELECT DISTINCT ON (p.id)
-                                   p.id::text AS product_id, p.product_name, p.brand
-                            FROM products p
-                            JOIN inventory_stock ist ON ist.product_id = p.id
-                            WHERE p.main_group=%(mg)s
-                              AND COALESCE(ist.quantity,0)>0
-                              AND COALESCE(ist.is_active,true)=true
-                              AND COALESCE(p.is_active,true)=true
-                            ORDER BY p.id, p.product_name
-                        """, {"mg":_add_mg}) or []
-                    except Exception:
-                        _add_prods = []
-
-                    if _add_prods:
-                        _ap_ids  = [r["product_id"] for r in _add_prods]
-                        _ap_lbls = {r["product_id"]: r["product_name"] for r in _add_prods}
-                        _ap_sel  = st.selectbox("Product",_ap_ids,
-                            format_func=lambda x: _ap_lbls.get(x,x),
-                            key=f"add_pid_{str(order.get('id',''))[:8]}")
+                    with st.expander("🗑 Delete Line", expanded=False):
+                        _line_id_del = str(line.get("line_id") or line.get("id") or "")
+                        _can_delete_line = True
                         try:
-                            _add_skus = _rq_add("""
-                                SELECT batch_no,
-                                       COALESCE(frame_group,'')  AS frame_group,
-                                       COALESCE(colour_mix,'')   AS colour_mix,
-                                       COALESCE(mrp,selling_price,0)::numeric AS mrp,
-                                       quantity::int AS quantity
-                                FROM inventory_stock
-                                WHERE product_id=%(pid)s::uuid
-                                  AND COALESCE(quantity,0)>0
-                                  AND COALESCE(is_active,true)=true
-                                ORDER BY frame_group,colour_mix
-                            """, {"pid":_ap_sel}) or []
+                            from modules.sql_adapter import run_query as _rq_del_guard
+                            _dg = _rq_del_guard("""
+                                SELECT
+                                    COALESCE(ol.billed_qty,0) AS billed_qty,
+                                    EXISTS(
+                                        SELECT 1 FROM challan_lines cl
+                                        JOIN challans c ON c.id=cl.challan_id
+                                        WHERE cl.order_line_id=ol.id
+                                          AND c.status NOT IN ('CANCELLED','VOID')
+                                    ) AS has_challan
+                                FROM order_lines ol
+                                WHERE ol.id=%(lid)s::uuid
+                                LIMIT 1
+                            """, {"lid": _line_id_del}) if _line_id_del else []
+                            if _dg and (int(_dg[0].get("billed_qty") or 0) > 0 or bool(_dg[0].get("has_challan"))):
+                                _can_delete_line = False
                         except Exception:
-                            _add_skus = []
-
-                        if _add_skus:
-                            _as_ids = [r["batch_no"] for r in _add_skus]
-                            _as_map = {r["batch_no"]: r for r in _add_skus}
-                            _as_lbls= {r["batch_no"]: " | ".join(filter(None,[
-                                r["batch_no"],r["frame_group"],r["colour_mix"],
-                                f"Qty:{r['quantity']}"
-                            ])) for r in _add_skus}
-                            _as_sel = st.selectbox("SKU / Colour / Size",_as_ids,
-                                format_func=lambda x: _as_lbls.get(x,x),
-                                key=f"add_sku_{str(order.get('id',''))[:8]}")
-                            _as_row = _as_map.get(_as_sel,{})
-                            _ac1,_ac2,_ac3 = st.columns(3)
-                            _add_qty   = _ac1.number_input("Qty",min_value=1,value=1,step=1,
-                                key=f"add_qty_{str(order.get('id',''))[:8]}")
-                            _add_price = _ac2.number_input("Price ₹",min_value=0.0,
-                                value=float(_as_row.get("mrp") or 0),step=50.0,format="%.2f",
-                                key=f"add_price_{str(order.get('id',''))[:8]}")
-                            _ac3.metric("Total",f"₹{_add_price*_add_qty:,.0f}")
-
-                            if st.button("➕ Add to Order",
-                                key=f"add_btn_{str(order.get('id',''))[:8]}",
-                                type="primary",
-                                disabled=(_add_price==0)
-                            ):
-                                import uuid as _uuid_add
-                                _new_line = {
-                                    "line_id":           str(_uuid_add.uuid4()),
-                                    "product_id":        _ap_sel,
-                                    "product_name":      " | ".join(filter(None,[
-                                        _ap_lbls[_ap_sel],_as_sel,
-                                        _as_row.get("frame_group",""),
-                                        _as_row.get("colour_mix","")
-                                    ])),
-                                    "brand":             next((r["brand"] for r in _add_prods if r["product_id"]==_ap_sel),""),
-                                    "main_group":        _add_mg,
-                                    "eye_side":          "OTHER",
-                                    "batch_no":          _as_sel,
-                                    "colour_mix":        _as_row.get("colour_mix",""),
-                                    "frame_group":       _as_row.get("frame_group",""),
-                                    "billing_qty":       _add_qty,
-                                    "unit_price":        _add_price,
-                                    "total_price":       _add_price * _add_qty,
-                                    "billing_total":     _add_price * _add_qty,
-                                    "gst_percent":       5.0,
-                                    "tax_inclusive":     True,
-                                    "manufacturing_route":"STOCK",
-                                    "batch_status":      "ALLOCATED",
-                                    "allocated_qty":     _add_qty,
-                                    "batch_allocation":  [{"batch_no":_as_sel,
-                                        "allocated_qty":_add_qty,"selling_price":_add_price,"qty":_add_qty}],
-                                    "lens_params": {
-                                        "batch_no":_as_sel,
-                                        "colour_mix":_as_row.get("colour_mix",""),
-                                        "frame_group":_as_row.get("frame_group",""),
-                                        "display_product_name":" | ".join(filter(None,[
-                                            _ap_lbls[_ap_sel],_as_sel,
-                                            _as_row.get("frame_group",""),
-                                            _as_row.get("colour_mix","")
-                                        ]))
-                                    },
-                                    "is_new_line": True,
-                                }
-                                all_lines.append(_new_line)
-                                other_lines.append(_new_line)
-                                st.success(f"✅ Added: {_new_line['product_name']}")
-                                st.rerun()
-
-        # ── Debug Overlay (only when debug_pricing enabled in sidebar) ──────────
-        if st.session_state.get("debug_pricing"):
-            try:
-                from .debug_pricing_overlay import render_debug_overlay
-                render_debug_overlay(order, all_lines)
-            except Exception as _dbg:
-                st.caption(f"Debug overlay error: {_dbg}")
-        # ──────────────────────────────────────────────────────────────────────────
-
-        # ══════════════════════════════════════════════════════════════════════
-        # 🎯 SUPPLIER / JOB ASSIGNMENT PANEL
-        # Must be confirmed before Save is allowed.
-        # Shift button lets operator re-route any line without re-opening save.
-        # ══════════════════════════════════════════════════════════════════════
-        if _ASSIGNMENT_PANEL_AVAILABLE:
-            render_assignment_panel(order, all_lines)
-        # ══════════════════════════════════════════════════════════════════════
-
-        # ── GST Verification Footer — always computed live from _calc_line_display_total
-        # Same function used by line rows → guaranteed to match what's displayed ──
-        # order_type already resolved at function top — reuse it here
-        _taxable_live   = 0.0   # ex-GST base
-        _gst_total_live = 0.0
-        _mrp_total_live = 0.0   # what customer actually pays (total col)
-        for _fl in all_lines:
-            _base, _g, _tot = _calc_line_display_total(_fl)
-            _taxable_live   += _base
-            _gst_total_live += _g
-            _mrp_total_live += _tot
-        _taxable_live   = round(_taxable_live, 2)
-        _gst_total_live = round(_gst_total_live, 2)
-        _mrp_total_live = round(_mrp_total_live, 2)
-
-        # ── Load service charges for summary ─────────────────────────────────
-        _oid_bvs = str(order.get("id") or "")
-        _bvs_key = f"svc_charges_{_oid_bvs}"
-        if _bvs_key not in st.session_state:
-            try:
-                from modules.backoffice.order_charges_panel import fetch_charges
-                st.session_state[_bvs_key] = fetch_charges(_oid_bvs)
-            except Exception:
-                st.session_state[_bvs_key] = []
-        _bvs_charges = st.session_state.get(_bvs_key, [])
-        _svc_base    = sum(float(x.get("amount") or 0)        for x in _bvs_charges)
-        _svc_gst     = sum(float(x.get("gst_amount") or 0)    for x in _bvs_charges)
-        _svc_total   = sum(float(x.get("total_amount") or 0)  for x in _bvs_charges)
-        _svc_base    = round(_svc_base, 2)
-        _svc_gst     = round(_svc_gst, 2)
-        _svc_total   = round(_svc_total, 2)
-
-        _invoice_total = round(_mrp_total_live + _svc_total, 2)
-
-        with st.container(border=True):
-            st.caption("📊 Billing Verification Summary")
-            if order_type == "RETAIL":
-                vc = st.columns(4)
-                vc[0].metric("MRP Total (incl. GST)",  f"₹{_mrp_total_live:,.2f}")
-                vc[1].metric("GST Extracted",           f"₹{_gst_total_live:,.2f}", help="GST back-calculated from MRP")
-                vc[2].metric("Taxable Value",           f"₹{_taxable_live:,.2f}")
-                vc[3].metric("Patient Pays",            f"₹{_mrp_total_live:,.2f}")
-            else:
-                vc = st.columns(4)
-                vc[0].metric("Subtotal (excl. GST)",   f"₹{_taxable_live:,.2f}")
-                vc[1].metric("GST Added",               f"₹{_gst_total_live:,.2f}", help="GST added on top of selling price")
-                vc[2].metric("Grand Total",             f"₹{_mrp_total_live:,.2f}")
-                vc[3].metric("Order Type",              order_type)
-
-            # ── Per-product line breakdown ─────────────────────────────
-            if all_lines:
-                st.markdown(
-                    "<div style='height:6px'></div>"
-                    "<div style='color:#64748b;font-size:0.7rem;font-weight:600;"
-                    "letter-spacing:.05em;padding:4px 0 2px'>PRODUCT LINES</div>",
-                    unsafe_allow_html=True,
-                )
-                _bvs_hcols = st.columns([0.5, 3, 1.5, 1, 1, 1.5, 1.5])
-                for _hh, _hl in zip(_bvs_hcols, ["Eye","Product","Power","Qty","GST%","Unit ₹","Total ₹"]):
-                    _hh.markdown(f"<span style='color:#475569;font-size:0.65rem'>{_hl}</span>",
-                                 unsafe_allow_html=True)
-                st.markdown("<hr style='margin:2px 0;border-color:#1e293b'>", unsafe_allow_html=True)
-                for _bvl in all_lines:
-                    _bvl_eye  = str(_bvl.get("eye_side","")).upper()
-                    _bvl_icon = {"R":"👁️R","L":"👁️L","SERVICE":"🩺","S":"🩺","B":"👁️👁️"}.get(_bvl_eye,"🔹")
-                    _bvl_name = str(_bvl.get("product_name",""))
-                    _bvl_pwr  = ""
-
-                    # Helper: reject NaN/Inf/None → clean float or None
-                    def _bvl_real(v):
-                        if v is None: return None
-                        try:
-                            import math as _bm
-                            f = float(v)
-                            return None if (_bm.isnan(f) or _bm.isinf(f)) else f
-                        except (TypeError, ValueError): return None
-
-                    _bvl_lp  = _bvl.get("lens_params") or {}
-                    _bvl_mg  = str(_bvl.get("main_group") or "").lower()
-                    _is_frame_line = (
-                        _bvl_eye == "OTHER"
-                        or "frame" in _bvl_mg
-                        or bool(_bvl_lp.get("batch_no"))  # saved by order_persistence
-                    )
-
-                    if _is_frame_line:
-                        # ── Frame: show SKU | Frame Group | Colour ──────────
-                        _bvl_sku  = str(_bvl_lp.get("batch_no") or _bvl.get("batch_no") or "").strip()
-                        _bvl_fgrp = str(_bvl_lp.get("frame_group") or _bvl.get("frame_group") or "").strip()
-                        _bvl_fcol = str(_bvl_lp.get("colour_mix")  or _bvl.get("colour_mix")  or "").strip()
-                        _bvl_desc_parts = [p for p in [_bvl_sku, _bvl_fgrp, _bvl_fcol] if p]
-                        _bvl_pwr = " | ".join(_bvl_desc_parts) if _bvl_desc_parts else ""
-
-                    elif _bvl_eye not in ("SERVICE", "S", "B"):
-                        # ── Lens: show SPH / CYL / AXIS ────────────────────
-                        _bvl_sph_f = _bvl_real(_bvl.get("sph"))
-                        if _bvl_sph_f is not None:
-                            _sign = lambda v: (f"+{v:.2f}" if v > 0 else f"{v:.2f}") if v else "0.00"
-                            _bvl_cyl_f = _bvl_real(_bvl.get("cyl"))
-                            _bvl_ax_f  = _bvl_real(_bvl.get("axis"))
-                            _bvl_pwr   = f"S{_sign(_bvl_sph_f)}"
-                            if _bvl_cyl_f: _bvl_pwr += f" C{_sign(_bvl_cyl_f)}"
-                            if _bvl_ax_f:  _bvl_pwr += f" A{int(_bvl_ax_f)}"
-                    _bvl_qty  = int(_bvl.get("billing_qty") or _bvl.get("quantity") or 0)
-                    _bvl_gst  = float(_bvl.get("gst_percent_used") or _bvl.get("gst_percent") or 0)
-                    _bvl_up   = float(_bvl.get("unit_price") or 0)
-                    _bvl_tot  = float(_bvl.get("billing_total") or _bvl.get("total_price") or 0)
-                    _bvl_row  = st.columns([0.5, 3, 1.5, 1, 1, 1.5, 1.5])
-                    _bvl_row[0].markdown(f"<span style='font-size:0.78rem'>{_bvl_icon}</span>",
-                                         unsafe_allow_html=True)
-                    _bvl_row[1].markdown(f"<span style='color:#e2e8f0;font-size:0.75rem'>{_bvl_name}</span>",
-                                         unsafe_allow_html=True)
-                    _bvl_row[2].markdown(f"<span style='color:#94a3b8;font-size:0.7rem'>{_bvl_pwr or '—'}</span>",
-                                         unsafe_allow_html=True)
-                    _bvl_row[3].markdown(f"<span style='color:#e2e8f0;font-size:0.75rem'>{_bvl_qty}</span>",
-                                         unsafe_allow_html=True)
-                    _bvl_row[4].markdown(f"<span style='color:#94a3b8;font-size:0.75rem'>{_bvl_gst:.0f}%</span>",
-                                         unsafe_allow_html=True)
-                    _bvl_row[5].markdown(f"<span style='color:#94a3b8;font-size:0.75rem'>₹{_bvl_up:,.2f}</span>",
-                                         unsafe_allow_html=True)
-                    _bvl_row[6].markdown(f"<span style='color:#10b981;font-size:0.78rem;font-weight:700'>₹{_bvl_tot:,.2f}</span>",
-                                         unsafe_allow_html=True)
-                st.markdown("<hr style='margin:4px 0;border-color:#1e293b'>", unsafe_allow_html=True)
-
-            # ── Service charges breakdown row ─────────────────────────
-            if _bvs_charges:
-                st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-                _sc_cols = st.columns(len(_bvs_charges) + 1)
-                for _sci, _sch in enumerate(_bvs_charges):
-                    _ico = {"FITTING":"🔧","COLOURING":"🎨","COURIER":"📦"}.get(
-                           _sch.get("charge_type",""), "➕")
-                    _sc_cols[_sci].metric(
-                        f"{_ico} {_sch.get('description') or _sch.get('charge_type','')}",
-                        f"₹{float(_sch.get('total_amount') or 0):,.2f}",
-                        help=f"Base ₹{float(_sch.get('amount') or 0):,.2f} + "
-                             f"{float(_sch.get('gst_percent') or 0):.0f}% GST")
-                _sc_cols[-1].metric("Services Total", f"₹{_svc_total:,.2f}")
-
-                st.markdown(
-                    f"<div style='background:#0d1f0d;border:1px solid #10b98155;"
-                    f"border-radius:8px;padding:10px 16px;margin-top:6px;"
-                    f"display:flex;justify-content:space-between;align-items:center'>"
-                    f"<div>"
-                    f"<span style='color:#64748b;font-size:0.72rem'>Lens Total</span>"
-                    f"<span style='color:#94a3b8;font-weight:700;margin-left:8px'>"
-                    f"₹{_mrp_total_live:,.2f}</span>"
-                    f"<span style='color:#475569;margin:0 10px'>+</span>"
-                    f"<span style='color:#64748b;font-size:0.72rem'>Service Charges</span>"
-                    f"<span style='color:#a78bfa;font-weight:700;margin-left:8px'>"
-                    f"₹{_svc_total:,.2f}</span>"
-                    f"</div>"
-                    f"<div>"
-                    f"<span style='color:#64748b;font-size:0.78rem;margin-right:10px'>"
-                    f"Invoice Total</span>"
-                    f"<span style='color:#10b981;font-weight:800;font-size:1.2rem'>"
-                    f"₹{_invoice_total:,.2f}</span>"
-                    f"</div></div>",
-                    unsafe_allow_html=True)
-
-            st.caption(
-                f"Source: {order.get('order_source', order_type)}  |  "
-                f"Tax treatment: {'GST inclusive in price' if order_type == 'RETAIL' else 'GST exclusive — added on top'}"
-            )
-        # ─────────────────────────────────────────────────────────────────────
-
-        # ─────────────────────────────────────────────────────────────────────
-        # "Send to Billing Dashboard" removed — Save & Confirm handles this in one step.
-        # After save, stock orders auto-advance to CONFIRMED; vendor orders go to UNDER_REVIEW.
-
-        # ── Cancel Order panel (only for PENDING / UNDER_REVIEW) ────────────
-        try:
-            from modules.backoffice.backoffice import render_cancel_order_panel
-            render_cancel_order_panel(order)
-        except Exception:
-            pass
-        # ─────────────────────────────────────────────────────────────────
-
-        from modules.utils.submit_guard import is_locked, guarded_submit
-        _save_frozen = _billing_frozen  # frozen if in billing pipeline
-        if _save_frozen:
-            st.markdown(
-                "<div style='background:#1a0a0a;border:1px solid #f59e0b44;"
-                "border-radius:8px;padding:8px 14px;text-align:center;"
-                "color:#78716c;font-size:0.8rem'>"
-                "🔒 SAVE DISABLED — Order is in the billing pipeline</div>",
-                unsafe_allow_html=True,
-            )
-        # ── Payment collection window (before final save) ───────────────
-        # Shows compact advance recording: Cash / UPI / Card / Bank
-        # Staff can record payment here before clicking Save & Confirm
-        _order_id_for_pay = str(order.get("id") or order.get("order_id") or "")
-        _pay_status_key   = f"_bo_advance_recorded_{_order_id_for_pay[:8]}"
-        _adv_recorded     = st.session_state.get(_pay_status_key, False)
-
-        if not _billing_frozen and _order_id_for_pay:
-            with st.expander(
-                "💰 Collect Payment (before saving)",
-                expanded=st.session_state.get(f"_bo_pay_open_{_order_id_for_pay[:8]}", False)
-            ):
-                # ── Payment details helper ───────────────────────────────────
-                _pay_party   = str(order.get("party_name") or order.get("patient_name") or "Customer")
-                # Auto-load mobile from order (patient_mobile → party_mobile → DB lookup)
-                _pay_mobile = str(
-                    order.get("patient_mobile") or
-                    order.get("mobile") or
-                    order.get("party_mobile") or ""
-                )
-                # If still empty, try DB lookup via party_id
-                if not _pay_mobile and order.get("party_id"):
-                    try:
-                        from modules.sql_adapter import run_query as _rq_mob
-                        _mob_row = _rq_mob(
-                            "SELECT COALESCE(mobile,'') AS mob FROM parties WHERE id=%s::uuid LIMIT 1",
-                            (str(order["party_id"]),)
-                        ) or []
-                        if _mob_row: _pay_mobile = str(_mob_row[0].get("mob") or "")
-                    except Exception: pass
-                # Sanitise to 10-digit Indian mobile
-                _pay_mob_clean = "".join(x for x in _pay_mobile if x.isdigit())
-                if _pay_mob_clean.startswith("91") and len(_pay_mob_clean) == 12:
-                    _pay_mob_clean = _pay_mob_clean[2:]
-                elif _pay_mob_clean.startswith("0") and len(_pay_mob_clean) == 11:
-                    _pay_mob_clean = _pay_mob_clean[1:]
-                _pay_wa_mob = ("91"+_pay_mob_clean) if (len(_pay_mob_clean)==10 and _pay_mob_clean[0] in "6789") else ""
-
-                # Pre-seed session state for all mobile inputs so value= actually shows
-                # Streamlit ignores value= if key already exists in session_state
-                for _mob_key in [
-                    f"pt2_wa_mob_{_order_id_for_pay[:8]}",
-                    f"pt3_mob_{_order_id_for_pay[:8]}",
-                ]:
-                    if _mob_key not in st.session_state or not st.session_state[_mob_key]:
-                        st.session_state[_mob_key] = _pay_mob_clean
-
-                # Balance due
-                _pay_total   = float(total_billing)
-                _pay_due     = _pay_total  # before any advances
-
-                # ── Helper to save payment to DB ─────────────────────────────
-                def _save_advance(amount, mode, ref=""):
-                    from modules.sql_adapter import run_write as _rw_p
-                    import uuid as _up
-                    _rw_p("""
-                        INSERT INTO payments
-                            (id, payment_no, payment_date, payment_mode,
-                             amount, reference_no, remarks,
-                             order_id, advance_for_order_id,
-                             payment_type, created_at)
-                        VALUES
-                            (%s::uuid, %s, CURRENT_DATE, %s,
-                             %s, %s, %s,
-                             %s::uuid, %s::uuid,
-                             'ADVANCE', NOW())
-                        ON CONFLICT DO NOTHING
-                    """, (
-                        str(_up.uuid4()),
-                        f"ADV-{_order_id_for_pay[:8].upper()}",
-                        mode, float(amount), ref or None,
-                        f"Advance — {_pay_party}",
-                        _order_id_for_pay, _order_id_for_pay,
-                    ))
-
-                # ── 4 tabs ────────────────────────────────────────────────────
-                _ptab1, _ptab2, _ptab3, _ptab4 = st.tabs([
-                    "💵 Cash / Card",
-                    "📱 UPI + QR Code",
-                    "🔗 Payment Link",
-                    "🏦 Bank Transfer",
-                ])
-
-                # ══ TAB 1: Cash / Card ═══════════════════════════════════════
-                with _ptab1:
-                    _t1c1, _t1c2 = st.columns(2)
-                    _t1_amt  = _t1c1.number_input(
-                        "Amount ₹", min_value=0.0,
-                        value=float(_pay_due), step=50.0, format="%.2f",
-                        key=f"pt1_amt_{_order_id_for_pay[:8]}"
-                    )
-                    _t1_mode = _t1c2.selectbox(
-                        "Mode", ["Cash", "Card (POS)", "Cheque"],
-                        key=f"pt1_mode_{_order_id_for_pay[:8]}"
-                    )
-                    _t1_ref = st.text_input(
-                        "Reference / Cheque No. (optional)",
-                        key=f"pt1_ref_{_order_id_for_pay[:8]}"
-                    )
-                    if st.button("✅ Record Cash/Card Payment",
-                                 key=f"pt1_save_{_order_id_for_pay[:8]}",
-                                 type="primary", use_container_width=True,
-                                 disabled=_t1_amt <= 0):
-                        try:
-                            _save_advance(_t1_amt, _t1_mode, _t1_ref)
-                            st.session_state[_pay_status_key] = True
-                            st.success(f"✅ ₹{_t1_amt:,.0f} via {_t1_mode} recorded")
-                            st.rerun()
-                        except Exception as _e1: st.error(f"Failed: {_e1}")
-
-                # ══ TAB 2: UPI + QR ══════════════════════════════════════════
-                with _ptab2:
-                    try:
-                        from modules.billing.payment_link_manager import get_upi_id as _get_upi, get_upi_name as _get_uname
-                        _upi_id   = _get_upi()
-                        _upi_name = _get_uname()
-                    except Exception:
-                        _upi_id = _upi_name = ""
-
-                    _t2_amt = st.number_input(
-                        "Amount ₹", min_value=0.0,
-                        value=float(_pay_due), step=50.0, format="%.2f",
-                        key=f"pt2_amt_{_order_id_for_pay[:8]}"
-                    )
-
-                    if _upi_id:
-                        import urllib.parse as _uparse_pay
-                        _upi_link = (
-                            f"upi://pay?pa={_uparse_pay.quote(_upi_id)}"
-                            f"&pn={_uparse_pay.quote(_upi_name or 'DV Optical')}"
-                            f"&am={_t2_amt:.2f}"
-                            f"&tn={_uparse_pay.quote('Order '+str(order.get('order_no','')))}"
-                            f"&cu=INR"
-                        )
-                        _qr_url = (
-                            f"https://upiqr.in/api/qr?vpa={_uparse_pay.quote(_upi_id)}"
-                            f"&name={_uparse_pay.quote(_upi_name or 'DV Optical')}"
-                            f"&amount={_t2_amt:.2f}"
-                            f"&trxnote={_uparse_pay.quote('Order '+str(order.get('order_no','')))}"
-                        )
-                        # QR + UPI ID display
-                        _qrc1, _qrc2 = st.columns([1, 1])
-                        with _qrc1:
-                            _qr_html = (
-                                "<div style='text-align:center'>"
-                                + f"<img src='{_qr_url}' width='160' "
-                                + "style='border-radius:8px;background:white;padding:6px'>"
-                                + f"<div style='font-size:0.72rem;color:#64748b;margin-top:4px'>"
-                                + f"Scan to Pay ₹{_t2_amt:,.0f}</div></div>"
-                            )
-                            st.markdown(_qr_html, unsafe_allow_html=True)
-                        with _qrc2:
-                            st.markdown(
-                                f"<div style='background:#0f172a;border:1px solid #1e293b;"
-                                f"border-radius:8px;padding:12px;text-align:center'>"
-                                f"<div style='color:#64748b;font-size:0.65rem;margin-bottom:6px'>UPI ID</div>"
-                                f"<div style='font-family:monospace;font-size:0.9rem;"
-                                f"color:#f1f5f9;font-weight:700'>{_upi_id}</div>"
-                                f"<div style='color:#64748b;font-size:0.65rem;margin-top:6px'>{_upi_name}</div>"
-                                f"</div>",
-                                unsafe_allow_html=True
-                            )
-                            st.link_button("📲 Open UPI App", _upi_link, use_container_width=True)
-
-                        # ── WhatsApp — always shown, with mobile input if missing ──
-                        st.markdown("---")
-                        _wa2_mob_input = st.text_input(
-                            "📱 Customer WhatsApp",
-                            value=_pay_mob_clean,
-                            placeholder="10-digit mobile",
-                            key=f"pt2_wa_mob_{_order_id_for_pay[:8]}"
-                        )
-                        _wa2_mob_clean = "".join(x for x in _wa2_mob_input if x.isdigit())
-                        _wa2_wa_mob = ("91"+_wa2_mob_clean) if (len(_wa2_mob_clean)==10 and _wa2_mob_clean[0] in "6789") else ""
-                        if _wa2_wa_mob and _upi_id:
-                            _wa_upi_msg = (
-                                f"Hi {_pay_party},\n\n"
-                                f"Please pay *₹{_t2_amt:,.0f}* for your order "
-                                f"*{order.get('order_no','')}* via UPI:\n\n"
-                                f"📲 UPI ID: *{_upi_id}*\n"
-                                f"Name: {_upi_name}\n\n"
-                                f"After payment, please share the transaction ID. Thank you! 🙏"
-                            )
-                            from modules.wa_hub import wa_link as _wa_link_hub
-                            _wa_upi_url = _wa_link_hub(_wa2_wa_mob, _wa_upi_msg)
-                            if _wa_upi_url:
-                                st.link_button(
-                                    "📲 Send UPI ID + Amount via WhatsApp",
-                                    _wa_upi_url,
-                                    use_container_width=True
-                                )
-                        elif not _wa2_wa_mob:
-                            st.caption("Enter valid mobile above to enable WhatsApp send")
-                    else:
-                        st.info("⚙️ No UPI ID configured. Set it in Billing → Payment Link settings.")
-
-                    st.markdown("---")
-                    _t2_ref = st.text_input("UPI Transaction ID (after payment)",
-                                            key=f"pt2_ref_{_order_id_for_pay[:8]}")
-                    if st.button("✅ Record UPI Payment",
-                                 key=f"pt2_save_{_order_id_for_pay[:8]}",
-                                 type="primary", use_container_width=True,
-                                 disabled=(_t2_amt <= 0 or not _t2_ref)):
-                        try:
-                            _save_advance(_t2_amt, "UPI", _t2_ref)
-                            st.session_state[_pay_status_key] = True
-                            st.success(f"✅ ₹{_t2_amt:,.0f} via UPI ({_t2_ref}) recorded")
-                            st.rerun()
-                        except Exception as _e2: st.error(f"Failed: {_e2}")
-
-                # ══ TAB 3: Payment Link ═══════════════════════════════════════
-                with _ptab3:
-                    st.caption("Generate a payment link and send via WhatsApp. Customer pays online and confirms.")
-                    _t3_mob = st.text_input(
-                        "Customer Mobile",
-                        value=_pay_mob_clean,
-                        key=f"pt3_mob_{_order_id_for_pay[:8]}"
-                    )
-                    _t3_amt = st.number_input(
-                        "Amount ₹", min_value=0.0,
-                        value=float(_pay_due), step=50.0, format="%.2f",
-                        key=f"pt3_amt_{_order_id_for_pay[:8]}"
-                    )
-                    _t3_hrs = st.slider("Link valid for (hours)", 1, 168, 48,
-                                        key=f"pt3_hrs_{_order_id_for_pay[:8]}")
-
-                    # Show WA preview note
-                    _t3_mob_clean = "".join(x for x in _t3_mob if x.isdigit())
-                    _t3_wa_ok = len(_t3_mob_clean)==10 and _t3_mob_clean[0] in "6789"
-                    if _t3_wa_ok:
-                        st.markdown(
-                            f"<div style='background:#0d2010;border:1px solid #22c55e33;"
-                            f"border-radius:6px;padding:6px 12px;font-size:0.75rem;color:#86efac'>"
-                            f"📲 WhatsApp link will be sent to +91 {_t3_mob_clean} after generation"
-                            f"</div>",
-                            unsafe_allow_html=True
-                        )
-                    else:
-                        st.caption("Enter a valid 10-digit mobile to enable WhatsApp send")
-
-                    if st.button("🔗 Generate Link + Send via WhatsApp",
-                                 key=f"pt3_gen_{_order_id_for_pay[:8]}",
-                                 type="primary", use_container_width=True,
-                                 disabled=(_t3_amt <= 0 or not _t3_wa_ok)):
-                        try:
-                            from modules.billing.payment_link_manager import (
-                                create_payment_link as _cpl, mark_link_sent as _mls
-                            )
-                            from modules.security.roles import current_user_name as _cun
-                            try: _by_pl = _cun() or "staff"
-                            except: _by_pl = "staff"
-                            if not isinstance(_by_pl, str):
-                                _by_pl = getattr(_by_pl, "name", "staff")
-
-                            _pl_result = _cpl(
-                                order_id     = _order_id_for_pay,
-                                order_no     = str(order.get("order_no","")),
-                                party_name   = _pay_party,
-                                mobile       = _t3_mob.strip(),
-                                amount       = float(_t3_amt),
-                                description  = f"Order {order.get('order_no','')} — Balance Payment",
-                                expiry_hours = _t3_hrs,
-                                created_by   = _by_pl,
-                            )
-                            _mls(_pl_result["token"])
-                            st.success(f"✅ Link generated — Token: `{_pl_result['token']}`")
-                            st.code(_pl_result["url"])
-                            st.markdown(
-                                "<div style='background:#0d2010;border:2px solid #22c55e;"
-                                "border-radius:8px;padding:10px;text-align:center;"
-                                "margin-top:6px'>"
-                                "<span style='color:#86efac;font-weight:700'>✅ Link ready — tap to send</span>"
-                                "</div>",
-                                unsafe_allow_html=True
-                            )
-                            st.link_button(
-                                "📲 Send Payment Link via WhatsApp",
-                                _pl_result["whatsapp_url"],
-                                use_container_width=True
-                            )
-                        except Exception as _e3:
-                            st.error(f"Link generation failed: {_e3}")
-
-                # ══ TAB 4: Bank Transfer ════════════════════════════════════
-                with _ptab4:
-                    st.caption("Share bank details for NEFT/RTGS/IMPS transfers.")
-                    try:
-                        from modules.settings.shop_master import get_unit_info as _gui_bank
-                        _shop_bank = _gui_bank("retail") or {}
-                        _bank_name = _shop_bank.get("bank_name","")
-                        _bank_acc  = _shop_bank.get("bank_account","")
-                        _bank_ifsc = _shop_bank.get("bank_ifsc","")
-                        _bank_branch = _shop_bank.get("bank_branch","")
-                    except Exception:
-                        _bank_name = _bank_acc = _bank_ifsc = _bank_branch = ""
-
-                    _t4_amt = st.number_input(
-                        "Amount ₹", min_value=0.0,
-                        value=float(_pay_due), step=50.0, format="%.2f",
-                        key=f"pt4_amt_{_order_id_for_pay[:8]}"
-                    )
-
-                    if _bank_acc:
-                        st.markdown(
-                            f"<div style='background:#0f172a;border:1px solid #1e293b;"
-                            f"border-radius:8px;padding:14px 16px'>"
-                            + (f"<div style='color:#94a3b8;font-size:0.8rem'><b>Bank:</b> {_bank_name}</div>" if _bank_name else "")
-                            + (f"<div style='color:#94a3b8;font-size:0.8rem'><b>Account No:</b> {_bank_acc}</div>" if _bank_acc else "")
-                            + (f"<div style='color:#94a3b8;font-size:0.8rem'><b>IFSC:</b> {_bank_ifsc}</div>" if _bank_ifsc else "")
-                            + (f"<div style='color:#94a3b8;font-size:0.8rem'><b>Branch:</b> {_bank_branch}</div>" if _bank_branch else "")
-                            + f"<div style='color:#f59e0b;font-size:0.9rem;font-weight:700;margin-top:6px'>"
-                            f"Amount: ₹{_t4_amt:,.2f}</div>"
-                            + "</div>",
-                            unsafe_allow_html=True
-                        )
-                        # WA to send bank details
-                        if _pay_wa_mob:
-                            import urllib.parse as _up4
-                            _wa_bank_msg = (
-                                f"Hi {_pay_party},\n\n"
-                                f"Please transfer *₹{_t4_amt:,.0f}* for Order *{order.get('order_no','')}*:\n\n"
-                                + (f"Bank: {_bank_name}\n" if _bank_name else "")
-                                + (f"Account: *{_bank_acc}*\n" if _bank_acc else "")
-                                + (f"IFSC: {_bank_ifsc}\n" if _bank_ifsc else "")
-                                + (f"Branch: {_bank_branch}\n" if _bank_branch else "")
-                                + f"\nAfter transfer, please share the transaction reference."
-                            )
-                            _wa_bank_url = f"https://wa.me/{_pay_wa_mob}?text={_up4.quote(_wa_bank_msg)}"
-                            st.link_button(
-                                "📲 Send Bank Details via WhatsApp",
-                                _wa_bank_url,
-                                use_container_width=True
-                            )
-                    else:
-                        st.info("⚙️ No bank details configured. Add them in Shop Master settings.")
-
-                    st.markdown("---")
-                    _t4_ref = st.text_input("Transaction Reference / UTR No.",
-                                            key=f"pt4_ref_{_order_id_for_pay[:8]}")
-                    if st.button("✅ Record Bank Transfer",
-                                 key=f"pt4_save_{_order_id_for_pay[:8]}",
-                                 type="primary", use_container_width=True,
-                                 disabled=(_t4_amt <= 0 or not _t4_ref)):
-                        try:
-                            _save_advance(_t4_amt, "NEFT/RTGS", _t4_ref)
-                            st.session_state[_pay_status_key] = True
-                            st.success(f"✅ ₹{_t4_amt:,.0f} via NEFT/RTGS ({_t4_ref}) recorded")
-                            st.rerun()
-                        except Exception as _e4: st.error(f"Failed: {_e4}")
-
-            if _adv_recorded:
-                st.success("✅ Payment recorded — order will save with payment linked")
-
-        # ── Recheck dialog — shown after SAVE pressed, before commit ─────────
-        if st.session_state.get(f"_bo_recheck_{_order_id_for_pay[:8]}"):
-            st.warning(
-                "⚠️ **Final check before saving.**  \n"
-                "Once confirmed, **order lines cannot be changed**.  \n"
-                f"**Order:** {order.get('order_no','?')}  ·  "
-                f"**Lines:** {len(all_lines)}  ·  "
-                f"**Total:** ₹{total_billing:,.2f}"
-            )
-            _rc1, _rc2 = st.columns(2)
-            with _rc1:
-                if st.button("✅ Yes — Confirm & Save",
-                             key=f"rc_yes_{_order_id_for_pay[:8]}",
-                             type="primary", use_container_width=True):
-                    st.session_state.pop(f"_bo_recheck_{_order_id_for_pay[:8]}", None)
-                    st.session_state[f"_bo_confirmed_{_order_id_for_pay[:8]}"] = True
-                    st.rerun()
-            with _rc2:
-                if st.button("✏️ No — Go back and edit",
-                             key=f"rc_no_{_order_id_for_pay[:8]}",
-                             use_container_width=True):
-                    st.session_state.pop(f"_bo_recheck_{_order_id_for_pay[:8]}", None)
-                    st.info("Make changes above, then click Save again.")
-                    st.rerun()
-
-        # ── SAVE button or proceed if already confirmed ───────────────────────
-        if st.session_state.get(f"_bo_confirmed_{_order_id_for_pay[:8]}"):
-            st.session_state.pop(f"_bo_confirmed_{_order_id_for_pay[:8]}", None)
-            _do_save_now = True
-        else:
-            _do_save_now = False
-
-        if not _billing_frozen and not st.session_state.get(f"_bo_recheck_{_order_id_for_pay[:8]}"):
-            if not _do_save_now:
-                if st.button("✅ Save & Confirm Order", type="primary", width='stretch',
-                             key="final_save_order_btn", disabled=is_locked("final_save")):
-                    st.session_state[f"_bo_recheck_{_order_id_for_pay[:8]}"] = True
-                    st.rerun()
-
-        if _do_save_now or (not _billing_frozen and False):
-            with guarded_submit("final_save") as _allowed:
-                if not _allowed:
-                    st.stop()
-                # 🔐 Billing guard — never save with zero billing
-                if total_billing <= 0:
-                    st.error("❌ Billing total invalid. Cannot save with zero or negative billing.")
-                    st.warning("Please check line items and pricing before saving.")
-                    return   # guarded_submit __exit__ clears lock
-
-                # 🎯 Assignment guard — warn if assignments not confirmed
-                if _ASSIGNMENT_PANEL_AVAILABLE and not st.session_state.get("bo_assignments_locked", False):
-                    st.warning(
-                        "⚠️ Supplier / Job assignments not confirmed. "
-                        "Scroll up and click **Confirm All Assignments** before saving."
-                    )
-                    return
-
-                # ═══════════════════════════════════════════════════════════
-                # PRE-SAVE ALLOCATION GUARD
-                # Ensures every STOCK-routed line has a valid batch_allocation
-                # before we write to DB. Catches any sync gaps between the
-                # allocation window and the assignment panel.
-                # ═══════════════════════════════════════════════════════════
-                _alloc_issues = []
-                _assignments_ss = st.session_state.get("bo_assignments", {})
-
-                for _gi, _gl in enumerate(all_lines):
-                    _g_eye   = str(_gl.get("eye_side","")).upper()
-                    _g_name  = str(_gl.get("product_name",""))[:28]
-                    _g_route = str(_gl.get("manufacturing_route") or "").upper()
-                    _g_lk    = None
-                    # Find the session-state assignment key for this line
-                    for _gk in _assignments_ss:
-                        if str(_gi) in str(_gk):
-                            _g_lk = _gk
-                            break
-
-                    if _g_route == "STOCK":
-                        # --- Sync pass: pull allocation from session-state assignment ---
-                        _g_asgn = _assignments_ss.get(_g_lk, {}) if _g_lk else {}
-                        _g_ba_asgn = _g_asgn.get("batch_allocation") or []
-                        _g_ba_line = _gl.get("batch_allocation") or []
-                        _g_aq_line = int(_gl.get("allocated_qty") or 0)
-                        _g_qty     = int(_gl.get("billing_qty") or 0)
-
-                        # Use whichever source has data
-                        _g_ba_final = _g_ba_asgn or _g_ba_line
-                        _g_aq_final = sum(int(b.get("allocated_qty",0)) for b in _g_ba_final
-                                          if isinstance(b, dict)) if _g_ba_final else _g_aq_line
-
-                        if _g_ba_final:
-                            # Write back to line so persistence picks it up
-                            _gl["batch_allocation"] = _g_ba_final
-                            _gl["allocated_qty"]    = _g_aq_final
-                            _gl["batch_status"]     = "ALLOCATED" if _g_aq_final >= _g_qty else "PARTIAL"
+                            _can_delete_line = True
+                        if not _can_delete_line:
+                            st.warning("Line is already challaned/billed. Cancel challan first.")
                         else:
-                            # No allocation anywhere — check DB as last resort
-                            _g_lid = str(_gl.get("line_id") or _gl.get("id") or "")
-                            if _g_lid and len(_g_lid) > 10:
+                            _del_key = f"bo_line_delete_confirm_{_line_id_del}"
+                            if not st.session_state.get(_del_key):
+                                if st.button("🗑 Delete this line", key=f"bo_line_delete_{_line_id_del}", use_container_width=True):
+                                    st.session_state[_del_key] = True
+                                    st.rerun()
+                            else:
+                                st.warning(f"Delete {_bo_line_display_name(line)}?")
+                                _dl1, _dl2 = st.columns(2)
+                                if _dl1.button("Yes, delete", key=f"bo_line_delete_yes_{_line_id_del}", type="primary"):
+                                    try:
+                                        from modules.sql_adapter import run_write as _rw_line_del
+                                        _bo_release_stock_allocation_for_line(line, "line_delete")
+                                        _rw_line_del("""
+                                            UPDATE order_lines
+                                            SET is_deleted  = TRUE,
+                                                status      = 'CANCELLED',
+                                                deleted_at  = NOW(),
+                                                deleted_by  = %(who)s
+                                            WHERE id = %(lid)s::uuid
+                                        """, {"lid": _line_id_del,
+                                                "who": str(st.session_state.get("user_name") or "backoffice")})
+                                        _bo_refresh_order_total_value(str(order.get("id") or order.get("order_id") or ""))
+                                        st.session_state[_del_key] = False
+                                        st.success("✅ Line deleted")
+                                        st.rerun()
+                                    except Exception as _del_err:
+                                        st.error(f"Delete failed: {_del_err}")
+                                if _dl2.button("Cancel", key=f"bo_line_delete_no_{_line_id_del}"):
+                                    st.session_state[_del_key] = False
+                                    st.rerun()
+
+                # ── Render R and L side by side ───────────────────────────
+                if has_right:
+                    with col_r:
+                        _render_eye_block_ui(group['R'], group['R_idx'], 'R')
+
+                if has_left:
+                    with col_l:
+                        _render_eye_block_ui(group['L'], group['L_idx'], 'L')
+
+            # ── Services / other non-eye lines ────────────────────────────────
+            _other_display_lines = [
+                (idx, line) for idx, line in enumerate(all_lines)
+                if str(line.get("eye_side", "")).upper() not in ["R", "RIGHT", "L", "LEFT"]
+            ]
+            if _other_display_lines:
+                _svc_display_lines = _other_display_lines
+
+                if _svc_display_lines:
+                    st.markdown("#### 🔧 Services / Other Items")
+                for _oi, _oln in _svc_display_lines:
+                    _lp_o = _oln.get("lens_params") or {}
+                    if isinstance(_lp_o, str):
+                        try:
+                            import json as _oln_json
+                            _lp_o = _oln_json.loads(_lp_o)
+                        except Exception:
+                            _lp_o = {}
+                    _oname = str(
+                        _oln.get("product_name")
+                        or _lp_o.get("service_display_name")
+                        or _lp_o.get("display_product_name")
+                        or _lp_o.get("service_description")
+                        or "Service"
+                    )
+                    _oln_eye_side = str(_oln.get("eye_side") or "").upper()
+                    _is_frame_line = (
+                        _oln_eye_side in ("B", "BOTH", "FRAME")
+                        and not bool(_oln.get("is_service_line"))
+                    )
+                    if _is_frame_line:
+                        _svc_type = "FRAME"
+                        _saved_frame_route = str(
+                            _oln.get("manufacturing_route") or
+                            _lp_o.get("manufacturing_route") or "STOCK"
+                        ).upper()
+                        _route = _saved_frame_route
+                        _frame_route_wrong = False
+                        _frame_available_qty = 0
+                        _frame_ba = _lp_o.get("batch_allocation") or _oln.get("batch_allocation") or []
+                        _frame_ba0 = _frame_ba[0] if isinstance(_frame_ba, list) and _frame_ba else {}
+                        _frame_sku = str(
+                            _lp_o.get("batch_no")
+                            or _oln.get("batch_no")
+                            or (_frame_ba0.get("batch_no") if isinstance(_frame_ba0, dict) else "")
+                            or ""
+                        ).strip()
+                        _frame_stock_id = str(
+                            _lp_o.get("stock_id")
+                            or (_frame_ba0.get("stock_id") if isinstance(_frame_ba0, dict) else "")
+                            or (_frame_ba0.get("batch_id") if isinstance(_frame_ba0, dict) else "")
+                            or ""
+                        ).strip()
+                        _frame_meta = {}
+                        try:
+                            from modules.sql_adapter import run_query as _rq_frame_bo
+                            _frame_stock_rows = _rq_frame_bo("""
+                                SELECT
+                                    COALESCE(SUM(
+                                        GREATEST(0, COALESCE(quantity,0) - COALESCE(allocated_qty,0))
+                                    ),0) AS available_qty,
+                                    MAX(id::text) AS stock_id,
+                                    MAX(batch_no) AS batch_no,
+                                    MAX(COALESCE(colour_mix,'')) AS colour_mix,
+                                    MAX(COALESCE(frame_group,'')) AS frame_group
+                                FROM inventory_stock
+                                WHERE (
+                                       (%(sid)s != '' AND id::text = %(sid)s)
+                                    OR (%(sku)s != '' AND UPPER(TRIM(batch_no)) = UPPER(TRIM(%(sku)s)))
+                                    OR (
+                                          %(sid)s = '' AND %(sku)s = ''
+                                          AND %(pid)s != ''
+                                          AND product_id = %(pid)s::uuid
+                                       )
+                                )
+                                  AND COALESCE(is_active, TRUE) = TRUE
+                            """, {
+                                "pid": str(_oln.get("product_id") or ""),
+                                "sku": _frame_sku,
+                                "sid": _frame_stock_id,
+                            }) if _oln.get("product_id") else []
+                            if _frame_stock_rows:
+                                _frame_meta = _frame_stock_rows[0] or {}
+                                _frame_available_qty = int(float((_frame_meta.get("available_qty") if _frame_meta else 0) or 0))
+                                _frame_sku = _frame_sku or str(_frame_meta.get("batch_no") or "").strip()
+                                _frame_stock_id = _frame_stock_id or str(_frame_meta.get("stock_id") or "").strip()
+                        except Exception:
+                            _frame_available_qty = 0
+                        _frame_colour = str(
+                            _lp_o.get("colour_mix") or _oln.get("colour_mix") or _frame_meta.get("colour_mix") or ""
+                        ).strip()
+                        _frame_group = str(
+                            _lp_o.get("frame_group") or _oln.get("frame_group") or _frame_meta.get("frame_group") or ""
+                        ).strip()
+                        _frame_name_parts = [_oname]
+                        if _frame_sku and _frame_sku not in _frame_name_parts:
+                            _frame_name_parts.append(_frame_sku)
+                        if _frame_colour:
+                            _frame_name_parts.append(_frame_colour)
+                        if _frame_group:
+                            _frame_name_parts.append(_frame_group)
+                        _oname = " | ".join([str(_p).strip() for _p in _frame_name_parts if str(_p).strip()])
+                        _frame_already_alloc = int(_oln.get("allocated_qty") or 0) > 0
+                        if _frame_already_alloc or _frame_available_qty > 0:
+                            _frame_route_wrong = _saved_frame_route != "STOCK"
+                            _route = "STOCK"
+                            if _frame_route_wrong:
                                 try:
-                                    from modules.sql_adapter import run_query as _rq_g
-                                    _g_db = _rq_g(
-                                        "SELECT allocated_qty, "
-                                        "COALESCE(lens_params->>'batch_allocation','[]') AS ba_json "
-                                        "FROM order_lines WHERE id=%(lid)s::uuid LIMIT 1",
-                                        {"lid": _g_lid}
-                                    ) or []
-                                    if _g_db:
-                                        import json as _jg
-                                        _g_aq_db = int(_g_db[0].get("allocated_qty") or 0)
-                                        try:
-                                            _g_ba_db = _jg.loads(_g_db[0].get("ba_json") or "[]")
-                                        except Exception:
-                                            _g_ba_db = []
-                                        if _g_ba_db or _g_aq_db > 0:
-                                            _gl["batch_allocation"] = _g_ba_db
-                                            _gl["allocated_qty"]    = _g_aq_db or sum(
-                                                int(b.get("allocated_qty",0)) for b in _g_ba_db
-                                                if isinstance(b, dict)
+                                    from modules.sql_adapter import run_write as _rw_frame_route_fix
+                                    _rw_frame_route_fix("""
+                                        UPDATE order_lines
+                                        SET lens_params = CASE
+                                            WHEN %(sid)s != '' THEN jsonb_set(
+                                                jsonb_set(
+                                                    COALESCE(lens_params, '{}'::jsonb),
+                                                    '{manufacturing_route}', to_jsonb('STOCK'::text), TRUE
+                                                ),
+                                                '{stock_id}', to_jsonb(%(sid)s::text), TRUE
                                             )
-                                            _gl["batch_status"] = "ALLOCATED"
-                                        else:
-                                            _alloc_issues.append(
-                                                f"{'RE' if _g_eye=='R' else 'LE' if _g_eye=='L' else _g_eye} "
-                                                f"{_g_name} — STOCK route but not allocated"
+                                            ELSE jsonb_set(
+                                                COALESCE(lens_params, '{}'::jsonb),
+                                                '{manufacturing_route}', to_jsonb('STOCK'::text), TRUE
                                             )
+                                        END
+                                        WHERE id = %(lid)s::uuid
+                                    """, {
+                                        "sid": _frame_stock_id,
+                                        "lid": str(_oln.get("line_id") or _oln.get("id") or ""),
+                                    })
+                                    _frame_route_wrong = False
                                 except Exception:
                                     pass
-
-                    elif _g_route in ("VENDOR","EXTERNAL_LAB","INHOUSE"):
-                        # Non-stock lines: ensure no stale allocation lingers
-                        if _gl.get("batch_allocation"):
-                            _gl["batch_allocation"] = []
-                            _gl["allocated_qty"]    = 0
-
-                if _alloc_issues:
-                    st.error("❌ **Save blocked — allocation incomplete:**")
-                    for _issue in _alloc_issues:
-                        st.warning(f"• {_issue}")
-                    st.info("Open **🗂️ Manage Stock** for each flagged line, allocate the batch, then save.")
-                    return
-                # ═══════════════════════════════════════════════════════════
-
-                try:
-                    # ── GST Recalculation — MUST succeed before save ──────────
-                    try:
-                        from modules.pricing.tax_engine import apply_taxes
-                        tax_input = {
-                            "order_type": order.get("order_type", "RETAIL"),
-                            "net_value":  sum(
-                                float(l.get("billing_total") or l.get("total_price") or 0)
-                                for l in all_lines
-                            ),
-                            "lines": all_lines,
-                        }
-                        taxed = apply_taxes(tax_input)
-                        order["tax_amount"]  = taxed["tax_amount"]
-                        order["final_value"] = taxed["final_value"]
-                    except Exception as _tax_err:
-                        st.error(f"❌ GST recalculation failed — order NOT saved: {_tax_err}")
-                        st.stop()   # lock auto-clears
-                    # ─────────────────────────────────────────────────────────
-
-                    from modules.persistence.order_persistence import save_order_to_db
-                    from modules.sql_adapter import run_query
-
-                    # ── Smart status advance on save ─────────────────────────
-                    # If all lines are stock-allocated → jump to CONFIRMED
-                    # (order is collected, nothing to procure)
-                    _all_stock_now = all(
-                        (l.get("manufacturing_route") or "STOCK") == "STOCK"
-                        for l in all_lines
-                    ) if all_lines else False
-                    _has_vendor = any(
-                        (l.get("manufacturing_route") or "") in ("VENDOR", "EXTERNAL_LAB", "INHOUSE")
-                        for l in all_lines
-                    )
-                    _cur_status = order.get("status", "PENDING")
-                    # ── Status advance rules ─────────────────────────────
-                    # STOCK only → CONFIRMED (already collected from shelf)
-                    # VENDOR/INHOUSE/EXTERNAL_LAB → CONFIRMED once supplier
-                    #   assigned (supplier_id set on line).  The assignment
-                    #   panel's "Confirm All" is the procurement confirmation.
-                    # If no supplier set yet → stay PENDING.
-                    # RULE: Any save from backoffice moves order to CONFIRMED.
-                    # PENDING / UNDER_REVIEW / PROVISIONAL → CONFIRMED on save.
-                    # Staff has reviewed lines, pricing, allocation — save = confirm.
-                    # Already CONFIRMED or beyond → leave status unchanged.
-                    _CONFIRMABLE = {
-                        "PENDING", "PENDING_VALIDATION", "PROVISIONAL",
-                        "UNDER_REVIEW", "ORDER_SAVED", "",
-                    }
-                    if _cur_status.upper() in _CONFIRMABLE:
-                        # ── FULL_ADVANCE gate: check payment before confirming ──
-                        _fa_gate_ok = True
-                        try:
-                            from modules.core.business_rules import get_billing_category
-                            from modules.sql_adapter import run_query as _rq_fa_bo
-                            _fa_pid_bo = str(order.get("party_id") or "")
-                            if _fa_pid_bo:
-                                _fa_row_bo = _rq_fa_bo(
-                                    "SELECT COALESCE(billing_category,payment_mode,'ON_COMPLETION') AS bc "
-                                    "FROM parties WHERE id=%s::uuid LIMIT 1", (_fa_pid_bo,)
-                                )
-                                _fa_bc_bo = (_fa_row_bo[0]["bc"] if _fa_row_bo else None) or "ON_COMPLETION"
-                                _fa_cfg_bo = get_billing_category(_fa_bc_bo)
-                                if _fa_cfg_bo.get("requires_full_pay_before_confirm"):
-                                    _fa_oid_bo = str(order.get("order_id") or order.get("id") or "")
-                                    _fa_total_bo = float(order.get("total_value") or 0)
-                                    _fa_paid_r_bo = _rq_fa_bo("""
-                                        SELECT COALESCE(SUM(amount),0) AS paid FROM payments
-                                        WHERE party_id=%s::uuid
-                                          AND COALESCE(is_deleted,FALSE)=FALSE
-                                          AND (
-                                              (advance_for_order_id IS NOT NULL
-                                               AND advance_for_order_id::text = %s)
-                                              OR payment_date::date = CURRENT_DATE
-                                          )
-                                    """, (_fa_pid_bo, _fa_oid_bo))
-                                    _fa_paid_bo = float(_fa_paid_r_bo[0]["paid"] if _fa_paid_r_bo else 0)
-                                    if _fa_paid_bo < _fa_total_bo - 0.01:
-                                        _fa_gate_ok = False
-                                        _fa_pending = round(_fa_total_bo - _fa_paid_bo, 2)
-                                        _fa_ono_disp = order.get("order_no") or _fa_oid_bo
-                                        _fa_pname   = order.get("party_name") or ""
-                                        st.error(
-                                            f"❌ **Full Advance required — Order cannot be confirmed.**\n\n"
-                                            f"**Party:** {_fa_pname}  \n"
-                                            f"**Order:** #{_fa_ono_disp}  \n"
-                                            f"**Order Total:** ₹{_fa_total_bo:,.2f}  \n"
-                                            f"**Paid:** ₹{_fa_paid_bo:,.2f}  \n"
-                                            f"**Pending:** ₹{_fa_pending:,.2f}  \n\n"
-                                            f"👉 Go to **💰 Billing → Payment** → select party **{_fa_pname}** "
-                                            f"→ select order **#{_fa_ono_disp}** → record ₹{_fa_pending:,.2f} "
-                                            f"→ come back and save to confirm."
-                                        )
-                        except Exception:
-                            pass  # gate is best-effort
-                        if _fa_gate_ok:
-                            order["status"] = "CONFIRMED"
-                    # ─────────────────────────────────────────────────────
-
-                    # Write status to DB directly FIRST (before save, so upsert picks it up)
-                    _new_status = order["status"]
-                    try:
-                        run_query(
-                            "UPDATE orders SET status=%(s)s, updated_at=NOW() WHERE order_no=%(n)s",
-                            {"s": _new_status, "n": order.get("order_no")},
-                        )
-                    except Exception:
-                        pass
-                    # ─────────────────────────────────────────────────────
-
-                    saved_id = save_order_to_db(order)
-                    for line in all_lines:
-                        line["pricing_locked"] = True
-
-                    # Reset reassignment ack so next edit triggers the warning again
-                    _oid_warn = get_display_order_id(order)
-                    st.session_state.pop(f"reassign_ack_{_oid_warn}", None)
-                    st.session_state.pop(f"reassign_warned_{_oid_warn}", None)
-
-                    # ── Write edit log entry (JSONL file — zero DB load) ───
-                    try:
-                        from modules.security.roles import current_user_name as _cur_user
-                        _log_user = _cur_user()
-                        if not isinstance(_log_user, str):
-                            _log_user = getattr(_log_user, "name", str(_log_user))
-                    except Exception:
-                        _log_user = st.session_state.get("user_name", "system")
-                    try:
-                        from modules.backoffice.edit_log_panel import log_edit as _log_edit
-                        _log_edit(
-                            event    = "ORDER_SAVED",
-                            order_no = order.get("order_no", ""),
-                            party    = order.get("party_name") or order.get("patient_name", ""),
-                            by       = _log_user,
-                            category = "SAVE",
-                            detail   = {
-                                "from_status": _old_status,
-                                "to_status":   _new_status,
-                                "line_count":  len(all_lines),
-                            },
-                            remarks  = f"Saved: {_old_status} → {_new_status}",
-                        )
-                    except Exception:
-                        pass  # logging must never crash the save
-
-                    # Update the in-memory order in bo_active_orders so the
-                    # detail view reflects the new status without a full reload
-                    _ono = order.get("order_no")
-                    for _o in st.session_state.get("bo_active_orders", []):
-                        if _o.get("order_no") == _ono:
-                            _o["status"]     = _new_status
-                            _o["updated_at"] = str(datetime.datetime.now())[:16]
-                            break
-
-                    # Clear load cache so next dashboard Load gets fresh data
-                    try:
-                        from modules.backoffice.backoffice_helpers import load_orders_from_database
-                        load_orders_from_database.clear()
-                    except Exception:
-                        pass
-
-                    _disp_no = order.get("display_order_no") or order.get("order_no", saved_id)
-                    _old_status = _cur_status  # Status before save
-                    _new_status = order["status"]  # Status after save logic
-                    # Verify display status against billing documents — never show BILLED if no docs
-                    try:
-                        from .backoffice import _determine_workflow_status, _order_lines as _ols
-                        _display_new_status = _determine_workflow_status(order, _new_status, _ols(order))
-                    except Exception:
-                        _display_new_status = _new_status
-
-                    # Check if status actually changed or was already confirmed
-                    if _old_status == "CONFIRMED" and _new_status == "CONFIRMED":
-                        # Order was already confirmed, show appropriate message
-                        confirmed_at = order.get("confirmed_at") or order.get("updated_at") or order.get("created_at")
-                        if confirmed_at:
-                            try:
-                                # Format timestamp nicely
-                                if isinstance(confirmed_at, str):
-                                    # Try to parse timestamp
-                                    if "T" in confirmed_at:  # ISO format
-                                        dt = datetime.datetime.fromisoformat(confirmed_at.replace("Z", "+00:00"))
-                                    else:
-                                        dt = datetime.datetime.strptime(confirmed_at[:19], "%Y-%m-%d %H:%M:%S")
-                                    formatted_time = dt.strftime("%d %b %Y at %I:%M %p")
-                                    st.success(f"✅ Order **{_disp_no}** saved — Already confirmed on {formatted_time}")
-                                else:
-                                    st.success(f"✅ Order **{_disp_no}** saved — Status: CONFIRMED (already confirmed)")
-                            except Exception:
-                                st.success(f"✅ Order **{_disp_no}** saved — Status: CONFIRMED (already confirmed)")
-                        else:
-                            st.success(f"✅ Order **{_disp_no}** saved — Status: CONFIRMED (already confirmed)")
-                    elif _old_status != _new_status and _new_status == "CONFIRMED":
-                        # Status just changed to CONFIRMED - show original success message
-                        st.success(
-                            f"✅ Order **{_disp_no}** saved — "
-                            f"Status: **{_display_new_status}** 🎯"
-                        )
-                        st.info("📦 All lines stock-allocated. Order is Collected ✓")
-                        # ── WhatsApp notification ─────────────────────────
-                        try:
-                            from modules.wa_hub import wa_panel, wa_order_confirmed
-                            from modules.settings.shop_master import get_unit_info
-                            _wa_party  = order.get("party_name") or order.get("patient_name","")
-                            _wa_mobile = order.get("patient_mobile","") or order.get("mobile","") or order.get("party_mobile","")
-                            _wa_otype  = order.get("order_type","WHOLESALE")
-                            _wa_shop   = get_unit_info("wholesale" if "WHOLE" in _wa_otype.upper() else "retail")
-                            _wa_msg    = wa_order_confirmed(
-                                party      = _wa_party,
-                                order_no   = _disp_no,
-                                total      = order.get("total_value", 0),
-                                lines      = order.get("order_lines") or [],
-                                shop_name  = _wa_shop.get("shop_name","DV Optical"),
-                                phone      = _wa_shop.get("shop_phone",""),
-                            )
-                            wa_panel(_wa_mobile, _wa_msg,
-                                     key=f"wa_bo_confirmed_{_disp_no}",
-                                     title="📲 WhatsApp — Order Confirmed",
-                                     expanded=True)
-                        except Exception:
-                            pass
-                        st.balloons()
+                        elif _saved_frame_route not in ("STOCK", "VENDOR"):
+                            _route = "VENDOR"
                     else:
-                        # Run silent integrity check after every save
-                        try:
-                            from modules.backoffice.audit_logger import check_order_integrity
-                            _ic_r = check_order_integrity(str(order.get("id","")))
-                            if not _ic_r.get("ok"):
-                                st.warning("⚠️ Integrity warning — check Status tab.")
-                        except Exception:
-                            pass
-                        # Regular save with status change or no change
-                        st.success(
-                            f"✅ Order **{_disp_no}** saved — "
-                            f"Status: **{_display_new_status}** 🎯"
-                        )
-                        if _display_new_status == "CONFIRMED":
-                            st.info("📦 All lines stock-allocated. Order is Collected ✓")
-                        st.balloons()
-                except Exception as _save_err:
+                        _frame_route_wrong = False
+                        _frame_available_qty = 0
+                        _frame_sku = ""
+                        _svc_type = str(_lp_o.get("service_production_type") or _lp_o.get("charge_type") or "").upper()
+                        _route = str(_oln.get("manufacturing_route") or _lp_o.get("manufacturing_route") or "SERVICE").upper()
+                    _qty_factor = _lp_o.get("service_qty_factor")
+                    if _is_frame_line:
+                        _qty_text = f"{int(_oln.get('billing_qty') or _oln.get('quantity') or 1)} PCS"
+                    else:
+                        _qty_text = f"{float(_qty_factor):g} pair" if _qty_factor not in (None, "", 0) else f"{int(_oln.get('billing_qty') or 1)}"
+                    _total = float(_oln.get("billing_total") or 0)
+                    _gst = float(_oln.get("gst_percent") or 0)
+                    _badge_color = "#a78bfa" if _svc_type == "COLOURING" else ("#f59e0b" if _svc_type == "FITTING" else "#22c55e")
+                    st.markdown(
+                        f"<div style='background:#0f172a;border:1px solid #1e293b;"
+                        f"border-left:3px solid {_badge_color};border-radius:6px;"
+                        f"padding:9px 12px;margin:6px 0'>"
+                        f"<div style='display:flex;justify-content:space-between;gap:10px;align-items:center'>"
+                        f"<div><b style='color:#f8fafc'>{_oname}</b>"
+                        f"<div style='font-size:0.72rem;color:#94a3b8'>"
+                        f"{_svc_type or 'SERVICE'} · Route {_route} · Qty {_qty_text}</div></div>"
+                        f"<div style='text-align:right;color:#f8fafc;font-weight:800'>₹{_total:,.2f}"
+                        f"<div style='font-size:0.68rem;color:#94a3b8;font-weight:500'>{_gst:g}% GST</div></div>"
+                        f"</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    _svc_note = str(_lp_o.get("service_instruction") or "").strip()
+                    if _svc_note:
+                        st.caption(f"Instruction: {_svc_note}")
+                    if _is_frame_line:
+                        _frame_alloc = int(_oln.get("allocated_qty") or 0)
+                        _frame_need = max(0, int(_oln.get("billing_qty") or _oln.get("quantity") or 1) - _frame_alloc)
+                        if _frame_route_wrong:
+                            st.warning("Frame route was saved as VENDOR earlier, but matching stock exists. Route shown as STOCK.")
+                        if _frame_need > 0 and _frame_available_qty <= 0 and _route == "STOCK":
+                            st.error("Frame is marked Stock but no inventory is available for this SKU. Receive stock or change to vendor arrangement.")
+                        elif _frame_need > 0 and _frame_available_qty <= 0:
+                            st.warning("Frame is not available in inventory. Proceed only if this frame will be arranged from vendor.")
+                        elif _frame_need > 0 and _frame_available_qty > 0:
+                            _assign_key = f"bo_assign_frame_stock_{str(_oln.get('line_id') or _oln.get('id') or '')}"
+                            if st.button("✅ Assign frame from inventory", key=_assign_key, use_container_width=True):
+                                try:
+                                    from modules.sql_adapter import run_write as _rw_frame_bo
+                                    _rw_frame_bo("""
+                                        WITH target AS (
+                                            SELECT id, batch_no
+                                            FROM inventory_stock
+                                            WHERE (
+                                                   (%(sid)s != '' AND id::text = %(sid)s)
+                                                OR (%(sku)s != '' AND UPPER(TRIM(batch_no)) = UPPER(TRIM(%(sku)s)))
+                                                OR (
+                                                      %(sid)s = '' AND %(sku)s = ''
+                                                      AND %(pid)s != ''
+                                                      AND product_id = %(pid)s::uuid
+                                                   )
+                                            )
+                                              AND COALESCE(is_active, TRUE) = TRUE
+                                              AND GREATEST(0, COALESCE(quantity,0) - COALESCE(allocated_qty,0)) >= %(qty)s
+                                            ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                                            LIMIT 1
+                                        ), upd_stock AS (
+                                            UPDATE inventory_stock s
+                                            SET allocated_qty = COALESCE(allocated_qty,0) + %(qty)s,
+                                                updated_at = NOW()
+                                            FROM target t
+                                            WHERE s.id = t.id
+                                            RETURNING s.id, s.batch_no
+                                        )
+                                        UPDATE order_lines ol
+                                        SET allocated_qty = COALESCE(allocated_qty,0) + %(qty)s,
+                                            ready_qty = GREATEST(COALESCE(ready_qty,0), COALESCE(allocated_qty,0) + %(qty)s),
+                                            status = 'READY',
+                                            lens_params = jsonb_set(
+                                                jsonb_set(
+                                                    jsonb_set(
+                                                        COALESCE(ol.lens_params, '{}'::jsonb),
+                                                        '{manufacturing_route}', to_jsonb('STOCK'::text), TRUE
+                                                    ),
+                                                    '{stock_id}', to_jsonb((SELECT id::text FROM upd_stock LIMIT 1)), TRUE
+                                                ),
+                                                '{batch_allocation}',
+                                                jsonb_build_array(jsonb_build_object(
+                                                    'stock_id', (SELECT id::text FROM upd_stock LIMIT 1),
+                                                    'batch_id', (SELECT id::text FROM upd_stock LIMIT 1),
+                                                    'batch_no', (SELECT batch_no FROM upd_stock LIMIT 1),
+                                                    'allocated_qty', %(qty)s
+                                                )),
+                                                TRUE
+                                            )
+                                        WHERE ol.id = %(lid)s::uuid
+                                          AND EXISTS (SELECT 1 FROM upd_stock)
+                                    """, {
+                                        "pid": str(_oln.get("product_id") or ""),
+                                        "sku": _frame_sku,
+                                        "sid": _frame_stock_id,
+                                        "qty": _frame_need,
+                                        "lid": str(_oln.get("line_id") or _oln.get("id") or ""),
+                                    })
+                                    st.success("Frame assigned from inventory.")
+                                    st.rerun()
+                                except Exception as _frame_assign_e:
+                                    st.error(f"Frame assignment failed: {_frame_assign_e}")
+                    if _tab1_edit_locked:
+                        continue
+                    _exp_lbl = "✏️ Edit / Delete Frame" if _is_frame_line else "✏️ Edit / Delete Service"
+                    with st.expander(_exp_lbl, expanded=False):
+                        if True:
+                            _sid = str(_oln.get("line_id") or _oln.get("id") or "")
+                            _old_total = _bo_float(_oln.get("billing_total") or _oln.get("total_price"))
+                            _old_gst = _bo_float(_oln.get("gst_percent"))
+                            if _is_frame_line:
+                                _old_qty = max(1, int(_oln.get("billing_qty") or _oln.get("quantity") or 1))
+                                _old_rate = round(_old_total / _old_qty, 2) if _old_qty else _old_total
+                                _ec1, _ec2, _ec3 = st.columns([1, 1, 1])
+                                _new_qty = _ec1.number_input(
+                                    "Qty (PCS)",
+                                    min_value=1,
+                                    value=int(_old_qty),
+                                    step=1,
+                                    key=f"bo_frame_edit_qty_{_sid}",
+                                )
+                                _new_rate = _ec2.number_input(
+                                    "Rate / pc",
+                                    min_value=0.0,
+                                    value=float(_old_rate or 0),
+                                    step=10.0,
+                                    key=f"bo_frame_edit_rate_{_sid}",
+                                )
+                                _new_gst = _ec3.number_input(
+                                    "GST%",
+                                    min_value=0.0,
+                                    max_value=28.0,
+                                    value=float(_old_gst or 0),
+                                    step=0.5,
+                                    key=f"bo_frame_edit_gst_{_sid}",
+                                )
+                                _new_total = round(float(_new_rate or 0) * int(_new_qty or 1), 2)
+                                _new_gst_amt = round(_new_total - (_new_total / (1 + float(_new_gst or 0) / 100)), 2) if _new_gst else 0.0
+                                st.caption(f"New amount: ₹{_new_total:,.2f} · GST ₹{_new_gst_amt:,.2f}")
+                                _fb1, _fb2 = st.columns(2)
+                                if _fb1.button("💾 Save Frame", key=f"bo_frame_edit_save_{_sid}", use_container_width=True):
+                                    try:
+                                        from modules.sql_adapter import run_write as _rw_frame_edit
+                                        _rw_frame_edit("""
+                                            UPDATE order_lines
+                                            SET quantity=%(qty)s,
+                                                unit_price=%(up)s,
+                                                total_price=%(tp)s,
+                                                billing_total=%(tp)s,
+                                                gst_percent=%(gp)s,
+                                                gst_amount=%(ga)s
+                                            WHERE id=%(lid)s::uuid
+                                        """, {
+                                            "qty": int(_new_qty or 1),
+                                            "up": float(_new_rate or 0),
+                                            "tp": float(_new_total or 0),
+                                            "gp": float(_new_gst or 0),
+                                            "ga": float(_new_gst_amt or 0),
+                                            "lid": _sid,
+                                        })
+                                        _oln["quantity"] = int(_new_qty or 1)
+                                        _oln["billing_qty"] = int(_new_qty or 1)
+                                        _oln["unit_price"] = float(_new_rate or 0)
+                                        _oln["total_price"] = float(_new_total or 0)
+                                        _oln["billing_total"] = float(_new_total or 0)
+                                        _oln["gst_percent"] = float(_new_gst or 0)
+                                        _oln["gst_amount"] = float(_new_gst_amt or 0)
+                                        try:
+                                            from modules.backoffice.backoffice_helpers import refresh_order_pricing_rules
+                                            refresh_order_pricing_rules(order, persist=True)
+                                        except Exception as _frame_sync_err:
+                                            logger.warning("Frame edit pricing sync failed: %s", _frame_sync_err)
+                                        _bo_refresh_order_total_value(str(order.get("id") or order.get("order_id") or ""))
+                                        st.success("Frame updated.")
+                                        st.rerun()
+                                    except Exception as _frame_edit_e:
+                                        st.error(f"Frame update failed: {_frame_edit_e}")
+                                if _fb2.button("🗑️ Delete Frame", key=f"bo_frame_del_{_sid}", use_container_width=True):
+                                    try:
+                                        from modules.sql_adapter import run_write as _rw_frame_del
+                                        _rw_frame_del(
+                                            "UPDATE order_lines SET is_deleted=TRUE WHERE id=%(lid)s::uuid",
+                                            {"lid": _sid},
+                                        )
+                                        _oln["is_deleted"] = True
+                                        try:
+                                            from modules.backoffice.backoffice_helpers import refresh_order_pricing_rules
+                                            refresh_order_pricing_rules(order, persist=True)
+                                        except Exception as _frame_del_sync_err:
+                                            logger.warning("Frame delete pricing sync failed: %s", _frame_del_sync_err)
+                                        _bo_refresh_order_total_value(str(order.get("id") or order.get("order_id") or ""))
+                                        st.warning("Frame deleted from order.")
+                                        st.rerun()
+                                    except Exception as _frame_del_e:
+                                        st.error(f"Frame delete failed: {_frame_del_e}")
+                                continue
+
+                            _old_factor = _bo_float(_lp_o.get("service_qty_factor"), 1.0) or 1.0
+                            _rate_pair = _bo_float(_lp_o.get("service_rate_per_pair"))
+                            if _rate_pair <= 0 and _old_factor > 0:
+                                _rate_pair = round(_old_total / _old_factor, 2)
+                            _ec1, _ec2, _ec3 = st.columns([1, 1, 1])
+                            _new_factor = _ec1.selectbox(
+                                "Qty",
+                                [0.5, 1.0, 1.5, 2.0, 3.0],
+                                index=[0.5, 1.0, 1.5, 2.0, 3.0].index(_old_factor) if _old_factor in [0.5, 1.0, 1.5, 2.0, 3.0] else 1,
+                                format_func=lambda v: f"{v:g} pair" if v != 0.5 else "0.5 pair — one eye",
+                                key=f"bo_svc_edit_qty_{_sid}",
+                            )
+                            _new_rate = _ec2.number_input(
+                                "Rate / pair",
+                                min_value=0.0,
+                                value=float(_rate_pair or 0),
+                                step=10.0,
+                                key=f"bo_svc_edit_rate_{_sid}",
+                            )
+                            _new_gst = _ec3.number_input(
+                                "GST%",
+                                min_value=0.0,
+                                max_value=28.0,
+                                value=float(_old_gst or 0),
+                                step=0.5,
+                                key=f"bo_svc_edit_gst_{_sid}",
+                            )
+                            _new_base = round(float(_new_rate or 0) * float(_new_factor or 1), 2)
+                            _new_total, _new_gst_amt = _bo_service_line_amounts(_new_base, _new_gst, order.get("order_type"))
+                            st.caption(f"New amount: ₹{_new_total:,.2f} · GST ₹{_new_gst_amt:,.2f}")
+                            _eb1, _eb2 = st.columns(2)
+                            if _eb1.button("💾 Save Service", key=f"bo_svc_edit_save_{_sid}", use_container_width=True):
+                                try:
+                                    import json as _svc_edit_json
+                                    from modules.sql_adapter import run_write as _rw_svc_edit
+                                    _lp_new = dict(_lp_o)
+                                    _lp_new["service_qty_factor"] = float(_new_factor)
+                                    _lp_new["service_rate_per_pair"] = float(_new_rate or 0)
+                                    _rw_svc_edit("""
+                                        UPDATE order_lines
+                                        SET unit_price=%(up)s,
+                                            total_price=%(tp)s,
+                                            billing_total=%(tp)s,
+                                            gst_percent=%(gp)s,
+                                            gst_amount=%(ga)s,
+                                            lens_params=%(lp)s::jsonb
+                                        WHERE id=%(lid)s::uuid
+                                    """, {
+                                        "up": _new_base,
+                                        "tp": _new_total,
+                                        "gp": _new_gst,
+                                        "ga": _new_gst_amt,
+                                        "lp": _svc_edit_json.dumps(_lp_new),
+                                        "lid": _sid,
+                                    })
+                                    _bo_refresh_order_total_value(str(order.get("id") or order.get("order_id") or ""))
+                                    st.success("✅ Service updated")
+                                    # F3: audit service edit so changes appear in History tab
+                                    try:
+                                        from modules.backoffice.audit_logger import audit, AuditAction
+                                        audit(
+                                            AuditAction.PRICE_OVERRIDE,
+                                            entity="order_lines",
+                                            entity_id=_sid,
+                                            order_id=str(order.get("id") or order.get("order_id") or ""),
+                                            payload={
+                                                "action":     "service_edit",
+                                                "old_value":  str(round(_old_total, 2)),
+                                                "new_value":  str(round(_new_total, 2)),
+                                                "order_no":   str(order.get("order_no") or ""),
+                                            },
+                                        )
+                                    except Exception as _audit_svc_err:
+                                        logger.debug("Service edit audit write failed (non-fatal): %s", _audit_svc_err)
+                                    st.rerun()
+                                except Exception as _svc_edit_err:
+                                    st.error(f"Service update failed: {_svc_edit_err}")
+                            _confirm_key = f"bo_svc_delete_confirm_{_sid}"
+                            if not st.session_state.get(_confirm_key):
+                                if _eb2.button("🗑 Delete Service", key=f"bo_svc_delete_{_sid}", use_container_width=True):
+                                    st.session_state[_confirm_key] = True
+                                    st.rerun()
+                            else:
+                                st.warning("Delete this service line?")
+                                _dc1, _dc2 = st.columns(2)
+                                if _dc1.button("Yes, delete", key=f"bo_svc_delete_yes_{_sid}", type="primary"):
+                                    try:
+                                        from modules.sql_adapter import run_write as _rw_svc_del
+                                        _rw_svc_del("""
+                                            UPDATE order_lines
+                                            SET is_deleted  = TRUE,
+                                                status      = 'CANCELLED',
+                                                deleted_at  = NOW(),
+                                                deleted_by  = %(who)s
+                                            WHERE id = %(lid)s::uuid
+                                        """, {"lid": _sid,
+                                                "who": str(st.session_state.get("user_name") or "backoffice")})
+                                        _bo_refresh_order_total_value(str(order.get("id") or order.get("order_id") or ""))
+                                        st.session_state[_confirm_key] = False
+                                        st.success("✅ Service deleted")
+                                        # F3: audit service delete so it appears in History tab
+                                        try:
+                                            from modules.backoffice.audit_logger import audit, AuditAction
+                                            _deleted_amt = float(_oln.get("billing_total") or _oln.get("total_price") or 0)
+                                            audit(
+                                                AuditAction.PRICE_OVERRIDE,
+                                                entity="order_lines",
+                                                entity_id=_sid,
+                                                order_id=str(order.get("id") or order.get("order_id") or ""),
+                                                payload={
+                                                    "action":    "service_delete",
+                                                    "old_value": str(round(_deleted_amt, 2)),
+                                                    "new_value": "0",
+                                                    "order_no":  str(order.get("order_no") or ""),
+                                                },
+                                            )
+                                        except Exception as _audit_del_err:
+                                            logger.debug("Service delete audit write failed (non-fatal): %s", _audit_del_err)
+                                        st.rerun()
+                                    except Exception as _svc_del_err:
+                                        st.error(f"Delete failed: {_svc_del_err}")
+                                if _dc2.button("Cancel", key=f"bo_svc_delete_no_{_sid}"):
+                                    st.session_state[_confirm_key] = False
+                                    st.rerun()
+
+            # ── Restore accidentally deleted lines before final lock ─────────────
+            if not _tab1_edit_locked:
+                try:
+                    from modules.sql_adapter import resolve_order_uuid as _resolve_order_uuid
+                    _restore_order_id = _resolve_order_uuid(order.get("id") or order.get("order_id") or order.get("order_no")) or ""
+                except Exception:
+                    _restore_order_id = ""
+                _deleted_lines = []
+                if _restore_order_id:
                     try:
-                        from modules.core.error_logger import log_error
-                        log_error(_save_err, context="backoffice.save_to_order",
-                                  payload={"order_no": order.get("order_no"),
-                                           "order_type": order.get("order_type")})
-                    except Exception:
-                        pass
-                    st.error(f"❌ Save failed: {_save_err}")
-    
-    with tab2:
-        # Documents tab — smart default based on what lines this order has
-        has_inhouse = bool(order.get('inhouse_lines'))
-        has_lab     = bool(order.get('lab_order_lines'))
-        has_stock   = bool(order.get('stock_lines'))
+                        from modules.sql_adapter import run_query as _rq_restore
+                        _deleted_lines = _rq_restore(
+                            """
+                            SELECT
+                                ol.id::text AS line_id,
+                                COALESCE(p.product_name, ol.lens_params->>'display_product_name', 'Line') AS product_name,
+                                COALESCE(p.brand, '') AS brand,
+                                COALESCE(ol.eye_side, '') AS eye_side,
+                                COALESCE(ol.billing_qty, ol.quantity, 1) AS qty,
+                                COALESCE(ol.unit_price, 0) AS unit_price,
+                                COALESCE(ol.billing_total, ol.total_price, 0) AS billing_total,
+                                COALESCE(ol.is_service_line, FALSE) AS is_service_line
+                            FROM order_lines ol
+                            LEFT JOIN products p ON p.id = ol.product_id
+                            WHERE ol.order_id = %(oid)s::uuid
+                              AND COALESCE(ol.is_deleted, FALSE) = TRUE
+                              AND ol.deleted_at IS NOT NULL
+                            ORDER BY ol.deleted_at DESC
+                            """,
+                            {"oid": _restore_order_id},
+                        ) or []
+                    except Exception as _restore_read_err:
+                        logger.warning("Backoffice deleted-line restore read failed: %s", _restore_read_err)
 
-        # Default to the most relevant tab for this order type
-        if has_stock and not has_inhouse and not has_lab:
-            default_doc = 'Labels'
-        elif has_inhouse and not has_lab:
-            default_doc = 'Job Cards'
-        elif has_lab and not has_inhouse:
-            default_doc = 'Lab Orders'
-        else:
-            default_doc = 'All'
+                if _deleted_lines:
+                    with st.expander("↩ Restore Deleted Lines", expanded=False):
+                        st.caption("Deleted lines stay recoverable here until the order is finally saved/locked.")
+                        for _dl in _deleted_lines:
+                            _dlid = str(_dl.get("line_id") or "")
+                            _eye = str(_dl.get("eye_side") or "").upper()
+                            _eye_label = (
+                                "R" if _eye in ("R", "RIGHT") else
+                                "L" if _eye in ("L", "LEFT") else
+                                "SVC" if bool(_dl.get("is_service_line")) else "OTHER"
+                            )
+                            _rc1, _rc2 = st.columns([4, 1])
+                            _rc1.markdown(
+                                f"**{_eye_label}** · {_dl.get('product_name') or 'Line'} "
+                                f"· Qty {_dl.get('qty') or 1} · ₹{float(_dl.get('billing_total') or 0):,.2f}"
+                            )
+                            if _rc2.button("Restore", key=f"bo_restore_line_{_dlid}", use_container_width=True):
+                                try:
+                                    from modules.sql_adapter import run_write as _rw_restore
+                                    _rw_restore(
+                                        """
+                                        UPDATE order_lines
+                                        SET is_deleted = FALSE,
+                                            status = CASE
+                                                WHEN COALESCE(is_service_line, FALSE) THEN 'READY'
+                                                ELSE 'PENDING'
+                                            END
+                                        WHERE id = %(lid)s::uuid
+                                        """,
+                                        {"lid": _dlid},
+                                    )
+                                    _bo_refresh_order_total_value(_restore_order_id)
+                                    st.success("✅ Line restored")
+                                    st.rerun()
+                                except Exception as _restore_err:
+                                    st.error(f"Restore failed: {_restore_err}")
+        
+            # ── Add Product / Service to Order ───────────────────────────────────
+            st.markdown("---")
+            _add_mode_key = f"bo_add_mode_{get_display_order_id(order)}"
+            _add_mode = None if _tab1_edit_locked else st.session_state.get(_add_mode_key, None)
+            if not _tab1_edit_locked:
+                _ac1, _ac2, _ac3 = st.columns([1, 1, 3])
+                with _ac1:
+                    if st.button("➕ Add Product", key=f"bo_add_prod_{get_display_order_id(order)}",
+                                 use_container_width=True):
+                        st.session_state[_add_mode_key] = "PRODUCT" if _add_mode != "PRODUCT" else None
+                        st.rerun()
+                with _ac2:
+                    if st.button("🔧 Add Service", key=f"bo_add_svc_{get_display_order_id(order)}",
+                                 use_container_width=True):
+                        st.session_state[_add_mode_key] = "SERVICE" if _add_mode != "SERVICE" else None
+                        st.rerun()
 
-        doc_options = ['Job Cards', 'Lab Orders', 'Labels', 'All']
-        doc_type = st.radio(
-            "Document Type",
-            doc_options,
-            index=doc_options.index(default_doc),
-            horizontal=True,
-            key=f"doc_type_{order_id}"
-        )
+            if _add_mode == "PRODUCT":
+                import json as _apj
+                st.markdown("<div style='background:#0f172a;border:1px solid #334155;"
+                            "border-top:3px solid #0891b2;border-radius:8px;padding:12px;margin:6px 0'>",
+                            unsafe_allow_html=True)
+                st.markdown("**➕ Add Product to Order**")
 
-        shown_any = False
+                _ap1, _ap2, _ap3 = st.columns([3, 1, 1])
+                _ap_search = _ap1.text_input("Search product name",
+                                             key=f"bo_ap_search_{get_display_order_id(order)}",
+                                             placeholder="Type product name...")
+                _ap_eye = _ap2.selectbox("Eye", ["R","L","B","Both"],
+                                         key=f"bo_ap_eye_{get_display_order_id(order)}")
+                _ap_qty = _ap3.number_input("Qty", min_value=1, value=1, step=1,
+                                            key=f"bo_ap_qty_{get_display_order_id(order)}")
 
-        if doc_type in ['Job Cards', 'All']:
-            if has_inhouse:
-                st.markdown("""
-                <div style='background:linear-gradient(135deg,#1e3a5f,#0f172a);border:1px solid #3b82f6;
-                    border-radius:12px;padding:20px;margin:10px 0'>
-                    <h4 style='color:#60a5fa;margin:0 0 10px'>🔧 Job Card Management</h4>
-                    <p style='color:#94a3b8;font-size:0.9rem'>
-                        Job card creation, blank selection, and printing are now handled by 
-                        <strong>Production staff</strong> in the <strong>Production → In-house Lab</strong> tab.
-                    </p>
-                    <p style='color:#f59e0b;font-size:0.85rem'>
-                        ➜ Navigate to Production tab to manage job cards and blanks.
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-                shown_any = True
-            elif doc_type == 'Job Cards':
-                st.info("No in-house manufacturing lines on this order — no job cards to generate.")
+                _ap_results = []
+                if _ap_search and len(_ap_search) >= 2:
+                    try:
+                        from modules.sql_adapter import run_query as _rq_ap
+                        _ap_results = _rq_ap(
+                            """SELECT id::text, product_name, brand, main_group, unit,
+                                      COALESCE(gst_percent, 0) AS gst_percent
+                               FROM products
+                               WHERE LOWER(product_name) LIKE LOWER(%(s)s)
+                                 AND COALESCE(is_active, TRUE) = TRUE
+                               ORDER BY product_name LIMIT 15""",
+                            {"s": f"%{_ap_search}%"}
+                        ) or []
+                    except Exception as _ape:
+                        st.error(f"Search error: {_ape}")
 
-        if doc_type in ['Lab Orders', 'All']:
-            if has_lab:
-                generate_lab_orders(order)
-                shown_any = True
-            elif doc_type == 'Lab Orders':
-                st.info("No external lab lines on this order — no lab orders to generate.")
+                if _ap_results:
+                    _ap_names = [f"{r['product_name']} — {r.get('brand','') or r.get('main_group','')} [{r.get('unit','PCS')}]"
+                                 for r in _ap_results]
+                    _ap_sel_idx = st.selectbox("Select product", range(len(_ap_names)),
+                                               format_func=lambda i: _ap_names[i],
+                                               key=f"bo_ap_sel_{get_display_order_id(order)}")
+                    _ap_row = _ap_results[_ap_sel_idx]
 
-        if doc_type in ['Labels', 'All']:
-            if has_stock:
-                generate_labels(order)
-                shown_any = True
-            elif doc_type == 'Labels':
-                st.info("No stock lines on this order — no labels to generate.")
+                    _ap_pr1, _ap_pr2 = st.columns(2)
+                    _ap_price = _ap_pr1.number_input("Unit Price (₹)",
+                                                      min_value=0.0, step=10.0,
+                                                      key=f"bo_ap_price_{get_display_order_id(order)}")
+                    _ap_gst   = _ap_pr2.number_input("GST%",
+                                                      value=float(_ap_row.get("gst_percent") or 0),
+                                                      min_value=0.0, max_value=28.0,
+                                                      key=f"bo_ap_gst_{get_display_order_id(order)}")
 
-        if doc_type == 'All' and not shown_any:
-            st.warning("No documents to generate for this order yet. Add and allocate line items first.")
-    
-    with tab3:
-        from modules.backoffice.order_status_window import render_order_status_window
-        render_order_status_window(order)
+                    if st.button("✅ Add to Order", key=f"bo_ap_add_{get_display_order_id(order)}",
+                                 type="primary", use_container_width=True):
+                        try:
+                            import uuid as _apu
+                            import json as _apj_save
+                            from modules.sql_adapter import run_write as _rw_ap
+                            _ap_eye_db = "R" if _ap_eye in ("R","Right") else                                      "L" if _ap_eye in ("L","Left") else "B"
+                            _ap_line = {
+                                "product_id": str(_ap_row["id"]),
+                                "product_name": _ap_row.get("product_name"),
+                                "brand": _ap_row.get("brand"),
+                                "main_group": _ap_row.get("main_group"),
+                                "eye_side": _ap_eye_db,
+                                "quantity": int(_ap_qty),
+                                "billing_qty": int(_ap_qty),
+                                "unit_price": float(_ap_price or 0),
+                                "gst_percent": float(_ap_gst or 0),
+                                "lens_params": {},
+                            }
+                            # New backoffice product lines should pass through the
+                            # same discount engine before they hit DB.
+                            try:
+                                from modules.pricing.discount_flow import apply_order_discounts
+                                apply_order_discounts(
+                                    [_ap_line],
+                                    party_id=str(order.get("party_id") or ""),
+                                    order_type=str(order.get("order_type") or "RETAIL").upper(),
+                                )
+                            except Exception as _ap_de:
+                                logger.warning("Backoffice add-product discount failed: %s", _ap_de)
+                            if not float(_ap_line.get("billing_total") or _ap_line.get("total_price") or 0):
+                                _ap_disc = float(_ap_line.get("discount_amount") or 0)
+                                _ap_net = round(max(0.0, (float(_ap_price or 0) * int(_ap_qty)) - _ap_disc), 2)
+                                try:
+                                    from modules.core.price_qty_governor import compute_line_gst as _ap_cgst
+                                    _ap_g = _ap_cgst(
+                                        _ap_net / max(int(_ap_qty), 1),
+                                        int(_ap_qty),
+                                        float(_ap_gst or 0),
+                                        str(order.get("order_type") or "RETAIL").upper(),
+                                    )
+                                    _ap_line["billing_total"] = _ap_net
+                                    _ap_line["total_price"] = _ap_net
+                                    _ap_line["gst_amount"] = float(_ap_g.get("gst_amount") or 0)
+                                except Exception:
+                                    _ap_line["billing_total"] = _ap_net
+                                    _ap_line["total_price"] = _ap_net
+                                    _ap_line["gst_amount"] = round(_ap_net * float(_ap_gst or 0) / 100, 2)
+                            _new_ap_id = str(_apu.uuid4())
+                            _rw_ap("""
+                                INSERT INTO order_lines
+                                  (id, order_id, product_id, eye_side,
+                                   unit_price, total_price, billing_total,
+                                   gst_percent, gst_amount,
+                                   quantity, billing_qty, allocated_qty,
+                                   batch_status, lens_params,
+                                   discount_percent, discount_amount, discount_rule,
+                                   applied_rule_ids)
+                                VALUES
+                                  (%(id)s::uuid, %(oid)s::uuid, %(pid)s::uuid, %(eye)s,
+                                   %(up)s, %(tp)s, %(tp)s,
+                                   %(gp)s, %(ga)s,
+                                   %(qty)s, %(qty)s, 0,
+                                   'PENDING', %(lp)s::jsonb,
+                                   %(dp)s, %(da)s, %(dr)s, %(ari)s)
+                            """, {
+                                "id":  _new_ap_id,
+                                "oid": str(order.get("id") or ""),
+                                "pid": str(_ap_row["id"]),
+                                "eye": _ap_eye_db,
+                                "up":  float(_ap_line.get("unit_price") or 0),
+                                "tp":  float(_ap_line.get("billing_total") or _ap_line.get("total_price") or 0),
+                                "gp":  float(_ap_line.get("gst_percent") or _ap_gst or 0),
+                                "ga":  float(_ap_line.get("gst_amount") or 0),
+                                "qty": _ap_qty,
+                                "lp": _apj_save.dumps(_ap_line.get("lens_params") or {}),
+                                "dp": float(_ap_line.get("discount_percent") or 0),
+                                "da": float(_ap_line.get("discount_amount") or 0),
+                                "dr": str(_ap_line.get("discount_rule") or ""),
+                                "ari": str(_ap_line.get("applied_rule_ids") or ""),
+                            })
+                            try:
+                                _ap_line["id"] = _new_ap_id
+                                _ap_line["line_id"] = _new_ap_id
+                            except Exception:
+                                pass
+                            try:
+                                _ap_line_db = dict(_ap_line)
+                                _ap_line_db["id"] = _ap_line_db.get("line_id") or str(_ap_line_db.get("id") or "")
+                                _ap_line_db["line_id"] = _ap_line_db["id"]
+                                order.setdefault("lines", []).append(_ap_line_db)
+                                from modules.backoffice.backoffice_helpers import refresh_order_pricing_rules
+                                refresh_order_pricing_rules(order, persist=True)
+                            except Exception as _ap_sync_err:
+                                logger.warning("Backoffice add-product pricing sync failed: %s", _ap_sync_err)
+                            _bo_refresh_order_total_value(str(order.get("id") or order.get("order_id") or ""))
+                            try:
+                                from modules.backoffice.backoffice_helpers import ensure_order_production_refs
+                                ensure_order_production_refs(order_id=str(order.get("id") or order.get("order_id") or ""))
+                            except Exception as _ap_ref_err:
+                                logger.warning("Backoffice add-product production_ref fill failed: %s", _ap_ref_err)
+                            st.session_state.pop(f"_bo_disc_val_done_{order_id}", None)
+                            st.success(f"✅ {_ap_row['product_name']} added to order")
+                            st.session_state[_add_mode_key] = None
+                            st.rerun()
+                        except Exception as _ape2:
+                            st.error(f"Failed: {_ape2}")
 
-        # ── Audit Trail + Integrity ───────────────────────────────────────
-        _oid_t3 = str(order.get("id") or order.get("order_id") or "")
+                st.markdown("</div>", unsafe_allow_html=True)
 
-        # Integrity check (silent, shown only when issues found)
-        if _oid_t3:
+            elif _add_mode == "SERVICE":
+                import json as _asj
+                st.markdown("<div style='background:#0f172a;border:1px solid #334155;"
+                            "border-top:3px solid #f59e0b;border-radius:8px;padding:12px;margin:6px 0'>",
+                            unsafe_allow_html=True)
+                st.markdown("**🔧 Add Service to Order**")
+                _order_type_add = str(order.get("order_type","RETAIL")).upper()
+                try:
+                    from modules.sql_adapter import resolve_order_uuid as _resolve_order_uuid
+                    _order_id_add = _resolve_order_uuid(order.get("id") or order.get("order_id") or order.get("order_no")) or ""
+                except Exception:
+                    _order_id_add = ""
+                try:
+                    from modules.backoffice.service_master import (
+                        fetch_service_types as _fst_add,
+                        service_price as _sp_add,
+                    )
+                    from modules.core.business_rules import SERVICE_CHARGE_TYPES as _SCT_add
+                    _svc_rows_add = _fst_add(active_only=True)
+                except Exception:
+                    _svc_rows_add = []
+                    _sp_add = lambda s, ot, *args, **kwargs: float((s or {}).get("default_price") or 0)
+                    _SCT_add = {"COLOURING":{"label":"Colouring","icon":"🎨","default_gst":18},
+                                "FITTING":{"label":"Fitting","icon":"🔧","default_gst":18},
+                                "COURIER":{"label":"Courier","icon":"🚚","default_gst":18},
+                                "OTHER":{"label":"Other","icon":"➕","default_gst":18},
+                                "MISC":{"label":"Other","icon":"➕","default_gst":18},
+                                "CONSULTATION":{"label":"Consultation","icon":"🩺","default_gst":0},
+                                "EYE_TESTING":{"label":"Eye Testing","icon":"👁️","default_gst":0}}
+                _svc_rows_add = _bo_complete_service_rows(_svc_rows_add)
+
+                _svc_by_group_add = {}
+                for _r in _svc_rows_add:
+                    _svc_by_group_add.setdefault(str(_r.get("service_group","OTHER")).upper(), []).append(_r)
+
+                st.markdown("🧾 **Service Charges** — Fitting · Colouring · Courier")
+                st.caption("Charges are saved directly to this order. Colouring/Fitting route to production; Courier goes direct to billing.")
+                _bo_svc_pick_key = f"_bo_svc_add_type_{_order_id_add[:8]}"
+                _bo_svc_by_code = {
+                    str(s.get("service_code") or "").upper(): s
+                    for s in _svc_rows_add
+                }
+                if not st.session_state.get(_bo_svc_pick_key):
+                    _add_group_order = ["FITTING", "COLOURING", "COURIER", "OTHER", "MISC", "CONSULTATION", "EYE_TESTING"]
+                    _add_group_order += [
+                        _g for _g in sorted(_svc_by_group_add)
+                        if _g not in set(_add_group_order)
+                    ]
+                    for _grp_name in _add_group_order:
+                        _grp_items = _svc_by_group_add.get(_grp_name, [])
+                        if not _grp_items:
+                            continue
+                        _cfg = _SCT_add.get(_grp_name) or _SCT_add.get("MISC", {})
+                        _icon = _cfg.get("icon", "➕")
+                        with st.expander(f"{_icon} {_grp_name.title()} Services", expanded=(_grp_name in ("FITTING", "COLOURING"))):
+                            _cols = st.columns(min(3, max(1, len(_grp_items))))
+                            for _i, _svc_def_row in enumerate(_grp_items):
+                                _code = str(_svc_def_row.get("service_code") or "").upper()
+                                _svc_name = str(_svc_def_row.get("service_name") or _code or _grp_name.title())
+                                _rate = float(_sp_add(_svc_def_row, _order_type_add) if _svc_def_row else 0)
+                                if _rate <= 0:
+                                    _rate = float(_svc_def_row.get("default_price") or 0)
+                                _gst = float(_svc_def_row.get("gst_percent") or _cfg.get("default_gst", 18) or 0)
+                                with _cols[_i % len(_cols)]:
+                                    st.caption(f"₹{_rate:,.0f} · GST {_gst:g}%")
+                                    if st.button(f"+ {_svc_name}", key=f"bo_sc_pick_{_order_id_add[:8]}_{_code}", use_container_width=True):
+                                        st.session_state[_bo_svc_pick_key] = _code
+                                        st.rerun()
+                else:
+                    _ct = str(st.session_state.get(_bo_svc_pick_key) or "").upper()
+                    _svc = _bo_svc_by_code.get(_ct, {})
+                    _grp = str(_svc.get("service_group") or _ct or "OTHER").upper()
+                    _cfg = _SCT_add.get(_grp) or _SCT_add.get("MISC", {})
+                    _lbl = _cfg.get("label", _grp.title())
+                    _icon = _cfg.get("icon", "➕")
+                    _default_rate = float(_sp_add(_svc, _order_type_add) if _svc else 0)
+                    if _default_rate <= 0:
+                        _default_rate = float(_svc.get("default_price") or 0)
+                    _default_gst = float(_svc.get("gst_percent") or _cfg.get("default_gst", 18) or 0)
+                    _courier_provider_id_add = ""
+                    _courier_provider_name_add = ""
+                    _courier_rate_option_id_add = ""
+                    _courier_rate_option_label_add = ""
+                    _courier_parcel_size_add = ""
+                    if _grp == "COURIER":
+                        try:
+                            from modules.backoffice.service_master import fetch_providers as _bo_fetch_providers
+                            from modules.backoffice.service_master import fetch_courier_rate_options as _bo_fetch_courier_slabs
+                            _bo_couriers = _bo_fetch_providers("COURIER", active_only=True) or []
+                        except Exception:
+                            _bo_couriers = []
+                            _bo_fetch_courier_slabs = lambda *_a, **_k: []
+                        _bo_provider_ids = [""] + [str(_p.get("id") or "") for _p in _bo_couriers]
+                        _bo_pref_pid = str(order.get("preferred_courier_provider_id") or "")
+                        _bo_provider_idx = _bo_provider_ids.index(_bo_pref_pid) if _bo_pref_pid in _bo_provider_ids else 0
+
+                        def _bo_fmt_courier(_pid):
+                            if not _pid:
+                                return "— Select Courier Provider —"
+                            _p = next((_x for _x in _bo_couriers if str(_x.get("id") or "") == str(_pid)), {})
+                            return str(_p.get("provider_name") or _pid)
+
+                        _courier_provider_id_add = st.selectbox(
+                            "Courier provider",
+                            _bo_provider_ids,
+                            index=_bo_provider_idx,
+                            format_func=_bo_fmt_courier,
+                            key=f"bo_sc_courier_provider_{_order_id_add[:8]}_{_ct}",
+                        )
+                        _bo_provider = next(
+                            (_x for _x in _bo_couriers if str(_x.get("id") or "") == str(_courier_provider_id_add)),
+                            {},
+                        )
+                        _courier_provider_name_add = str(_bo_provider.get("provider_name") or "")
+                        _bo_slabs = _bo_fetch_courier_slabs(_courier_provider_id_add, active_only=True) if _courier_provider_id_add else []
+                        _bo_slab_ids = [""] + [str(_s.get("id") or "") for _s in _bo_slabs]
+                        if _bo_slabs:
+                            _bo_lowest = min(_bo_slabs, key=lambda _s: float(_s.get("charge_base") or 0))
+                            _bo_slab_default = str(_bo_lowest.get("id") or "")
+                            _bo_slab_idx = _bo_slab_ids.index(_bo_slab_default) if _bo_slab_default in _bo_slab_ids else 0
+                        else:
+                            _bo_slab_idx = 0
+
+                        def _bo_fmt_slab(_sid):
+                            if not _sid:
+                                return "Provider default / manual"
+                            _s = next((_x for _x in _bo_slabs if str(_x.get("id") or "") == str(_sid)), {})
+                            _code = str(_s.get("parcel_size_code") or "")
+                            return (
+                                f"{_s.get('option_label') or ''}"
+                                + (f" · {_code}" if _code else "")
+                                + f" — ₹{float(_s.get('charge_base') or 0):,.2f}"
+                            )
+
+                        _courier_rate_option_id_add = st.selectbox(
+                            "Courier charge slab / parcel size",
+                            _bo_slab_ids,
+                            index=_bo_slab_idx,
+                            format_func=_bo_fmt_slab,
+                            key=f"bo_sc_courier_slab_{_order_id_add[:8]}_{_ct}",
+                        )
+                        _bo_slab = next(
+                            (_x for _x in _bo_slabs if str(_x.get("id") or "") == str(_courier_rate_option_id_add)),
+                            {},
+                        )
+                        if _bo_slab:
+                            _default_rate = float(_bo_slab.get("charge_base") or _default_rate or 0)
+                            _default_gst = float(_bo_slab.get("gst_percent") or _default_gst or 18)
+                            _courier_rate_option_label_add = str(_bo_slab.get("option_label") or "")
+                            _courier_parcel_size_add = str(_bo_slab.get("parcel_size_code") or "")
+                            st.caption("Lowest courier slab is auto-selected. Change dropdown if parcel is bigger.")
+                    st.markdown(f"**{_icon} Add {_lbl}**")
+                    _c1, _c2, _cq, _c3 = st.columns([3, 1.3, 1.2, 1.1])
+                    with _c1:
+                        _desc = st.text_input(
+                            "Description",
+                            value=str(_svc.get("service_name") or _lbl),
+                            key=f"bo_sc_desc_{_order_id_add[:8]}_{_ct}",
+                        )
+                    with _c2:
+                        _rate_pair = st.number_input(
+                            "₹ Rate / pair",
+                            min_value=0.0,
+                            value=float(_default_rate or 0),
+                            step=10.0,
+                            key=f"bo_sc_rate_{_order_id_add[:8]}_{_ct}",
+                        )
+                    with _cq:
+                        _qty_factor = st.selectbox(
+                            "Qty",
+                            [0.5, 1.0, 1.5, 2.0, 3.0],
+                            index=1,
+                            format_func=lambda v: (
+                                f"{v:g} pair — 1 eye" if v == 0.5 else
+                                f"{v:g} pair — both eyes" if v == 1.0 else
+                                f"{v:g} pair"
+                            ),
+                            key=f"bo_sc_qty_{_order_id_add[:8]}_{_ct}",
+                        )
+                    with _c3:
+                        _gst = st.number_input(
+                            "GST %",
+                            min_value=0.0,
+                            max_value=28.0,
+                            value=_default_gst,
+                            step=0.5,
+                            key=f"bo_sc_gst_{_order_id_add[:8]}_{_ct}",
+                        )
+
+                    _instr = ""
+                    _photo_b64 = ""
+                    _photo_name = ""
+                    if _grp in ("COLOURING", "FITTING"):
+                        _instr = st.text_area(
+                            "Special instruction for production / provider",
+                            placeholder="Tint shade, sample reference, fitting note, urgency...",
+                            key=f"bo_sc_instr_{_order_id_add[:8]}_{_ct}",
+                            height=70,
+                        )
+                        if _grp == "COLOURING":
+                            _photo = st.file_uploader(
+                                "Colour sample photograph",
+                                type=["jpg", "jpeg", "png", "webp"],
+                                key=f"bo_sc_colour_sample_{_order_id_add[:8]}_{_ct}",
+                            )
+                            if _photo:
+                                import base64 as _bo_sc_b64
+                                _photo_b64 = _bo_sc_b64.b64encode(_photo.read()).decode("ascii")
+                                _photo_name = _photo.name
+
+                    _b1, _b2 = st.columns(2)
+                    if _b1.button(f"✅ Add {_qty_factor:g} pair", type="primary",
+                                  key=f"bo_sc_confirm_{_order_id_add[:8]}_{_ct}",
+                                  use_container_width=True):
+                        if not _order_id_add:
+                            st.error("Order reference missing. Reopen the order and try again.")
+                            st.stop()
+                        try:
+                            import uuid as _asu
+                            from modules.sql_adapter import run_write as _rw_as
+                            _base_amt = round(float(_rate_pair or 0) * float(_qty_factor or 1), 2)
+                            _direct = (_grp not in ("COLOURING", "FITTING"))
+                            _svc_route2 = _service_route_for_group(_grp, _direct)
+                            _tot2, _ga2 = _bo_service_line_amounts(_base_amt, _gst, order.get("order_type"))
+                            _svc_product_label = f"{_lbl}: {_desc}"
+                            _svc_pid2 = _ensure_bo_service_product(_grp, _svc_product_label, _gst)
+                            _dup_rows = []
+                            try:
+                                from modules.sql_adapter import run_query as _rq_dup_svc
+                                _dup_rows = _rq_dup_svc("""
+                                    SELECT id::text
+                                    FROM order_lines
+                                    WHERE order_id=%(oid)s::uuid
+                                      AND COALESCE(is_deleted,FALSE)=FALSE
+                                      AND COALESCE(is_service_line,FALSE)=TRUE
+                                      AND UPPER(COALESCE(lens_params->>'service_code','')) = UPPER(%(code)s)
+                                    LIMIT 1
+                                """, {
+                                    "oid": _order_id_add,
+                                    "code": str(_svc.get("service_code") or _ct).upper(),
+                                }) or []
+                            except Exception:
+                                _dup_rows = []
+                            _dup_key = f"bo_dup_service_add_{_order_id_add[:8]}_{_ct}"
+                            if _dup_rows and not st.session_state.get(_dup_key):
+                                st.warning(f"{_lbl}: {_desc} already exists on this order. Click Add again to confirm duplicate.")
+                                st.session_state[_dup_key] = True
+                                st.stop()
+                            _lp2  = _asj.dumps({
+                                "charge_type": _grp,
+                                "service_type": _grp,
+                                "service_code": str(_svc.get("service_code") or _ct).upper(),
+                                "service_description": _desc,
+                                "service_display_name": _svc_product_label,
+                                "display_product_name": _svc_product_label,
+                                "service_production_type": "" if _direct else _grp,
+                                "manufacturing_route": _svc_route2,
+                                "service_instruction": _instr,
+                                "colour_sample_photo": _photo_b64,
+                                "colour_sample_filename": _photo_name,
+                                "service_qty_factor": float(_qty_factor),
+                                "service_rate_per_pair": float(_rate_pair or 0),
+                                "courier_provider_id": _courier_provider_id_add,
+                                "courier_provider_name": _courier_provider_name_add,
+                                "courier_rate_option_id": _courier_rate_option_id_add,
+                                "courier_rate_option_label": _courier_rate_option_label_add,
+                                "courier_parcel_size": _courier_parcel_size_add,
+                                "service_origin": "backoffice_add",
+                            })
+                            _rw_as("""
+                                INSERT INTO order_lines
+                                  (id, order_id, product_id, eye_side,
+                                   unit_price, total_price, billing_total,
+                                   gst_percent, gst_amount,
+                                   quantity, billing_qty, allocated_qty,
+                                   is_service_line, batch_status, lens_params)
+                                VALUES
+                                  (%(id)s::uuid, %(oid)s::uuid, %(pid)s::uuid, 'S',
+                                   %(up)s, %(tp)s, %(tp)s,
+                                   %(gp)s, %(ga)s,
+                                   1, 1, %(aq)s,
+                                   TRUE, %(bs)s, %(lp)s::jsonb)
+                            """, {
+                                "id":  str(_asu.uuid4()),
+                                "oid": _order_id_add,
+                                "pid": _svc_pid2,
+                                "up":  _base_amt, "tp": _tot2,
+                                "gp":  _gst, "ga": _ga2,
+                                "aq":  1 if _direct else 0,
+                                "bs":  "READY" if _direct else "PENDING",
+                                "lp":  _lp2,
+                            })
+                            _bo_refresh_order_total_value(_order_id_add)
+                            try:
+                                from modules.backoffice.backoffice_helpers import ensure_order_production_refs
+                                ensure_order_production_refs(order_id=_order_id_add)
+                            except Exception as _as_ref_err:
+                                logger.warning("Backoffice add-service production_ref fill failed: %s", _as_ref_err)
+                            st.session_state.pop(_dup_key, None)
+                            st.success(f"✅ {_lbl}: {_desc} — {_qty_factor:g} pair ₹{_tot2:.0f}")
+                            st.session_state.pop(_bo_svc_pick_key, None)
+                            st.session_state[_add_mode_key] = None
+                            st.rerun()
+                        except Exception as _ase:
+                            st.error(f"Failed: {_ase}")
+                    if _b2.button("✕ Cancel", key=f"bo_sc_cancel_{_order_id_add[:8]}_{_ct}",
+                                  use_container_width=True):
+                        st.session_state.pop(_bo_svc_pick_key, None)
+                        st.rerun()
+
+                for _svc_t in []:
+                    _cfg   = _SCT_add.get(_svc_t, {})
+                    _lbl   = _cfg.get("label", _svc_t.title())
+                    _icon  = _cfg.get("icon","🔧")
+                    _gst_d = float(_cfg.get("default_gst",18))
+                    _grow  = _svc_by_group_add.get(_svc_t, [])
+                    _gopts = ["None"] + [r.get("service_name","") for r in _grow]
+                    _gsel  = st.selectbox(f"{_icon} {_lbl}", _gopts,
+                                          key=f"bo_as_{_svc_t}_{_order_id_add[:8]}")
+                    if _gsel and _gsel != "None":
+                        _grow_def = next((r for r in _grow if r.get("service_name")==_gsel), {})
+                        _gdamt = float(_sp_add(_grow_def, _order_type_add) if _grow_def else 0)
+
+                        # ── Mandatory qty confirmation ─────────────────────────
+                        _qk  = f"bo_as_q_{_svc_t}_{_order_id_add[:8]}"
+                        _qok = st.session_state.get(_qk + "_ok", False)
+                        _gqty = st.selectbox(
+                            f"👁 {_lbl} Qty — confirm before price",
+                            [0.5, 1.0, 1.5, 2.0],
+                            index=1,
+                            format_func=lambda v: (
+                                f"{v:g} pair — 1 eye only" if v == 0.5 else
+                                f"{v:g} pair — both eyes" if v == 1.0 else
+                                f"{v:g} pair"
+                            ),
+                            key=_qk,
+                        )
+                        if not _qok:
+                            if st.button(f"✅ Confirm {_gqty:g} pair",
+                                         key=f"bo_as_qc_{_svc_t}_{_order_id_add[:8]}",
+                                         type="primary", use_container_width=True):
+                                st.session_state[_qk + "_ok"] = True
+                                st.rerun()
+                            st.caption("⚠️ Confirm qty to unlock price entry")
+                        else:
+                            st.info(f"✅ {_gqty:g} pair confirmed")
+                            if st.button("↩️ Change", key=f"bo_as_qr_{_svc_t}_{_order_id_add[:8]}"):
+                                st.session_state[_qk + "_ok"] = False
+                                st.rerun()
+                            _gc1, _gc2 = st.columns(2)
+                            _gamt  = _gc1.number_input(f"Amount ₹", min_value=0.0,
+                                                       value=round(_gdamt * _gqty, 2), step=10.0,
+                                                       key=f"bo_as_amt_{_svc_t}_{_order_id_add[:8]}_{_gsel}")
+                            _ggst  = _gc2.number_input("GST%", value=_gst_d, min_value=0.0, max_value=28.0,
+                                                       key=f"bo_as_gst_{_svc_t}_{_order_id_add[:8]}")
+                            _ginst = st.text_input("Instruction",
+                                                   key=f"bo_as_ins_{_svc_t}_{_order_id_add[:8]}",
+                                                   placeholder="Special instruction for provider...")
+                            if st.button(f"➕ Add {_lbl} — {_gqty:g} pair",
+                                         key=f"bo_as_add_{_svc_t}_{_order_id_add[:8]}",
+                                         use_container_width=True, type="primary"):
+                                if _gamt >= 0 and _order_id_add:
+                                    try:
+                                        import uuid as _asu
+                                        from modules.sql_adapter import run_write as _rw_as
+                                        _direct = (_svc_t == "COURIER")
+                                        _svc_route2 = _service_route_for_group(_svc_t, _direct)
+                                        _ga2 = 0.0
+                                        _tot2, _ga2 = _bo_service_line_amounts(_gamt, _ggst, order.get("order_type"))
+                                        _svc_product_label = f"{_lbl}: {_gsel}"
+                                        _svc_pid2 = _ensure_bo_service_product(_svc_t, _svc_product_label, _ggst)
+                                        _lp2  = _asj.dumps({
+                                            "charge_type": _svc_t,
+                                            "service_type": _svc_t,
+                                            "service_description": _gsel,
+                                            "service_display_name": _svc_product_label,
+                                            "display_product_name": _svc_product_label,
+                                            "service_production_type": "" if _direct else _svc_t,
+                                            "manufacturing_route": _svc_route2,
+                                            "service_instruction": _ginst,
+                                            "service_qty_factor": float(_gqty),
+                                            "service_rate_per_pair": float(_gdamt or 0),
+                                            "service_origin": "backoffice_add",
+                                        })
+                                        _rw_as("""
+                                            INSERT INTO order_lines
+                                              (id, order_id, product_id, eye_side,
+                                               unit_price, total_price, billing_total,
+                                               gst_percent, gst_amount,
+                                               quantity, billing_qty, allocated_qty,
+                                               is_service_line, batch_status, lens_params)
+                                            VALUES
+                                              (%(id)s::uuid, %(oid)s::uuid, %(pid)s::uuid, 'S',
+                                               %(up)s, %(tp)s, %(tp)s,
+                                               %(gp)s, %(ga)s,
+                                               1, 1, %(aq)s,
+                                               TRUE, %(bs)s, %(lp)s::jsonb)
+                                        """, {
+                                            "id":  str(_asu.uuid4()),
+                                            "oid": _order_id_add,
+                                            "pid": _svc_pid2,
+                                            "up":  _gamt, "tp": _tot2,
+                                            "gp":  _ggst, "ga": _ga2,
+                                            "aq":  1 if _direct else 0,
+                                            "bs":  "READY" if _direct else "PENDING",
+                                            "lp":  _lp2,
+                                        })
+                                        st.success(f"✅ {_lbl}: {_gsel} — {_gqty:g} pair ₹{_tot2:.0f}")
+                                        st.session_state[_qk + "_ok"] = False
+                                        st.session_state[_add_mode_key] = None
+                                        st.rerun()
+                                    except Exception as _ase:
+                                        st.error(f"Failed: {_ase}")
+                                else:
+                                    st.warning("Select a service first")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            #  RENDER ALLOCATION WINDOW IF ACTIVE
+            if st.session_state.get('bo_show_allocation_window', False):
+                line_idx = st.session_state.get('bo_allocation_line_idx')
+            
+                if line_idx is not None and line_idx < len(all_lines):
+                    line = all_lines[line_idx]
+                    render_allocation_window(line, line_idx, order)
+
+            # ========== FINAL SAVE TO ORDER ==========
+            st.markdown("---")
+            st.markdown("###  Order Summary")
+
+            # ── Sticky restore banner: surface soft-deleted lines at the top ──
+            # The detail view's existing "↩ Restore Deleted Lines" expander is
+            # far below; users couldn't see at a glance that a delete had taken
+            # effect. This banner shows a count + a one-click jump down to the
+            # restore panel (it lives at the existing expander; we just hint).
             try:
-                from modules.backoffice.audit_logger import check_order_integrity
-                _ic = check_order_integrity(_oid_t3)
-                if not _ic.get("ok"):
-                    st.markdown("---")
-                    st.error("⚠️ **Integrity Issues Detected**")
-                    for _issue in (_ic.get("issues") or []):
-                        st.caption(f"• {_issue}")
-                    st.caption("Investigate before proceeding with billing.")
+                _deleted_count = sum(
+                    1 for _l in all_lines if bool(_l.get("is_deleted"))
+                )
+                if _deleted_count > 0:
+                    st.warning(
+                        f"🗑 {_deleted_count} line(s) deleted from this order. "
+                        "Scroll down to **↩ Restore Deleted Lines** to undo."
+                    )
             except Exception:
                 pass
 
-        # History panel — all audit_log events for this order
-        st.markdown("---")
-        with st.expander("📋 Change History (Audit Trail)", expanded=False):
-            if not _oid_t3:
-                st.caption("Order ID not resolved.")
-            else:
+            if st.button(" System Health Check", use_container_width=True):
+
+                issues = run_system_health_check(order)
+
+                if not issues:
+                    st.success(" System OK. No issues found.")
+                else:
+                    st.error(" Issues Found:")
+                    for i in issues:
+                        st.write("", i)
+        
+            # Calculate order totals with R/L breakdown
+            # FIX: exclude soft-deleted lines from every count and bucket below.
+            # Without this, a service that was just deleted via 🗑 still appears
+            # in the Order Summary because `all_lines` carries it (it remains in
+            # the in-memory list with is_deleted=True until next reload). Other
+            # parts of this file already filter is_deleted (e.g. lines 690/1521/
+            # 1916) — the Order Summary section was missed.
+            _visible_lines = [
+                _l for _l in all_lines if not bool(_l.get("is_deleted"))
+            ]
+            total_items = len(_visible_lines)
+        
+            # Separate R and L lines - handle both short and full eye_side formats
+            for _sum_guard_line in _visible_lines:
+                _bo_enforce_wholesale_price(_sum_guard_line, order.get("order_type"))
+            r_lines = [line for line in _visible_lines if line.get('eye_side', '').upper() in ['R', 'RIGHT']]
+            l_lines = [line for line in _visible_lines if line.get('eye_side', '').upper() in ['L', 'LEFT']]
+            other_lines = [line for line in _visible_lines if line.get('eye_side', '').upper() not in ['R', 'RIGHT', 'L', 'LEFT']]
+        
+            # Calculate R eye totals
+            _order_type_calc = str(order.get("order_type") or "WHOLESALE").upper()
+            r_billing = sum(_bo_line_amounts(line, _order_type_calc)["grand"] for line in r_lines)
+            r_discount = sum(_bo_float(line.get('discount_amount')) for line in r_lines)
+        
+            # Calculate L eye totals
+            l_billing = sum(_bo_line_amounts(line, _order_type_calc)["grand"] for line in l_lines)
+            l_discount = sum(_bo_float(line.get('discount_amount')) for line in l_lines)
+        
+            # Calculate other items totals
+            other_billing = sum(_bo_line_amounts(line, _order_type_calc)["grand"] for line in other_lines)
+            other_discount = sum(_bo_float(line.get('discount_amount')) for line in other_lines)
+        
+            # Grand totals
+            total_billing = r_billing + l_billing + other_billing
+            total_discount = r_discount + l_discount + other_discount
+        
+            # Summary metrics row
+            col_total1, col_total2, col_total3 = st.columns(3)
+            with col_total1:
+                st.metric("Total Items", total_items)
+            with col_total2:
+                st.metric("Total Discount", f"{total_discount:.2f}")
+            with col_total3:
+                st.metric("**Final Amount**", f"**{total_billing:.2f}**")
+        
+            # Detailed R/L Breakdown - Compact View
+            st.markdown("---")
+        
+            # Right Eye Block
+            with st.container(border=True):
+                st.markdown("####  Right Eye")
+                st.caption(f"{len(r_lines)} items | Subtotal: {r_billing:.2f}")
+            
+                if r_lines:
+                    # Header row
+                    hcols = st.columns([3, 2, 1, 1, 1, 1, 1, 0.6])
+                    hcols[0].caption("Product")
+                    hcols[1].caption("Qty")
+                    hcols[2].caption("Unit Price")
+                    hcols[3].caption("Discount")
+                    hcols[4].caption("GST%")
+                    hcols[5].caption("GST Amt")
+                    hcols[6].caption("Total")
+                    hcols[7].caption("")
+                    st.markdown("<hr style='margin:2px 0 6px 0'>", unsafe_allow_html=True)
+                    for idx, line in enumerate(r_lines, 1):
+                        _bo_enforce_wholesale_price(line, order.get("order_type"))
+                        qty_disp = _bo_qty_display(line)
+                        # ── GST fields ──
+                        gst_pct     = float(line.get('gst_percent_used') or line.get('gst_percent') or 0)
+                        _amt_line = _bo_line_amounts(line, _order_type_calc)
+                        gst_amt     = _amt_line["gst"]
+                        tax_inc     = line.get('tax_inclusive', True)
+                        gst_label   = f"{gst_pct:.0f}%" + (" (incl)" if tax_inc else " (+)") if gst_pct else "⚠️ Not set"
+                        disc_pct    = float(line.get('discount_percent') or 0)
+                        unit_price  = float(line.get('unit_price') or 0)
+                        total       = _amt_line["grand"]
+                        lcols = st.columns([3, 2, 1, 1, 1, 1, 1, 0.6])
+                        lcols[0].write(f"{idx}. {_bo_line_display_name(line)}")
+                        lcols[1].write(qty_disp)
+                        lcols[2].write(f"₹{unit_price:,.2f}")
+                        lcols[3].write(f"{disc_pct:.1f}%" if disc_pct else "—")
+                        lcols[4].write(gst_label)
+                        lcols[5].write(f"₹{gst_amt:,.2f}" if gst_amt else ("⚠️" if gst_pct else "—"))
+                        lcols[6].write(f"₹{total:,.2f}")
+                        _bo_summary_row_delete_button(line, order, lcols[7])
+                else:
+                    st.caption("No Right Eye items")
+        
+            # Left Eye Block
+            with st.container(border=True):
+                st.markdown("####  Left Eye")
+                st.caption(f"{len(l_lines)} items | Subtotal: {l_billing:.2f}")
+            
+                if l_lines:
+                    # Header row
+                    hcols = st.columns([3, 2, 1, 1, 1, 1, 1, 0.6])
+                    hcols[0].caption("Product")
+                    hcols[1].caption("Qty")
+                    hcols[2].caption("Unit Price")
+                    hcols[3].caption("Discount")
+                    hcols[4].caption("GST%")
+                    hcols[5].caption("GST Amt")
+                    hcols[6].caption("Total")
+                    hcols[7].caption("")
+                    st.markdown("<hr style='margin:2px 0 6px 0'>", unsafe_allow_html=True)
+                    for idx, line in enumerate(l_lines, 1):
+                        _bo_enforce_wholesale_price(line, order.get("order_type"))
+                        qty_disp = _bo_qty_display(line)
+                        gst_pct     = float(line.get('gst_percent_used') or line.get('gst_percent') or 0)
+                        _amt_line = _bo_line_amounts(line, _order_type_calc)
+                        gst_amt     = _amt_line["gst"]
+                        tax_inc     = line.get('tax_inclusive', True)
+                        gst_label   = f"{gst_pct:.0f}%" + (" (incl)" if tax_inc else " (+)") if gst_pct else "⚠️ Not set"
+                        disc_pct    = float(line.get('discount_percent') or 0)
+                        unit_price  = float(line.get('unit_price') or 0)
+                        total       = _amt_line["grand"]
+                        lcols = st.columns([3, 2, 1, 1, 1, 1, 1, 0.6])
+                        lcols[0].write(f"{idx}. {_bo_line_display_name(line)}")
+                        lcols[1].write(qty_disp)
+                        lcols[2].write(f"₹{unit_price:,.2f}")
+                        lcols[3].write(f"{disc_pct:.1f}%" if disc_pct else "—")
+                        lcols[4].write(gst_label)
+                        lcols[5].write(f"₹{gst_amt:,.2f}" if gst_amt else ("⚠️" if gst_pct else "—"))
+                        lcols[6].write(f"₹{total:,.2f}")
+                        _bo_summary_row_delete_button(line, order, lcols[7])
+                else:
+                    st.caption("No Left Eye items")
+        
+            # Other Items Section - Compact (if any)
+            if other_lines:
+                with st.container(border=True):
+                    st.markdown("####  Other Items")
+                    st.caption(f"{len(other_lines)} items | Subtotal: {other_billing:.2f}")
+                
+                    # Header row
+                    hcols = st.columns([3, 2, 1, 1, 1, 1, 1, 0.6])
+                    hcols[0].caption("Product")
+                    hcols[1].caption("Qty")
+                    hcols[2].caption("Unit Price")
+                    hcols[3].caption("Discount")
+                    hcols[4].caption("GST%")
+                    hcols[5].caption("GST Amt")
+                    hcols[6].caption("Total")
+                    hcols[7].caption("")
+                    st.markdown("<hr style='margin:2px 0 6px 0'>", unsafe_allow_html=True)
+                    for idx, line in enumerate(other_lines, 1):
+                        _bo_enforce_wholesale_price(line, order.get("order_type"))
+                        qty_disp = _bo_qty_display(line)
+                        gst_pct     = float(line.get('gst_percent_used') or line.get('gst_percent') or 0)
+                        _amt_line = _bo_line_amounts(line, _order_type_calc)
+                        gst_amt     = _amt_line["gst"]
+                        tax_inc     = line.get('tax_inclusive', True)
+                        gst_label   = f"{gst_pct:.0f}%" + (" (incl)" if tax_inc else " (+)") if gst_pct else "⚠️ Not set"
+                        disc_pct    = float(line.get('discount_percent') or 0)
+                        unit_price  = float(line.get('unit_price') or 0)
+                        total       = _amt_line["grand"]
+                        lcols = st.columns([3, 2, 1, 1, 1, 1, 1, 0.6])
+                        lcols[0].write(f"{idx}. {_bo_line_display_name(line)}")
+                        lcols[1].write(qty_disp)
+                        lcols[2].write(f"₹{unit_price:,.2f}")
+                        lcols[3].write(f"{disc_pct:.1f}%" if disc_pct else "—")
+                        lcols[4].write(gst_label)
+                        lcols[5].write(f"₹{gst_amt:,.2f}" if gst_amt else ("⚠️" if gst_pct else "—"))
+                        lcols[6].write(f"₹{total:,.2f}")
+                        _bo_summary_row_delete_button(line, order, lcols[7])
+        
+            st.markdown("---")
+
+            # ── Debug Overlay (only when debug_pricing enabled in sidebar) ──────────
+            if st.session_state.get("debug_pricing"):
                 try:
-                    from modules.backoffice.audit_logger import get_audit_trail
-                    _trail = get_audit_trail(_oid_t3, limit=50)
-                    if not _trail:
-                        st.caption("No change history recorded yet.")
-                    else:
-                        _EVENT_COLORS = {
-                            "save_order":       "#6366f1",
-                            "status_changed":   "#8b5cf6",
-                            "product_changed":  "#ef4444",
-                            "price_override":   "#f59e0b",
-                            "qty_changed":      "#f97316",
-                            "payment_created":  "#10b981",
-                            "payment_reversed": "#dc2626",
-                            "stock_adjusted":   "#0ea5e9",
-                            "invoice_created":  "#22c55e",
-                        }
-                        _EVENT_LABELS = {
-                            "save_order":       "💾 Order Saved",
-                            "status_changed":   "🔄 Status Changed",
-                            "product_changed":  "📦 Line Changed",
-                            "price_override":   "💰 Price Changed",
-                            "qty_changed":      "🔢 Qty Changed",
-                            "payment_created":  "✅ Payment Recorded",
-                            "payment_reversed": "↩️ Payment Reversed",
-                            "stock_adjusted":   "📊 Stock Adjusted",
-                            "invoice_created":  "🧾 Invoice Created",
-                        }
-                        for _ev in _trail:
-                            _ev_type = str(_ev.get("event") or "").lower()
-                            _ev_ts   = str(_ev.get("created_at") or "")[:16]
-                            _ev_user = str(_ev.get("user_id") or "system")
-                            _ev_pay  = _ev.get("payload") or {}
-                            _color   = _EVENT_COLORS.get(_ev_type, "#475569")
-                            _label   = _EVENT_LABELS.get(_ev_type, f"⚙️ {_ev_type}")
+                    from .debug_pricing_overlay import render_debug_overlay
+                    render_debug_overlay(order, all_lines)
+                except Exception as _dbg:
+                    st.caption(f"Debug overlay error: {_dbg}")
+            # ──────────────────────────────────────────────────────────────────────────
 
-                            # Build detail line from payload
-                            _detail = ""
-                            if isinstance(_ev_pay, dict):
-                                _act = _ev_pay.get("action","")
-                                if _act == "frame_sku_changed":
-                                    _detail = (
-                                        f"SKU: `{_ev_pay.get('old_sku','?')}` → "
-                                        f"`{_ev_pay.get('new_sku','?')}` | "
-                                        f"₹{float(_ev_pay.get('old_price',0)):,.2f} → "
-                                        f"₹{float(_ev_pay.get('new_price',0)):,.2f}"
-                                    )
-                                elif _act == "line_deleted":
-                                    _detail = (
-                                        f"{_ev_pay.get('product','')} "
-                                        f"[{_ev_pay.get('eye_side','')}] deleted"
-                                        + (f" · {_ev_pay.get('qty_restored',0)} pcs restored" if _ev_pay.get('qty_restored') else "")
-                                    )
-                                elif _act == "order_cancelled":
-                                    _detail = (
-                                        f"Reason: {_ev_pay.get('reason','—')}"
-                                        + (f" · Refund ₹{float(_ev_pay.get('refund_amount',0)):,.0f}" if _ev_pay.get('refund_amount') else "")
-                                    )
-                                elif _ev_pay.get("from_status") or _ev_pay.get("to_status"):
-                                    _detail = (
-                                        f"{_ev_pay.get('from_status','?')} → {_ev_pay.get('to_status','?')}"
-                                    )
-                                elif _ev_pay.get("diff"):
-                                    _diff_d = _ev_pay["diff"]
-                                    _detail = " | ".join(
-                                        f"{k}: {v.get('old','?')} → {v.get('new','?')}"
-                                        for k, v in list(_diff_d.items())[:3]
-                                    )
+            # ══════════════════════════════════════════════════════════════════════
+            # 🎯 SUPPLIER / JOB ASSIGNMENT PANEL
+            # Blocked once a blank is assigned (job card saved) or challan exists.
+            # ══════════════════════════════════════════════════════════════════════
+            _order_status_upper = str(order.get("status","")).upper()
+            _pipeline_locked_statuses = {
+                "IN_PRODUCTION","READY","CHALLANED","INVOICED","DISPATCHED","DELIVERED","CLOSED"
+            }
+            # Check if any challan exists for this order
+            _has_challan_lock = False
+            try:
+                # WIN 2: read from session_state cache populated by the tab1 check above.
+                # If not cached yet (edge case), fall back to a live query.
+                _ch_cache_key2 = f"_bo_challan_exists_{order_id}"
+                if _ch_cache_key2 in st.session_state:
+                    _has_challan_lock = st.session_state[_ch_cache_key2]
+                else:
+                    from modules.sql_adapter import run_query as _rq_chk
+                    _ch_rows = _rq_chk("""
+                        SELECT 1 FROM challans c
+                        WHERE (c.order_ids::text[] @> ARRAY[%(oid)s::text]
+                            OR c.order_ids::text[] @> ARRAY[%(ono)s::text])
+                          AND c.status NOT IN ('CANCELLED','VOID')
+                        LIMIT 1
+                    """, {"oid": str(order.get("id") or ""), "ono": str(order.get("order_no") or "")})
+                    _has_challan_lock = bool(_ch_rows)
+                    st.session_state[_ch_cache_key2] = _has_challan_lock
+            except Exception:
+                pass
 
-                            st.markdown(
-                                f"<div style='border-left:3px solid {_color};"
-                                f"padding:4px 10px;margin-bottom:5px;'>"
-                                f"<span style='color:{_color};font-weight:600;"
-                                f"font-size:0.78rem'>{_label}</span> "
-                                f"<span style='color:#6b7280;font-size:0.72rem'>"
-                                f"— {_ev_ts} by {_ev_user}</span>"
-                                + (f"<br><span style='color:#94a3b8;font-size:0.72rem'>"
-                                   f"{_detail}</span>" if _detail else "")
-                                + "</div>",
-                                unsafe_allow_html=True
+            # Check if ANY non-service lines exist — if only service lines, don't freeze
+            _non_svc_lines = [l for l in all_lines
+                              if not l.get("is_service_line")
+                              and str(l.get("eye_side","")).upper() not in ("S","SERVICE")]
+            _only_services = len(_non_svc_lines) == 0 and len(all_lines) > 0
+            _order_items_frozen = (
+                not _only_services  # service-only orders never freeze
+                and (
+                    _order_status_upper in _pipeline_locked_statuses
+                    or _has_challan_lock
+                    or _tab1_edit_locked
+                )
+            )
+
+            if _order_items_frozen:
+                if _has_challan_lock:
+                    st.markdown(
+                        "<div style='background:#1a0a00;border:1px solid #f97316;"
+                        "border-radius:8px;padding:8px 14px;margin:8px 0'>"
+                        "<span style='color:#fb923c;font-weight:700;font-size:0.82rem'>"
+                        "🔒 Challan exists — saving changes is blocked.</span>"
+                        "<span style='color:#78350f;font-size:0.75rem;display:block;margin-top:2px'>"
+                        "To modify: cancel the challan from Billing Summary first.</span>"
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
+                elif _tab1_edit_locked:
+                    st.markdown(
+                        "<div style='background:#1a0a00;border:1px solid #f97316;"
+                        "border-radius:8px;padding:8px 14px;margin:8px 0'>"
+                        "<span style='color:#fb923c;font-weight:700;font-size:0.82rem'>"
+                        "🔒 Supplier/external order already sent — saving changes is blocked.</span>"
+                        "<span style='color:#fbbf24;font-size:0.75rem;display:block;margin-top:2px'>"
+                        "Set the order back from Production before editing product, power, quantity, or route.</span>"
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
+                    with st.expander("🔧 Supervisor: Set Back from Supplier/External", expanded=False):
+                        st.caption(
+                            "Use only when the line was routed/assigned but no real supplier purchase has happened. "
+                            "This clears stale supplier stage/order references and makes product, power and route editable again."
+                        )
+                        _sb_confirm = st.checkbox(
+                            "I confirm this supplier/external order was not actually sent or purchased",
+                            key=f"bo_sup_setback_confirm_{order.get('id','')}",
+                        )
+                        if st.button(
+                            "↩ Set Back to Editable",
+                            key=f"bo_sup_setback_btn_{order.get('id','')}",
+                            use_container_width=True,
+                            disabled=not _sb_confirm,
+                        ):
+                            try:
+                                from modules.sql_adapter import run_write as _bo_sb_write
+                                _line_ids_sb = [
+                                    str(_l.get("id") or _l.get("line_id") or "")
+                                    for _l in (all_lines or [])
+                                    if str(_l.get("manufacturing_route") or "").upper() in ("VENDOR", "EXTERNAL_LAB")
+                                    or str((_l.get("lens_params") or {}).get("manufacturing_route") if isinstance(_l.get("lens_params"), dict) else "").upper() in ("VENDOR", "EXTERNAL_LAB")
+                                ]
+                                _line_ids_sb = [x for x in _line_ids_sb if x]
+                                if not _line_ids_sb:
+                                    st.warning("No supplier/external lines found to set back.")
+                                else:
+                                    _bo_sb_write(
+                                        """
+                                        UPDATE order_lines
+                                           SET lens_params = COALESCE(lens_params, '{}'::jsonb)
+                                                - ARRAY[
+                                                    'supplier_stage','external_lab_stage',
+                                                    'supplier_order_no','supplier_confirmation_no',
+                                                    'supplier_order_id','purchase_order_id',
+                                                    'vendor_order_ref','lab_order_ref',
+                                                    'po_number','dispatch_eta'
+                                                  ],
+                                               updated_at = NOW()
+                                         WHERE id = ANY(%(line_ids)s::uuid[])
+                                        """,
+                                        {"line_ids": _line_ids_sb},
+                                    )
+                                    st.success("Set back done. Refreshing order...")
+                                    st.rerun()
+                            except Exception as _sb_e:
+                                st.error(f"Set back failed: {_sb_e}")
+                else:
+                    try:
+                        from modules.backoffice.guidance import render_stage_guidance
+                        render_stage_guidance(_order_status_upper, compact=True)
+                    except ImportError:
+                        st.info(f"ℹ️ Order is {_order_status_upper} — route/product edits read-only. Power corrections via Supervisor Override.")
+            if _ASSIGNMENT_PANEL_AVAILABLE and not _tab1_edit_locked:
+                render_assignment_panel(order, all_lines)
+            elif _ASSIGNMENT_PANEL_AVAILABLE and _tab1_edit_locked:
+                st.caption("🎯 Supplier / Job assignment is locked for this order stage.")
+            # ══════════════════════════════════════════════════════════════════════
+
+            # ── GST Verification Footer ───────────────────────────────────────────
+            order_type  = order.get("order_type", "RETAIL")
+            # FIX: exclude soft-deleted lines from the verification sums. Same
+            # class of bug as Order Summary — without this filter a deleted
+            # service still adds to GST/taxable and the displayed Grand Total
+            # diverges from the actual order value (also stalls the post-save
+            # gate because Grand Total ≠ stored orders.total_value).
+            _verif_lines = [_l for _l in all_lines if not bool(_l.get("is_deleted"))]
+            _verif_amounts = [_bo_line_amounts(_l, order_type) for _l in _verif_lines]
+            gst_total   = sum(_a["gst"] for _a in _verif_amounts)
+            taxable_val = sum(_a["taxable"] for _a in _verif_amounts)
+            grand_val   = sum(_a["grand"] for _a in _verif_amounts)
+
+            with st.container(border=True):
+                st.caption("📊 Billing Verification Summary")
+                vc = st.columns(4)
+                if order_type == "RETAIL":
+                    vc[0].metric("MRP Total (incl. GST)",  f"₹{grand_val:,.2f}")
+                    vc[1].metric("GST Extracted",           f"₹{gst_total:,.2f}",   help="GST back-calculated from MRP")
+                    vc[2].metric("Taxable Value",           f"₹{taxable_val:,.2f}")
+                    vc[3].metric("Patient Pays",            f"₹{grand_val:,.2f}")
+                else:
+                    vc[0].metric("Subtotal (excl. GST)",   f"₹{taxable_val:,.2f}")
+                    vc[1].metric("GST Added",               f"₹{gst_total:,.2f}",   help="GST added on top of selling price")
+                    vc[2].metric("Grand Total",             f"₹{grand_val:,.2f}")
+                    vc[3].metric("Order Type",              order_type)
+                st.caption(
+                    f"Source: {order.get('order_source', order_type)}  |  "                f"Tax treatment: {'GST inclusive in price' if order_type == 'RETAIL' else 'GST exclusive — added on top'}"            )
+            # ─────────────────────────────────────────────────────────────────────
+
+            from modules.utils.submit_guard import is_locked, guarded_submit
+            _post_save_actions_rendered = False
+            if _order_items_frozen:
+                st.button(
+                    "🔒 SAVE LOCKED — Order in pipeline or challan exists",
+                    type="secondary", use_container_width=True,
+                    key="final_save_frozen", disabled=True,
+                    help="Cancel challan or use supervisor override to edit"
+                )
+            elif st.button(" SAVE TO ORDER", type="primary", use_container_width=True,
+                         key="final_save_order", disabled=is_locked("final_save")):
+                with guarded_submit("final_save") as _allowed:
+                    if not _allowed:
+                        st.stop()
+                    # 🔐 Billing guard — never save with zero billing
+                    if total_billing <= 0:
+                        st.error("❌ Billing total invalid. Cannot save with zero or negative billing.")
+                        st.warning("Please check line items and pricing before saving.")
+                        return   # guarded_submit __exit__ clears lock
+
+                    # 🎯 Assignment guard — uses smart auto-confirm logic
+                    try:
+                        from modules.backoffice.decision_engine import is_assignment_confirmed as _iac
+                        _assign_ok = _iac(st.session_state, all_lines)
+                    except Exception:
+                        _assign_ok = st.session_state.get("bo_assignments_locked", False)
+                    if _ASSIGNMENT_PANEL_AVAILABLE and not _assign_ok:
+                        st.warning(
+                            "⚠️ Supplier / Job assignments not confirmed. "
+                            "Scroll up and click **Confirm All Assignments** before saving."
+                        )
+                        return
+
+                    try:
+                        # ── GST Recalculation — MUST succeed before save ──────────
+                        try:
+                            from modules.pricing.tax_engine import apply_taxes
+                            tax_input = {
+                                "order_type": order.get("order_type", "RETAIL"),
+                                "net_value":  sum(
+                                    float(l.get("billing_total") or l.get("total_price") or 0)
+                                    for l in all_lines
+                                ),
+                                "lines": all_lines,
+                            }
+                            taxed = apply_taxes(tax_input)
+                            order["tax_amount"]  = taxed["tax_amount"]
+                            order["final_value"] = taxed["final_value"]
+                        except Exception as _tax_err:
+                            st.error(f"❌ GST recalculation failed — order NOT saved: {_tax_err}")
+                            st.stop()   # lock auto-clears
+                        # ─────────────────────────────────────────────────────────
+
+                        from modules.persistence.order_persistence import save_order_to_db
+                        from modules.sql_adapter import run_query, run_write
+
+                        _old_status_for_history = order.get("status") or "PENDING"
+
+                        # ── Smart status advance on save ─────────────────────────
+                        # Once Backoffice assignments are confirmed, the order itself is
+                        # confirmed. Supplier/stock/in-house readiness is still controlled
+                        # line-wise by the route pipeline and billing gate.
+                        _cur_status = order.get("status", "PENDING")
+                        if _cur_status in ("PENDING", "PENDING_VALIDATION", "PROVISIONAL", "UNDER_REVIEW", ""):
+                            order["status"] = "CONFIRMED"
+                        # ─────────────────────────────────────────────────────────
+
+                        # ── Decide final status BEFORE save ──────────────────
+                        # Use batch_status + allocation as the ground truth
+                        # (manufacturing_route may be None on old orders)
+                        _alloc_total  = sum(int(l.get("allocated_qty") or 0) for l in all_lines)
+                        _bill_total   = sum(int(l.get("billing_qty") or 0) for l in all_lines)
+                        _cur_status = order.get("status") or "PENDING"
+                        if _cur_status in ("PENDING", "PENDING_VALIDATION", "PROVISIONAL", "UNDER_REVIEW", ""):
+                            order["status"] = "CONFIRMED"
+
+                        # Write status to DB directly FIRST (before save, so upsert picks it up)
+                        _new_status = order["status"]
+                        try:
+                            run_query(
+                                "UPDATE orders SET status=%(s)s, updated_at=NOW() WHERE order_no=%(n)s",
+                                {"s": _new_status, "n": order.get("order_no")},
                             )
-                except Exception as _trail_e:
-                    st.caption(f"Audit trail unavailable: {_trail_e}")
+                            if _new_status == "CONFIRMED":
+                                try:
+                                    run_write("""
+                                        INSERT INTO order_status_history
+                                            (order_id, from_status, to_status,
+                                             changed_at, changed_by_name, remarks)
+                                        SELECT id, %(frm)s, 'CONFIRMED',
+                                               NOW(), %(by)s, %(rmk)s
+                                        FROM orders
+                                        WHERE order_no = %(ono)s
+                                          AND NOT EXISTS (
+                                              SELECT 1
+                                              FROM order_status_history h
+                                              WHERE h.order_id = orders.id
+                                                AND h.to_status = 'CONFIRMED'
+                                          )
+                                    """, {
+                                        "frm": _old_status_for_history,
+                                        "by": "Backoffice",
+                                        "rmk": "Backoffice assignments confirmed and order saved",
+                                        "ono": order.get("order_no"),
+                                    })
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        # ─────────────────────────────────────────────────────
+
+                        saved_id = save_order_to_db(order)
+
+                        # WIN 2: invalidate challan cache — save may affect challan state
+                        try:
+                            st.session_state.pop(f"_bo_challan_exists_{order_id}", None)
+                        except Exception:
+                            pass
+
+                        # F5: Re-read orders.total_value from DB after save so
+                        # WhatsApp message always shows the post-save amount, not
+                        # the pre-save in-memory total_billing which may differ if
+                        # save_order_to_db adjusted any line values.
+                        try:
+                            from modules.sql_adapter import run_query as _rq_tv
+                            _tv_rows = _rq_tv(
+                                "SELECT total_value FROM orders WHERE id=%(oid)s::uuid LIMIT 1",
+                                {"oid": str(saved_id or order.get("id") or "")},
+                            ) or []
+                            if _tv_rows:
+                                total_billing = float(_tv_rows[0].get("total_value") or total_billing)
+                        except Exception as _tv_err:
+                            logger.debug("Post-save total_value re-read failed (non-fatal): %s", _tv_err)
+                        try:
+                            from modules.backoffice.backoffice_helpers import ensure_order_production_refs
+                            ensure_order_production_refs(
+                                order_no=str(order.get("order_no") or ""),
+                                order_id=str(saved_id or order.get("id") or order_id or ""),
+                            )
+                        except Exception as _prod_ref_err:
+                            logger.warning("Backoffice save production_ref fill failed: %s", _prod_ref_err)
+                        try:
+                            from modules.procurement.procurement_ledger import ensure_queue_items
+                            _proc_line_ids = [
+                                str(l.get("line_id") or l.get("id") or "")
+                                for l in all_lines
+                                if not l.get("is_service_line")
+                                and str(l.get("eye_side") or "").upper() not in ("S", "SERVICE")
+                                and str(l.get("manufacturing_route") or "STOCK").upper() in ("STOCK", "VENDOR", "EXTERNAL_LAB")
+                            ]
+                            ensure_queue_items(_proc_line_ids, source="BACKOFFICE_SAVE")
+                        except Exception:
+                            pass
+                        for line in all_lines:
+                            line["pricing_locked"] = True
+
+                        # Update the in-memory order in bo_active_orders so the
+                        # detail view reflects the new status without a full reload
+                        _ono = order.get("order_no")
+                        for _o in st.session_state.get("bo_active_orders", []):
+                            if _o.get("order_no") == _ono:
+                                _o["status"]     = _new_status
+                                _o["updated_at"] = str(datetime.datetime.now())[:16]
+                                break
+
+                        # Clear load cache so next dashboard Load gets fresh data
+                        try:
+                            from modules.backoffice.backoffice_helpers import load_orders_from_database
+                            load_orders_from_database.clear()
+                        except Exception:
+                            pass
+
+                        _disp_no = order.get("display_order_no") or order.get("order_no", saved_id)
+                        st.success(
+                            f"✅ Order **{_disp_no}** saved — "
+                            f"Status: **{_new_status}** 🎯"
+                        )
+                        if _new_status == "CONFIRMED":
+                            st.info("📦 All lines stock-allocated. Order is Collected ✓")
+                        try:
+                            from modules.post_save_actions import render_post_save_actions
+                            render_post_save_actions(
+                                order_no=str(order.get("order_no") or _disp_no),
+                                party_name=str(order.get("party_name") or order.get("patient_name") or "Customer"),
+                                mobile=str(order.get("mobile") or order.get("patient_mobile") or order.get("party_mobile") or ""),
+                                total=float(total_billing or 0),
+                                order_type=str(order.get("order_type") or "RETAIL"),
+                                advance=float(order.get("advance_amount") or order.get("paid_amount") or 0),
+                                delivery_date=str(order.get("expected_supply_date") or order.get("expected_delivery_date") or ""),
+                                on_account=True,
+                                # FIX: pass only live lines to post-save actions.
+                                # Sending the raw all_lines included deleted rows,
+                                # which made post-save reconcile against the wrong
+                                # totals and skip the action panel.
+                                lines=[_l for _l in all_lines if not bool(_l.get("is_deleted"))],
+                            )
+                            _post_save_actions_rendered = True
+                        except Exception as _psa_err:
+                            st.caption(f"Post-save actions unavailable: {_psa_err}")
+                        with st.expander("⏸ Hold / 🚫 Cancel Order", expanded=False):
+                            try:
+                                from modules.backoffice.guidance import (
+                                    render_hold_confirm_panel, render_cancel_confirm_panel,
+                                )
+                                _order_id_action  = str(order.get("id") or order.get("order_id") or "")
+                                _order_no_action  = str(order.get("order_no") or "")
+                                _cur_status_action = str(order.get("status") or "CONFIRMED").upper()
+                                st.markdown("**⏸ Hold Order**")
+                                render_hold_confirm_panel(_order_id_action, _order_no_action, _cur_status_action)
+                                st.markdown("---")
+                                st.markdown("**🚫 Cancel Order**")
+                                render_cancel_confirm_panel(_order_id_action, _order_no_action, _cur_status_action)
+                            except ImportError:
+                                st.caption("guidance.py not installed")
+                        st.balloons()
+                    except Exception as _save_err:
+                        try:
+                            from modules.core.error_logger import log_error
+                            log_error(_save_err, context="backoffice.save_to_order",
+                                      payload={"order_no": order.get("order_no"),
+                                               "order_type": order.get("order_type")})
+                        except Exception:
+                            pass
+                        st.error(f"❌ Save failed: {_save_err}")
+
+            _status_for_actions = str(order.get("status") or "").upper()
+
+            # After a production rollback the order is CONFIRMED but the staff
+            # want to RE-EDIT, not send WhatsApp. Collapse post-save actions into
+            # an expander when the order was rolled back (no in-session save).
+            # _post_save_actions_rendered=True means a save just happened — expand.
+            # Otherwise (e.g., loaded fresh after rollback) wrap in a collapsed expander.
+            _psa_just_saved = _post_save_actions_rendered  # True only if save ran this rerun
+            _psa_oid = str(order.get("id") or order.get("order_id") or "")
+            _psa_session_key = f"_bo_psa_just_saved_{_psa_oid}"
+            if _psa_just_saved:
+                st.session_state[_psa_session_key] = True
+            _psa_expand = bool(st.session_state.get(_psa_session_key))
+
+            if (
+                not _post_save_actions_rendered
+                and _status_for_actions in ("CONFIRMED", "IN_PRODUCTION", "READY_TO_BILL", "READY_FOR_BILLING")
+            ):
+                try:
+                    from modules.post_save_actions import render_post_save_actions
+
+                    def _do_psa():
+                        render_post_save_actions(
+                            order_no=str(order.get("order_no") or order.get("display_order_no") or ""),
+                            party_name=str(order.get("party_name") or order.get("patient_name") or "Customer"),
+                            mobile=str(order.get("mobile") or order.get("patient_mobile") or order.get("party_mobile") or ""),
+                            total=float(total_billing or 0),
+                            order_type=str(order.get("order_type") or "RETAIL"),
+                            advance=float(order.get("advance_amount") or order.get("paid_amount") or 0),
+                            delivery_date=str(order.get("expected_supply_date") or order.get("expected_delivery_date") or ""),
+                            on_account=True,
+                            lines=[_l for _l in all_lines if not bool(_l.get("is_deleted"))],
+                        )
+
+                    if _psa_expand:
+                        # Just saved this session — show expanded (normal post-save flow)
+                        _do_psa()
+                    else:
+                        # Loaded fresh after rollback (or any re-open without a save)
+                        # Collapse so the edit form above is the first thing staff see
+                        with st.expander("🚀 Post-Save Actions (WhatsApp / Notification)", expanded=False):
+                            _do_psa()
+
+                    with st.expander("⏸ Hold / 🚫 Cancel Order", expanded=False):
+                        try:
+                            from modules.backoffice.guidance import (
+                                render_hold_confirm_panel, render_cancel_confirm_panel,
+                            )
+                            _order_id_action  = str(order.get("id") or order.get("order_id") or "")
+                            _order_no_action  = str(order.get("order_no") or "")
+                            _cur_status_action = str(order.get("status") or "CONFIRMED").upper()
+                            st.markdown("**⏸ Hold Order**")
+                            render_hold_confirm_panel(_order_id_action, _order_no_action, _cur_status_action)
+                            st.markdown("---")
+                            st.markdown("**🚫 Cancel Order**")
+                            render_cancel_confirm_panel(_order_id_action, _order_no_action, _cur_status_action)
+                        except ImportError:
+                            st.caption("guidance.py not installed")
+                except Exception as _psa_reopen_err:
+                    st.caption(f"Confirmation actions unavailable: {_psa_reopen_err}")
     
-    with tab4:
-        # ═════════════════════════════════════════════════════════════
-        # LIVE BILLING STATUS — automatic from challan/invoice system
-        # ═════════════════════════════════════════════════════════════
-        
-        # Query live billing status from challan and invoice tables
-        from modules.sql_adapter import run_query as _rq
-        try:
-            _order_id = order.get("id")
-            
-            # Get challan status - check if order is referenced in any challan
-            _challan_sql = """
-                SELECT c.challan_no, c.status, c.total_amount, c.created_at,
-                       p.party_name, c.remarks
-                FROM challans c
-                LEFT JOIN parties p ON p.id = c.party_id
-                WHERE (c.order_ids::text[] @> ARRAY[%(oid)s::text] OR c.order_ids::text[] @> ARRAY[%(ono)s::text])
-                AND c.status NOT IN ('CANCELLED','VOID')
-                ORDER BY c.created_at DESC
-                LIMIT 5
-            """
-            _challans = _rq(_challan_sql, {"oid": str(_order_id or ""), "ono": str(order.get("order_no") or "")}) if _rq else []
-            
-            # Get invoice status - check if order is referenced in any invoice
-            _invoice_sql = """
-                SELECT i.invoice_no, i.status, i.total_amount, i.created_at,
-                       p.party_name, i.remarks
-                FROM invoices i
-                LEFT JOIN parties p ON p.id = i.party_id
-                WHERE (i.order_ids::text[] @> ARRAY[%(oid)s::text] OR i.order_ids::text[] @> ARRAY[%(ono)s::text])
-                AND i.status NOT IN ('CANCELLED','VOID')
-                ORDER BY i.created_at DESC
-                LIMIT 5
-            """
-            _invoices = _rq(_invoice_sql, {"oid": str(_order_id or ""), "ono": str(order.get("order_no") or "")}) if _rq else []
-            
-        except Exception as e:
-            _challans = []
-            _invoices = []
-            st.caption(f"⚠️ Billing query error: {e}")
-        
-        # Use the new billing status UI module
-        try:
-            from .billing_status_ui import render_billing_status_panel
-            render_billing_status_panel(order, all_lines)
-        except ImportError:
-            # billing_status_ui not yet deployed — show placeholder
-            import streamlit as _st_bsu
-            _st_bsu.info("🧾 Billing Status panel loading — please redeploy billing_status_ui.py")
-        except Exception as _bsu_e:
-            import streamlit as _st_bsu
-            _st_bsu.error(f"Billing status error: {_bsu_e}")
+        if False:
+            # Documents tab — smart default based on what lines this order has
+            has_inhouse = bool(order.get('inhouse_lines'))
+            has_lab     = bool(order.get('lab_order_lines'))
+            has_stock   = bool(order.get('stock_lines'))
 
-        # ── Full Payment Provisioning (view, edit, void, re-record) ──
-        try:
-            from modules.billing.payment_manager import render_payment_provisioning
-            render_payment_provisioning(order, all_lines)
-        except Exception as _ape:
-            st.caption(f"Payment panel error: {_ape}")
+            # Default to the most relevant tab for this order type
+            if has_stock and not has_inhouse and not has_lab:
+                default_doc = 'Labels'
+            elif has_inhouse and not has_lab:
+                default_doc = 'Job Cards'
+            elif has_lab and not has_inhouse:
+                default_doc = 'Lab Orders'
+            else:
+                default_doc = 'All'
 
-        # ── Payment Link (send to customer via WhatsApp) ──────────────
-        try:
-            from modules.billing.payment_link_manager import render_payment_link_panel
-            render_payment_link_panel(order, all_lines)
-        except Exception as _plm_err:
-            st.caption(f"Payment link panel: {_plm_err}")
+            doc_options = ['Job Cards', 'Lab Orders', 'Labels', 'All']
+            doc_type = st.radio(
+                "Document Type",
+                doc_options,
+                index=doc_options.index(default_doc),
+                horizontal=True,
+                key=f"doc_type_{order_id}"
+            )
+
+            shown_any = False
+
+            if doc_type in ['Job Cards', 'All']:
+                if has_inhouse:
+                    if not _jump_billing:
+                        generate_job_cards(order)
+                        shown_any = True
+                    else:
+                        st.info("📄 Job cards available — navigate here manually after billing.")
+                        shown_any = True
+                elif doc_type == 'Job Cards':
+                    st.info("No in-house manufacturing lines on this order — no job cards to generate.")
+
+            if doc_type in ['Lab Orders', 'All']:
+                if has_lab:
+                    generate_lab_orders(order)
+                    shown_any = True
+                elif doc_type == 'Lab Orders':
+                    st.info("No external lab lines on this order — no lab orders to generate.")
+
+            if doc_type in ['Labels', 'All']:
+                if has_stock:
+                    generate_labels(order)
+                    shown_any = True
+                elif doc_type == 'Labels':
+                    st.info("No stock lines on this order — no labels to generate.")
+
+            if doc_type == 'All' and not shown_any:
+                st.warning("No documents to generate for this order yet. Add and allocate line items first.")
+    
+    if _bo_active_section == "📊 Status":
+        with tab3:
+            _t3_status = str(order.get("status") or "").upper()
+            if _t3_status in ("HOLD", "CANCELLED"):
+                try:
+                    from modules.backoffice.guidance import render_hold_confirm_panel, render_stage_guidance
+                    _t3_oid = str(order.get("id") or order.get("order_id") or "")
+                    _t3_ono = str(order.get("order_no") or "")
+                    if _t3_status == "HOLD":
+                        render_hold_confirm_panel(_t3_oid, _t3_ono, "HOLD")
+                    else:
+                        render_stage_guidance("CANCELLED", compact=False)
+                    st.markdown("---")
+                except ImportError:
+                    pass
+            from modules.backoffice.order_status_window import render_order_status_window
+            render_order_status_window(order)
+    
+    if _bo_active_section == "💰 Billing Summary":
+        with tab4:
+            # ── Billing Summary ───────────────────────────────────────────────
+            st.markdown("### 💰 Billing Summary")
+
+            # ── Pricing summary ───────────────────────────────────────────────
+            locked_count    = sum(1 for line in all_lines if line.get("pricing_locked", False))
+            _active_billing_lines = [_l for _l in all_lines if not bool(_l.get("is_deleted"))]
+            _order_type_bill = str(order.get("order_type") or "WHOLESALE").upper()
+            total_billing   = sum(_bo_line_amounts(line, _order_type_bill)["grand"] for line in _active_billing_lines)
+            total_discount  = sum(float(line.get("discount_amount") or 0) for line in _active_billing_lines)
+            total_allocated = sum(int(line.get("allocated_qty") or 0) for line in _active_billing_lines)
+
+            if locked_count > 0:
+                st.info(f"🔒 {locked_count} of {len(all_lines)} line(s) have locked pricing")
+
+            _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+            _mc1.metric("Lines",          len(_active_billing_lines))
+            _mc2.metric("Allocated",      total_allocated)
+            _mc3.metric("Discount",       f"₹{total_discount:.2f}")
+            _mc4.metric("Billing Total",  f"₹{total_billing:.2f}")
+
+            # ── Line table with discount ──────────────────────────────────────
+            def _prod_billing_label(line: dict) -> str:
+                """Build full product label with index and coating for billing table."""
+                import json as _bj_lbl
+                _lp = line.get("lens_params") or {}
+                if isinstance(_lp, str):
+                    try: _lp = _bj_lbl.loads(_lp)
+                    except Exception as _e:
+                        logger.warning("Suppressed error: %s", _e)
+                        _lp = {}
+                _nm = str(
+                    line.get("product_name")
+                    or _lp.get("service_display_name")
+                    or _lp.get("display_product_name")
+                    or _lp.get("service_description")
+                    or "N/A"
+                )
+                _coat = str(line.get("coating_type") or line.get("coating") or
+                            _lp.get("coating_type") or _lp.get("coating") or "").strip()
+                _idx  = str(line.get("index_value") or line.get("lens_index") or
+                            _lp.get("index_value") or _lp.get("lens_index") or "").strip()
+                label = _nm
+                if _idx and _idx not in _nm:
+                    label = f"{label} ({_idx})"
+                if _coat and _coat not in _nm:
+                    label = f"{label} {_coat}"
+                return label
 
 
-        # =====================================================
+            billing_data = []
+            _billing_stage_map = {}
+            try:
+                from modules.sql_adapter import run_query as _rq_bill_stage
+                _stage_lids = [
+                    str(_ln.get("line_id") or _ln.get("id") or "")
+                    for _ln in _active_billing_lines
+                    if _ln.get("line_id") or _ln.get("id")
+                ]
+                if _stage_lids:
+                    _stage_rows = _rq_bill_stage(
+                        "SELECT order_line_id::text AS lid, current_stage, is_closed "
+                        "FROM job_master WHERE order_line_id = ANY(%(ids)s::uuid[])",
+                        {"ids": _stage_lids},
+                    ) or []
+                    _billing_stage_map = {str(r.get("lid") or ""): r for r in _stage_rows}
+            except Exception:
+                _billing_stage_map = {}
+            for _bi, line in enumerate(_active_billing_lines, 1):
+                _bqty   = int(line.get("billing_qty") or 0)
+                _bprice = float(line.get("unit_price") or 0)
+                _bqty_label = _bo_qty_display(line)
+                _bdisc  = float(line.get("discount_amount") or 0)
+                _bamount = _bo_line_amounts(line, _order_type_bill)
+                _btotal = _bamount["grand"]
+                _bgross = _bqty * _bprice
+                _line_stage_row = _billing_stage_map.get(str(line.get("line_id") or line.get("id") or "")) or {}
+                _line_stage = str(_line_stage_row.get("current_stage") or "").upper()
+                _line_lp_stage = line.get("lens_params") or {}
+                if isinstance(_line_lp_stage, str):
+                    try:
+                        import json as _line_stage_json
+                        _line_lp_stage = _line_stage_json.loads(_line_lp_stage)
+                    except Exception:
+                        _line_lp_stage = {}
+                _line_route_stage = str(
+                    line.get("manufacturing_route")
+                    or _line_lp_stage.get("manufacturing_route")
+                    or ""
+                ).upper()
+                _supplier_stage_label = str(
+                    line.get("supplier_stage")
+                    or _line_lp_stage.get("supplier_stage")
+                    or _line_lp_stage.get("external_lab_stage")
+                    or ""
+                ).upper()
+                _line_stage_label = (
+                    "Ready to Bill" if bool(_line_stage_row.get("is_closed")) or _line_stage in ("READY_TO_BILL", "READY_FOR_BILLING")
+                    else "Ready to Bill" if _line_route_stage in ("VENDOR", "EXTERNAL_LAB") and _supplier_stage_label in ("READY_TO_BILL", "READY_FOR_BILLING")
+                    else _supplier_stage_label.replace("_", " ").title() if _line_route_stage in ("VENDOR", "EXTERNAL_LAB") and _supplier_stage_label
+                    else (_line_stage.replace("_", " ").title() if _line_stage else "Pending")
+                )
+                billing_data.append({
+                    "#":        _bi,
+                    "Product":  _prod_billing_label(line),
+                    "Eye":      str(line.get("eye_side", "")).upper(),
+                    "Stage":    _line_stage_label,
+                    "Qty":      _bqty_label,
+                    "Unit ₹":   f"{_bprice:.2f}",
+                    "Gross ₹":  f"{_bgross:.2f}",
+                    "Disc ₹":   f"{_bdisc:.2f}" if _bdisc else "—",
+                    "Total ₹":  f"{_btotal:.2f}",
+                    "Route":    str(line.get("manufacturing_route") or "—").upper(),
+                    "🔒":       "🔒" if line.get("pricing_locked") else "",
+                })
+            st.dataframe(pd.DataFrame(billing_data), use_container_width=True, hide_index=True)
+
+            _present_service_families = {
+                _bo_service_family_for_line(_svc_line)
+                for _svc_line in _active_billing_lines
+                if _bo_service_family_for_line(_svc_line)
+            }
+            _suspected_missing_services = _bo_suspected_missing_services(_active_billing_lines)
+            _recovery_label = (
+                f"⚠️ Possible Missing Services — {', '.join(_suspected_missing_services)}"
+                if _suspected_missing_services
+                else "🧾 Add missed service / collectable before billing"
+            )
+            with st.expander(_recovery_label, expanded=bool(_suspected_missing_services)):
+                if _suspected_missing_services:
+                    st.warning(
+                        "The order data hints that these services may be missing from billing: "
+                        + ", ".join(_suspected_missing_services)
+                    )
+                else:
+                    st.caption("Use only when a service was taken/selected but is not visible in Billing Status.")
+                try:
+                    from modules.backoffice.service_master import fetch_service_types as _fst_rec, service_price as _sp_rec
+                    _svc_recovery_rows = _bo_complete_service_rows(_fst_rec(active_only=True) or [])
+                except Exception:
+                    _svc_recovery_rows = _bo_complete_service_rows([])
+                    _sp_rec = lambda s, ot, *args, **kwargs: float((s or {}).get("default_price") or 0)
+
+                _svc_recovery_groups = ["COLOURING", "FITTING", "COURIER", "CONSULTATION", "EYE_TESTING", "MISC"]
+                _default_group_idx = 0
+                if _suspected_missing_services:
+                    _default_group_idx = _svc_recovery_groups.index(_suspected_missing_services[0])
+                _rec_key_base = str(order.get("id") or order_id or "")[:8]
+                _rec_group = st.selectbox(
+                    "Service family",
+                    _svc_recovery_groups,
+                    index=_default_group_idx,
+                    format_func=lambda g: (
+                        f"{g.title()} — already present" if g in _present_service_families else g.title()
+                    ),
+                    key=f"bo_bill_missing_svc_group_{_rec_key_base}",
+                )
+                _rec_options = [
+                    r for r in _svc_recovery_rows
+                    if str(r.get("service_group") or "").upper() == _rec_group
+                ] or [{
+                    "service_code": _rec_group,
+                    "service_group": _rec_group,
+                    "service_name": _rec_group.title(),
+                    "gst_percent": 0 if _rec_group in ("CONSULTATION", "EYE_TESTING") else 18,
+                    "default_price": 0,
+                }]
+                _rec_labels = [
+                    f"{r.get('service_name') or r.get('service_code')} · {r.get('service_code') or _rec_group}"
+                    for r in _rec_options
+                ]
+                _rec_i = st.selectbox(
+                    "Service type",
+                    range(len(_rec_options)),
+                    format_func=lambda i: _rec_labels[i],
+                    key=f"bo_bill_missing_svc_type_{_rec_key_base}_{_rec_group}",
+                )
+                _rec_def = _rec_options[int(_rec_i)]
+                _rec_rate_default = float(_sp_rec(_rec_def, _order_type_bill) if _rec_def else 0)
+                if _rec_rate_default <= 0:
+                    _rec_rate_default = float(_rec_def.get("default_price") or 0)
+                _rec_gst_default = float(
+                    _rec_def.get("gst_percent")
+                    if _rec_def.get("gst_percent") is not None
+                    else (0 if _rec_group in ("CONSULTATION", "EYE_TESTING") else 18)
+                )
+                _rsvc1, _rsvc2, _rsvc3 = st.columns([1.2, 1.0, 1.0])
+                with _rsvc1:
+                    _rec_rate = st.number_input(
+                        "₹ Rate / pair",
+                        min_value=0.0,
+                        value=float(_rec_rate_default or 0),
+                        step=10.0,
+                        key=f"bo_bill_missing_svc_rate_{_rec_key_base}_{_rec_group}",
+                    )
+                with _rsvc2:
+                    _rec_qty_factor = st.selectbox(
+                        "Qty",
+                        [0.5, 1.0, 1.5, 2.0, 3.0],
+                        index=1,
+                        format_func=lambda v: (
+                            f"{v:g} pair — 1 eye" if v == 0.5 else
+                            f"{v:g} pair — both eyes" if v == 1.0 else
+                            f"{v:g} pair"
+                        ),
+                        key=f"bo_bill_missing_svc_qty_{_rec_key_base}_{_rec_group}",
+                    )
+                with _rsvc3:
+                    _rec_gst = st.number_input(
+                        "GST %",
+                        min_value=0.0,
+                        max_value=28.0,
+                        value=float(_rec_gst_default),
+                        step=0.5,
+                        key=f"bo_bill_missing_svc_gst_{_rec_key_base}_{_rec_group}",
+                    )
+                _rec_instr = ""
+                _rec_photo = None
+                if _rec_group in ("COLOURING", "FITTING"):
+                    _rec_instr = st.text_area(
+                        "Instruction for production / provider",
+                        placeholder="Tint shade, sample reference, fitting note, urgency...",
+                        key=f"bo_bill_missing_svc_instr_{_rec_key_base}_{_rec_group}",
+                        height=70,
+                    )
+                    if _rec_group == "COLOURING":
+                        _rec_photo = st.file_uploader(
+                            "Colour sample photograph",
+                            type=["jpg", "jpeg", "png", "webp"],
+                            key=f"bo_bill_missing_svc_photo_{_rec_key_base}_{_rec_group}",
+                        )
+                elif _rec_group in ("COURIER", "CONSULTATION", "EYE_TESTING", "MISC"):
+                    _rec_instr = st.text_input(
+                        "Narration / reference",
+                        placeholder="Optional note",
+                        key=f"bo_bill_missing_svc_note_{_rec_key_base}_{_rec_group}",
+                    )
+                _rec_duplicate = _rec_group in _present_service_families
+                if _rec_duplicate:
+                    st.info(f"{_rec_group.title()} already exists on this order. Add only if this is a genuine extra charge.")
+                if st.button(
+                    f"✅ Add {_rec_group.title()} Service Line",
+                    key=f"bo_bill_missing_svc_add_{_rec_key_base}_{_rec_group}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        import base64 as _rec_b64
+                        import json as _rec_json
+                        import uuid as _rec_uuid
+                        from modules.sql_adapter import run_write as _rw_rec
+                        _oid_rec = str(order.get("id") or order.get("order_id") or order_id or "")
+                        if not _oid_rec:
+                            st.error("Order id missing. Reopen this order and try again.")
+                            st.stop()
+                        if _rec_duplicate and not st.session_state.get(f"bo_bill_missing_svc_dup_{_rec_key_base}_{_rec_group}"):
+                            st.warning(f"{_rec_group.title()} already exists. Click Add again to confirm duplicate.")
+                            st.session_state[f"bo_bill_missing_svc_dup_{_rec_key_base}_{_rec_group}"] = True
+                            st.stop()
+                        _direct_rec = _rec_group not in ("COLOURING", "FITTING")
+                        _rec_base = round(float(_rec_rate or 0) * float(_rec_qty_factor or 1), 2)
+                        _rec_total, _rec_gst_amt = _bo_service_line_amounts(_rec_base, _rec_gst, order.get("order_type"))
+                        _rec_name = str(_rec_def.get("service_name") or _rec_group.title())
+                        _rec_code = str(_rec_def.get("service_code") or _rec_group).upper()
+                        _rec_label = f"{_rec_group.title()}: {_rec_name}"
+                        _rec_pid = _ensure_bo_service_product(_rec_group, _rec_label, _rec_gst)
+                        _rec_photo_b64 = ""
+                        _rec_photo_name = ""
+                        if _rec_photo:
+                            _rec_photo_b64 = _rec_b64.b64encode(_rec_photo.read()).decode("ascii")
+                            _rec_photo_name = _rec_photo.name
+                        _lp_rec = _rec_json.dumps({
+                            "charge_type": _rec_group,
+                            "service_type": _rec_group,
+                            "service_group": _rec_group,
+                            "service_code": _rec_code,
+                            "service_description": _rec_name,
+                            "service_display_name": _rec_label,
+                            "display_product_name": _rec_label,
+                            "service_production_type": "" if _direct_rec else _rec_group,
+                            "manufacturing_route": _service_route_for_group(_rec_group, _direct_rec),
+                            "service_instruction": _rec_instr,
+                            "colour_sample_photo": _rec_photo_b64,
+                            "colour_sample_filename": _rec_photo_name,
+                            "service_qty_factor": float(_rec_qty_factor or 1),
+                            "service_rate_per_pair": float(_rec_rate or 0),
+                            "service_origin": "billing_summary_recovery",
+                        })
+                        _rw_rec("""
+                            INSERT INTO order_lines
+                              (id, order_id, product_id, eye_side,
+                               unit_price, total_price, billing_total,
+                               gst_percent, gst_amount,
+                               quantity, billing_qty, allocated_qty,
+                               is_service_line, batch_status, lens_params)
+                            VALUES
+                              (%(id)s::uuid, %(oid)s::uuid, %(pid)s::uuid, 'S',
+                               %(up)s, %(tp)s, %(tp)s,
+                               %(gp)s, %(ga)s,
+                               1, 1, %(aq)s,
+                               TRUE, %(bs)s, %(lp)s::jsonb)
+                        """, {
+                            "id": str(_rec_uuid.uuid4()),
+                            "oid": _oid_rec,
+                            "pid": _rec_pid,
+                            "up": _rec_base,
+                            "tp": _rec_total,
+                            "gp": float(_rec_gst or 0),
+                            "ga": _rec_gst_amt,
+                            "aq": 1 if _direct_rec else 0,
+                            "bs": "READY" if _direct_rec else "PENDING",
+                            "lp": _lp_rec,
+                        })
+                        try:
+                            from modules.backoffice.backoffice_helpers import ensure_order_production_refs
+                            ensure_order_production_refs(order_id=_oid_rec)
+                        except Exception as _rec_ref_err:
+                            logger.warning("Service recovery production_ref fill failed: %s", _rec_ref_err)
+                        _bo_refresh_order_total_value(_oid_rec)
+                        st.session_state.pop(f"bo_bill_missing_svc_dup_{_rec_key_base}_{_rec_group}", None)
+                        if _direct_rec:
+                            st.success(f"{_rec_group.title()} service line added and ready for billing.")
+                        else:
+                            st.success(f"{_rec_group.title()} service line added. Complete it in Production before billing.")
+                        st.rerun()
+                    except Exception as _rec_add_err:
+                        st.error(f"Could not add service line: {_rec_add_err}")
+
+            # ── Mixed-route audit: one order may have many independent line routes ──
+            _route_notes = []
+            _route_errors = []
+            _route_stage_map = {}
+            try:
+                from modules.sql_adapter import run_query as _rq_route_stage
+                _route_lids = [
+                    str(_ln.get("line_id") or _ln.get("id") or "")
+                    for _ln in all_lines
+                    if _ln.get("line_id") or _ln.get("id")
+                ]
+                if _route_lids:
+                    _stage_rows = _rq_route_stage(
+                        "SELECT order_line_id::text AS lid, current_stage, is_closed "
+                        "FROM job_master WHERE order_line_id = ANY(%(ids)s::uuid[])",
+                        {"ids": _route_lids},
+                    ) or []
+                    _route_stage_map = {str(r.get("lid") or ""): r for r in _stage_rows}
+            except Exception:
+                _route_stage_map = {}
+            for _ln in all_lines:
+                _lp = _ln.get("lens_params") or {}
+                if isinstance(_lp, str):
+                    try:
+                        import json as _rj_audit
+                        _lp = _rj_audit.loads(_lp)
+                    except Exception:
+                        _lp = {}
+                _name = str(_ln.get("product_name") or _lp.get("service_display_name") or _lp.get("service_description") or "Line")
+                _route = str(_ln.get("manufacturing_route") or _lp.get("manufacturing_route") or "").upper()
+                _is_svc = bool(_ln.get("is_service_line")) or str(_ln.get("eye_side") or "").upper() in ("S", "SERVICE")
+                _svc_type = str(_lp.get("service_production_type") or "").upper()
+                _lid_audit = str(_ln.get("line_id") or _ln.get("id") or "")
+                _stage_row = _route_stage_map.get(_lid_audit) or {}
+                _stage_audit = str(_stage_row.get("current_stage") or "").upper()
+                _stage_label_audit = (
+                    "Ready to Bill" if bool(_stage_row.get("is_closed")) or _stage_audit in ("READY_TO_BILL", "READY_FOR_BILLING")
+                    else (_stage_audit.replace("_", " ").title() if _stage_audit else "Pending / job not created")
+                )
+                if _is_svc:
+                    if not _svc_type:
+                        _route_notes.append(f"{_name}: direct billing service.")
+                    elif _svc_type == "COLOURING":
+                        _route_notes.append(f"{_name}: COLOURING service — {_stage_label_audit}.")
+                    elif _svc_type == "FITTING":
+                        _route_notes.append(f"{_name}: FITTING service — {_stage_label_audit}.")
+                    else:
+                        _route_notes.append(f"{_name}: {_svc_type} service route {_route}.")
+                else:
+                    _route_notes.append(f"{_name}: product route {_route or 'NOT ASSIGNED'}.")
+                    if not _route:
+                        _route_errors.append(f"{_name}: product route not assigned.")
+
+            with st.expander("🧭 Mixed Order Route Audit", expanded=bool(_route_errors)):
+                if _route_errors:
+                    for _err in _route_errors:
+                        st.error(_err)
+                    st.caption("Fix these before challan/invoice. Every line must have its own clear route.")
+                else:
+                    st.success("Line-wise routing is consistent. Mixed orders are allowed.")
+                for _note in _route_notes:
+                    st.caption(f"• {_note}")
+
+            st.markdown("---")
+
+            # ── INLINE BILL NOW ───────────────────────────────────────────────
+            # Check which lines are ready to bill (not yet on any challan)
+            _bill_ready = []
+            _bill_blocked = ""
+            _bill_blockers = []
+            _bill_pending_rows = []
+            try:
+                from modules.sql_adapter import run_query as _rq_b4
+                _BILL_READY_STAGES = {
+                    # Strict billing gate:
+                    # READY_FOR_PACK is not billable. Packing must advance to READY_TO_BILL first.
+                    "READY_TO_BILL", "READY_FOR_BILLING",
+                }
+
+                # WIN 3: pre-fetch all job_master rows for this order's lines in ONE query
+                # instead of one per line inside the loop (was 2×N queries → now 1 query).
+                _jm_line_ids_b4 = [
+                    str(_bl.get("line_id") or _bl.get("id") or "")
+                    for _bl in _active_billing_lines
+                    if _bl.get("line_id") or _bl.get("id")
+                ]
+                _jm_map_b4 = {}
+                if _jm_line_ids_b4:
+                    try:
+                        _jm_rows_b4 = _rq_b4(
+                            "SELECT order_line_id::text AS lid, current_stage, is_closed "
+                            "FROM job_master WHERE order_line_id = ANY(%(ids)s::uuid[])",
+                            {"ids": _jm_line_ids_b4},
+                        ) or []
+                        _jm_map_b4 = {str(r["lid"]): r for r in _jm_rows_b4}
+                    except Exception:
+                        _jm_map_b4 = {}
+
+                _already_billed_line_ids_b4 = set()
+                if _jm_line_ids_b4:
+                    try:
+                        _already_rows_b4 = _rq_b4("""
+                            SELECT DISTINCT cl.order_line_id::text AS lid
+                            FROM challan_lines cl
+                            JOIN challans c ON c.id = cl.challan_id
+                            WHERE cl.order_line_id = ANY(%(ids)s::uuid[])
+                              AND c.status NOT IN ('CANCELLED','VOID')
+                              AND NOT COALESCE(cl.is_deleted,FALSE)
+                              AND NOT COALESCE(c.is_deleted,FALSE)
+                        """, {"ids": _jm_line_ids_b4}) or []
+                        _already_billed_line_ids_b4 = {
+                            str(r.get("lid") or "") for r in _already_rows_b4 if r.get("lid")
+                        }
+                    except Exception:
+                        _already_billed_line_ids_b4 = set()
+
+                for _bl in _active_billing_lines:
+                    _bl_id    = str(_bl.get("line_id") or _bl.get("id") or "")
+                    _lp_route_src = _bl.get("lens_params") or {}
+                    if isinstance(_lp_route_src, str):
+                        try:
+                            import json as _jrte
+                            _lp_route_src = _jrte.loads(_lp_route_src)
+                        except Exception:
+                            _lp_route_src = {}
+                    _bl_route = str(_bl.get("manufacturing_route") or _lp_route_src.get("manufacturing_route") or "").upper()
+                    _bl_price = _bo_line_amounts(_bl, _order_type_bill)["grand"]
+                    if _bl_price <= 0:
+                        continue  # skip zero-value lines
+
+                    # Already billed? Pre-fetched once for all visible lines above.
+                    if _bl_id in _already_billed_line_ids_b4:
+                        continue
+
+                    def _add_pending_bill_row(_line, _reason: str) -> None:
+                        _bill_pending_rows.append({
+                            "Product": _prod_billing_label(_line),
+                            "Eye": str(_line.get("eye_side") or "").upper(),
+                            "Stage / Reason": _reason,
+                            "Amount ₹": f"{_bo_line_amounts(_line, _order_type_bill)['grand']:.2f}",
+                        })
+
+                    # Service lines are ALWAYS ready to bill — no job card or blank needed
+                    _bl_is_svc = (
+                        bool(_bl.get("is_service_line"))
+                        or str(_bl.get("eye_side","")).upper() in ("S","SERVICE")
+                        or str(_bl.get("manufacturing_route","")).upper() == "SERVICE"
+                        or str(_lp_route_src.get("manufacturing_route","")).upper() == "SERVICE"
+                        or str(_lp_route_src.get("service_production_type","")).upper() in ("COLOURING", "FITTING")
+                    )
+                    if _bl_is_svc or _bl_route != "INHOUSE":
+                        # Service lines and non-inhouse lines: always billable once stages done
+                        # (Service lines completed colouring/fitting stages = ready)
+                        if _bl_is_svc:
+                            # Check service has reached a terminal production stage
+                            # (or is a direct-billing service like COURIER)
+                            _lp_bl = _bl.get("lens_params") or {}
+                            if isinstance(_lp_bl, str):
+                                try:
+                                    import json as _jbl; _lp_bl = _jbl.loads(_lp_bl)
+                                except Exception as _e:
+                                    logger.warning("Suppressed error: %s", _e)
+                                    _lp_bl = {}
+                            _svc_prod_type = str(_lp_bl.get("service_production_type") or "").upper()
+                            _jm_svc = [_jm_map_b4[_bl_id]] if _bl_id in _jm_map_b4 else (
+                                _rq_b4("""
+                                SELECT current_stage, is_closed FROM job_master
+                                WHERE order_line_id = %(lid)s::uuid LIMIT 1
+                            """, {"lid": _bl_id}) if _bl_id else []
+                            )
+                            if not _svc_prod_type or _svc_prod_type not in ("COLOURING","FITTING"):
+                                # Direct billing service (COURIER etc) — always ready
+                                _bill_ready.append(_bl)
+                            elif _svc_prod_type in ("COLOURING", "FITTING") and _jm_svc:
+                                _svc_stg  = str(_jm_svc[0].get("current_stage") or "").upper()
+                                _svc_clsd = bool(_jm_svc[0].get("is_closed"))
+                                if _svc_clsd or _svc_stg in _BILL_READY_STAGES:
+                                    _bill_ready.append(_bl)
+                                else:
+                                    _add_pending_bill_row(
+                                        _bl,
+                                        f"{_svc_prod_type.title()} stage {_svc_stg or 'NOT STARTED'}",
+                                    )
+                                    _bill_blockers.append(
+                                        f"{str(_bl.get('product_name',''))[:20]}: "
+                                        f"stage {_svc_stg or 'NOT STARTED'}"
+                                    )
+                            else:
+                                _add_pending_bill_row(
+                                    _bl,
+                                    f"{_svc_prod_type.title() if _svc_prod_type else 'Service'} job not created",
+                                )
+                                _bill_blockers.append(
+                                    f"{str(_bl.get('product_name',''))[:20]}: "
+                                    f"{_svc_prod_type.lower() if _svc_prod_type else 'service'} job not created"
+                                )
+                        else:
+                            if _bl_route in ("VENDOR", "EXTERNAL_LAB"):
+                                _lp_vnd = _bl.get("lens_params") or {}
+                                if isinstance(_lp_vnd, str):
+                                    try:
+                                        import json as _jvnd
+                                        _lp_vnd = _jvnd.loads(_lp_vnd)
+                                    except Exception:
+                                        _lp_vnd = {}
+                                _sup_stage = str(
+                                    _bl.get("supplier_stage")
+                                    or _lp_vnd.get("supplier_stage")
+                                    or _lp_vnd.get("external_lab_stage")
+                                    or ""
+                                ).upper()
+                                if _sup_stage in _BILL_READY_STAGES:
+                                    _bill_ready.append(_bl)
+                                else:
+                                    _add_pending_bill_row(
+                                        _bl,
+                                        f"{_bl_route} stage {_sup_stage or 'ORDER_PLACED'}",
+                                    )
+                                    _bill_blockers.append(
+                                        f"{str(_bl.get('product_name',''))[:20]} "
+                                        f"[{_bl_route}]: supplier stage {_sup_stage or 'ORDER_PLACED'}"
+                                    )
+                            else:
+                                _bill_ready.append(_bl)
+                    else:
+                        # Inhouse lens: check job stage
+                        _jm = [_jm_map_b4[_bl_id]] if _bl_id in _jm_map_b4 else (
+                            _rq_b4("""
+                            SELECT current_stage, is_closed FROM job_master
+                            WHERE order_line_id = %(lid)s::uuid LIMIT 1
+                        """, {"lid": _bl_id}) if _bl_id else []
+                        )
+                        if _jm:
+                            _stg   = str(_jm[0].get("current_stage") or "").upper()
+                            _clsd  = bool(_jm[0].get("is_closed"))
+                            if _clsd or _stg in _BILL_READY_STAGES:
+                                _bill_ready.append(_bl)
+                            else:
+                                _add_pending_bill_row(
+                                    _bl,
+                                    f"{_bl_route or 'INHOUSE'} stage {_stg or 'NOT STARTED'}",
+                                )
+                                _bill_blockers.append(
+                                    f"{str(_bl.get('product_name',''))[:20]} "
+                                    f"[{_bl_route}]: stage {_stg or 'NOT STARTED'}"
+                                )
+                        else:
+                            # No job card yet — not ready
+                            _add_pending_bill_row(_bl, "Job card not created yet")
+                            _bill_blockers.append(
+                                f"{str(_bl.get('product_name',''))[:20]}: "
+                                "Job card not created yet"
+                            )
+                # Partial billing rule:
+                # If some lines are ready, allow challan for those ready lines and keep
+                # unfinished services/products pending for a later challan. A hard block
+                # is only needed when nothing is ready to bill.
+                if _bill_blockers and not _bill_ready:
+                    _bill_blocked = " | ".join(dict.fromkeys(_bill_blockers))
+            except Exception as _b4e:
+                st.caption(f"Billing readiness check: {_b4e}")
+
+            if _bill_pending_rows:
+                with st.expander(f"⏳ Pending Billing Lines — {len(_bill_pending_rows)}", expanded=True):
+                    st.dataframe(pd.DataFrame(_bill_pending_rows), use_container_width=True, hide_index=True)
+
+            _bill_total = sum(_bo_line_amounts(l, _order_type_bill)["grand"] for l in _bill_ready)
+            _bill_lbl = (
+                f"💰 Bill Now — {len(_bill_ready)} line(s) · ₹{_bill_total:,.2f}"
+                if _bill_ready else "💰 Billing (not ready)"
+            )
+            try:
+                _existing_doc_rows = _rq_b4(
+                    """
+                    SELECT 1
+                    FROM challans c
+                    WHERE (c.order_ids::text[] @> ARRAY[%(oid)s::text]
+                        OR c.order_ids::text[] @> ARRAY[%(ono)s::text])
+                      AND COALESCE(c.status,'') NOT IN ('VOID','CANCELLED','DELETED')
+                    LIMIT 1
+                    """,
+                    {"oid": str(order.get("id") or order_id), "ono": str(order.get("order_no") or "")},
+                ) or []
+                _has_existing_billing_docs = bool(_existing_doc_rows)
+            except Exception:
+                _has_existing_billing_docs = False
+
+            with st.expander(
+                _bill_lbl,
+                expanded=(
+                    (bool(_bill_ready) and not _bill_blocked and _jump_billing)
+                    or _has_existing_billing_docs
+                )
+            ):
+                if _bill_blocked:
+                    st.warning(
+                        "Cannot bill — route/stage not ready: "
+                        + _bill_blocked
+                        + ". Advance the relevant supplier/production flow to Ready to Bill first."
+                    )
+                elif _bill_blockers and _bill_ready:
+                    st.info(
+                        "Partial billing enabled — only ready lines below will be billed now. "
+                        "Pending lines remain open for later billing after their stage is complete."
+                    )
+                if not _bill_ready:
+                    if not _bill_blocked:
+                        st.info("No unbilled lines ready on this order.")
+                else:
+                    # Show what will be billed
+                    for _rl in _bill_ready:
+                        _rl_eye   = str(_rl.get("eye_side","")).upper()
+                        _rl_name  = str(_rl.get("product_name","")).split(" | ")[0][:35]
+                        _rl_qty   = _bo_qty_display(_rl)
+                        _rl_disc  = float(_rl.get("discount_amount") or 0)
+                        _rl_total = _bo_line_amounts(_rl, _order_type_bill)["grand"]
+                        st.markdown(
+                            f"<div style='display:flex;justify-content:space-between;"
+                            f"padding:3px 0;border-bottom:1px solid #1e293b;font-size:0.8rem'>"
+                            f"<span>{_rl_eye} {_rl_name} <span style='color:#94a3b8'>· {_rl_qty}</span></span>"
+                            f"<span style='color:#10b981;font-weight:700'>₹{_rl_total:,.2f}"
+                            + (f" <span style='color:#64748b;font-size:0.7rem'>(-₹{_rl_disc:.2f})</span>"
+                               if _rl_disc > 0 else "")
+                            + "</span></div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    st.markdown(
+                        f"<div style='text-align:right;color:#10b981;font-weight:800;"
+                        f"font-size:1rem;padding:8px 0'>Total: ₹{_bill_total:,.2f}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    _xc1, _xc2 = st.columns(2)
+                    _chal_no  = _xc1.text_input("Challan No",
+                                                  key=f"bo_chal_{order_id}",
+                                                  placeholder="Auto-generated if blank")
+                    _remarks  = _xc2.text_input("Remarks",
+                                                  key=f"bo_rem_{order_id}",
+                                                  placeholder="Optional")
+                    _preflight_ok = True
+                    _preflight_issues = []
+                    _preflight_line_ids = [
+                        str(l.get("line_id") or l.get("id", ""))
+                        for l in _bill_ready
+                        if str(l.get("line_id") or l.get("id", "")).strip()
+                    ]
+                    try:
+                        from modules.billing.challan_invoice_manager import audit_billing_preflight
+                        _preflight_ok, _preflight_issues = audit_billing_preflight(
+                            [str(order.get("id") or order_id)],
+                            _preflight_line_ids,
+                        )
+                    except Exception as _preflight_err:
+                        _preflight_ok = False
+                        _preflight_issues = [f"Billing audit could not run: {_preflight_err}"]
+                    if not _preflight_ok:
+                        st.warning(
+                            "Billing audit warning: possible missing/unusual collectables were found. "
+                            "This partial challan will include only the ready lines listed above."
+                        )
+                        for _pfi in _preflight_issues:
+                            st.write("•", _pfi)
+                        if _bill_ready:
+                            _preflight_ok = True
+
+                    _do_chal = st.button(
+                        f"🧾 Create Challan — ₹{_bill_total:,.2f}",
+                        key=f"bo_do_chal_{order_id}",
+                        type="primary", use_container_width=True,
+                        disabled=not _preflight_ok,
+                    )
+                    _do_inv = st.button(
+                        "🧾 → 📄 Challan + Invoice",
+                        key=f"bo_do_inv_{order_id}",
+                        use_container_width=True,
+                        disabled=not _preflight_ok,
+                    )
+
+                    if _do_chal or _do_inv:
+                        try:
+                            from modules.billing.challan_invoice_manager import create_challan
+                            from modules.sql_adapter import run_query as _rq_ch
+
+                            # ── Repair missing blank_allocations ─────────────────────────
+                            # Job card saves blank selection into lens_params.surfacing_data
+                            # but may not always write a row to blank_allocations (older
+                            # pipeline versions, network blip during save, etc.).
+                            # Billing readiness checks blank_allocations — if the row is
+                            # absent the challan gate says "no blank allocated" even though
+                            # the technician did allot the blank.
+                            # This runs silently before challan creation; it is idempotent
+                            # (ON CONFLICT DO UPDATE) so safe to call every time.
+                            def _repair_missing_blank_allocations(line_ids: list) -> None:
+                                import json as _rj
+                                from modules.sql_adapter import run_query as _rq_rep, run_write as _rw_rep
+                                for _lid in line_ids:
+                                    if not _lid:
+                                        continue
+                                    try:
+                                        _lrows = _rq_rep(
+                                            "SELECT lens_params, eye_side FROM order_lines "
+                                            "WHERE id = %(lid)s::uuid LIMIT 1",
+                                            {"lid": _lid},
+                                        )
+                                        if not _lrows:
+                                            continue
+                                        _lp = _lrows[0].get("lens_params") or {}
+                                        if isinstance(_lp, str):
+                                            try:
+                                                _lp = _rj.loads(_lp)
+                                            except Exception:
+                                                _lp = {}
+                                        _surf     = (_lp.get("surfacing_data") or {}) if isinstance(_lp, dict) else {}
+                                        _blank_id = _surf.get("blank_id") or _surf.get("selected_blank_id")
+                                        if not _blank_id:
+                                            continue
+                                        # Check if allocation row already exists
+                                        _existing = _rq_rep(
+                                            "SELECT 1 FROM blank_allocations "
+                                            "WHERE order_line_id = %(lid)s::uuid LIMIT 1",
+                                            {"lid": _lid},
+                                        )
+                                        if _existing:
+                                            continue  # already allocated — nothing to repair
+                                        # Write the missing row
+                                        _rw_rep("""
+                                            INSERT INTO blank_allocations
+                                                (id, order_line_id, blank_id, eye_side,
+                                                 base_selected, allocated_at)
+                                            VALUES (
+                                                gen_random_uuid(),
+                                                %(lid)s::uuid,
+                                                %(bid)s::uuid,
+                                                %(eye)s,
+                                                %(base)s,
+                                                NOW()
+                                            )
+                                            ON CONFLICT (order_line_id) DO UPDATE SET
+                                                blank_id      = EXCLUDED.blank_id,
+                                                eye_side      = EXCLUDED.eye_side,
+                                                base_selected = EXCLUDED.base_selected,
+                                                allocated_at  = NOW()
+                                        """, {
+                                            "lid":  _lid,
+                                            "bid":  str(_blank_id),
+                                            "eye":  _lrows[0].get("eye_side") or "",
+                                            "base": _surf.get("base_curve") or _surf.get("base_selected"),
+                                        })
+                                    except Exception:
+                                        pass  # non-fatal — challan creation will surface any hard block
+
+                            _repair_line_ids = [
+                                str(l.get("line_id") or l.get("id", ""))
+                                for l in _bill_ready
+                            ]
+                            _repair_missing_blank_allocations(_repair_line_ids)
+
+                            # Compute base amount + tax from per-line GST
+                            _t_base = 0.0
+                            _t_tax  = 0.0
+                            for _l in _bill_ready:
+                                _amt = _bo_line_amounts(_l, _order_type_bill)
+                                _t_base += _amt["taxable"]
+                                _t_tax  += _amt["gst"]
+
+                            _challan_no_out = create_challan(
+                                party_id     = str(order.get("party_id") or ""),
+                                order_ids    = [str(order.get("id") or order_id)],
+                                total_amount = round(_t_base, 2),
+                                total_tax    = round(_t_tax,  2),
+                                remarks      = _remarks.strip() or "",
+                                line_ids     = [str(l.get("line_id") or l.get("id", ""))
+                                                for l in _bill_ready],
+                            )
+                            if _challan_no_out:
+                                st.success(
+                                    f"✅ Challan {_challan_no_out} created · "
+                                    f"₹{_bill_total:,.2f}"
+                                )
+                                # Direct navigation button to Challan Dashboard
+                                if st.button("📋 View in Challan Dashboard →",
+                                             key=f"go_chal_dash_{order_id}",
+                                             use_container_width=True):
+                                    st.session_state["_sidebar_page"]  = "🧾  Challan & Invoice"
+                                    st.session_state["active_module"]  = "Challan & Invoice Dashboard"
+                                    st.session_state["bo_show_billing_tab"] = False
+                                    st.rerun()
+                                if _do_inv:
+                                    try:
+                                        from modules.billing.challan_invoice_manager import (
+                                            create_invoice,
+                                        )
+                                        # Fetch the newly created challan's UUID
+                                        _ch_rows = _rq_ch(
+                                            "SELECT id::text AS challan_id FROM challans "
+                                            "WHERE challan_no = %(n)s LIMIT 1",
+                                            {"n": _challan_no_out},
+                                        )
+                                        _ch_id = (_ch_rows[0]["challan_id"]
+                                                  if _ch_rows else None)
+                                        if _ch_id:
+                                            _inv_no = create_invoice(
+                                                challan_id   = _ch_id,
+                                                party_id     = str(order.get("party_id") or ""),
+                                                order_ids    = [str(order.get("id") or order_id)],
+                                                total_amount = round(_t_base, 2),
+                                                total_tax    = round(_t_tax,  2),
+                                                remarks      = _remarks.strip() or "",
+                                            )
+                                            if _inv_no:
+                                                st.success(f"📄 Invoice {_inv_no} created")
+                                            else:
+                                                st.warning("Challan created — invoice creation failed, retry from Challan Dashboard")
+                                        else:
+                                            st.warning("Challan created — could not auto-create invoice (challan not found in DB)")
+                                    except Exception as _ie:
+                                        st.warning(f"Invoice error: {_ie}")
+                                import time; time.sleep(0.4)
+                                # Keep billing tab active on next render
+                                st.session_state["bo_show_billing_tab"] = True
+                                st.rerun()
+                            else:
+                                st.error("Challan creation failed — check logs")
+                        except Exception as _ce:
+                            _err_msg = str(_ce)
+                            st.error(f"❌ Billing error: {_err_msg}")
+                            # Show detailed reason if it's a readiness block
+                            if "not ready" in _err_msg.lower() or "stage:" in _err_msg.lower():
+                                st.info(
+                                    "💡 To fix: go to Production → In-house Lab → "
+                                    "advance the job to **Ready to Bill**, then return here."
+                                )
+                            elif "already has an active challan" in _err_msg:
+                                st.info("💡 Refresh the page — a challan may already exist for this order.")
+
+            # ── Existing Challans + Payment Collection ────────────────────────
+            # billing_status_ui renders: challan list, payment status, 
+            # Convert to Invoice button, payment balance check
+            st.markdown("---")
+            try:
+                from modules.backoffice.billing_status_ui import render_billing_status_panel
+                render_billing_status_panel(order, all_lines, actions_enabled=False)
+            except ImportError:
+                st.info(
+                    "💡 Challan management available in the **💳 Billing Gate** tab. "
+                    "Use that tab to view existing challans, collect payment, and convert to invoice."
+                )
+            except Exception as _bse:
+                st.warning(f"Billing status panel error: {_bse}")
+
+            # ── Pricing debug toggle ──────────────────────────────────────────
+            st.markdown("---")
+            if st.checkbox("🔍 Debug Pricing (Advanced)", key=f"debug_pricing_{order_id}"):
+                st.markdown("#### Line Item Debug")
+                for _di, line in enumerate(all_lines, 1):
+                    with st.expander(f"Line {_di}: {line.get('product_name', 'N/A')}", expanded=False):
+                        st.json({
+                            "product_id":           line.get("product_id", "N/A"),
+                            "price_source":         line.get("price_source", "unknown"),
+                            "eye_side":             line.get("eye_side", "N/A"),
+                            "billing_qty":          line.get("billing_qty", 0),
+                            "allocated_qty":        line.get("allocated_qty", 0),
+                            "pending_qty":          max(0, int(line.get("billing_qty") or 0) -
+                                                         int(line.get("allocated_qty") or 0)),
+                            "unit_price":           line.get("unit_price", 0),
+                            "discount_amount":      line.get("discount_amount", 0),
+                            "discount_percent":     line.get("discount_percent", 0),
+                            "billing_total":        line.get("billing_total", 0),
+                            "manufacturing_route":  line.get("manufacturing_route", "N/A"),
+                            "batch_allocation":     line.get("batch_allocation", []),
+                            "pricing_locked":       line.get("pricing_locked", False),
+                        }, expanded=False)
+    
+    # =====================================================
     # TAB 5: SUPPLIER ORDERS PANEL
     # =====================================================
-    with tab5:
-        try:
-            from .supplier_panel import render_supplier_panel
-            render_supplier_panel(order)
-        except ImportError as e:
-            st.error(f"❌ Supplier Panel module not found: {e}")
-            st.info("📋 Place supplier_panel.py in modules/backoffice/ directory")
-        except Exception as e:
-            st.error(f"❌ Supplier Panel error: {e}")
-            import traceback
-            with st.expander("Debug Info"):
-                st.code(traceback.format_exc())
-
-    if tab6 is not None:
-        with tab6:
+    if False:
+        _supplier_panel_key = f"bo_load_supplier_panel_{order_id}"
+        if not st.session_state.get(_supplier_panel_key):
+            st.info("Supplier Orders loads on demand to keep Backoffice fast.")
+            if st.button("Load Supplier Orders", key=f"{_supplier_panel_key}_btn", use_container_width=True):
+                st.session_state[_supplier_panel_key] = True
+                st.rerun()
+        else:
+            if st.button("Hide Supplier Orders", key=f"{_supplier_panel_key}_hide", use_container_width=True):
+                st.session_state.pop(_supplier_panel_key, None)
+                st.rerun()
             try:
-                from modules.backoffice.dispatch_panel import render_dispatch_panel
-                render_dispatch_panel(order)
-            except Exception as _dp_err:
-                st.error(f"Dispatch panel error: {_dp_err}")
-                import traceback as _tb_dp
-                with st.expander("Debug"):
-                    st.code(_tb_dp.format_exc())
+                from .supplier_panel import render_supplier_panel
+                render_supplier_panel(order)
+            except ImportError as e:
+                st.error(f"❌ Supplier Panel module not found: {e}")
+                st.info("📋 Place supplier_panel.py in modules/backoffice/ directory")
+            except Exception as e:
+                st.error(f"❌ Supplier Panel error: {e}")
+                import traceback
+                with st.expander("Debug Info"):
+                    st.code(traceback.format_exc())
     
-    def show_status_update_modal(order: Dict):
-        """Show modal for updating order status"""
-        st.markdown("---")
-        st.markdown("###  Update Order Status")
-        
-        current_status = order.get('status', 'PENDING')
+    # =====================================================
+    # TAB 6: BILLING GATE (CONTROLLED WRITE PANEL)
+    # =====================================================
+    if False:
+        _billing_gate_key = f"bo_load_billing_gate_{order_id}"
+        if not st.session_state.get(_billing_gate_key):
+            st.info("Billing Gate loads on demand. Billing Summary remains available immediately.")
+            if st.button("Load Billing Gate", key=f"{_billing_gate_key}_btn", use_container_width=True):
+                st.session_state[_billing_gate_key] = True
+                st.rerun()
+        else:
+            if st.button("Hide Billing Gate", key=f"{_billing_gate_key}_hide", use_container_width=True):
+                st.session_state.pop(_billing_gate_key, None)
+                st.rerun()
+            try:
+                from .billing_gate import render_billing_gate
+                render_billing_gate(order)
+            except ImportError as e:
+                st.error(f"❌ Billing Gate module not found: {e}")
+                st.info("📋 Place billing_gate.py in modules/backoffice/ directory")
 
-        
-        new_status = st.selectbox(
-            "New Status",
-            [s.value for s in OrderStatus],
-            index=[s.value for s in OrderStatus].index(current_status) if current_status in [s.value for s in OrderStatus] else 0,
-            key=f"status_update_{get_display_order_id(order)}"
-        )
-        
-        notes = st.text_area(
-            "Status Update Notes",
-            key=f"status_notes_{get_display_order_id(order)}"
-        )
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button(" Update Status", type="primary", width='stretch'):
-                # Update order status
-                for o in st.session_state.bo_active_orders:
-                    if get_display_order_id(o) == get_display_order_id(order):
-                        o['status'] = new_status
-                        o['updated_at'] = datetime.datetime.now().isoformat()
-                        if notes:
-                            if 'status_history' not in o:
-                                o['status_history'] = []
-                            o['status_history'].append({
-                                'status': new_status,
-                                'notes': notes,
-                                'timestamp': datetime.datetime.now().isoformat(),
-                                'user': st.session_state.get('user_name', 'Unknown')
-                            })
-                        st.success(f"✅ Status updated to {new_status}")
-                        st.rerun()
-                        break
+            except Exception as e:
+                st.error(f"❌ Billing Gate error: {e}")
+                import traceback
+                with st.expander("Debug Info"):
+                    st.code(traceback.format_exc())
+
+
+
+
+    # ── TAB 7: DISPATCH — the final step after billing ────────────────────
+    if _bo_active_section == "🚀 Dispatch":
+        with tab7:
+            _dispatch_status = str(order.get("status","")).upper()
+            _billed_statuses = {
+                "BILLED","CHALLANED","INVOICED","INVOICED_BILLED",
+                "READY_TO_DISPATCH","CHALLAN_ONLY",
+                "DISPATCHED","DELIVERED","CLOSED",
+            }
+            if _dispatch_status not in _billed_statuses:
+                st.info(
+                    "🔒 **Dispatch is available only after billing is complete.**\n\n"
+                    "Create a Challan or Invoice first, then return here to dispatch."
+                )
+                st.markdown(
+                    "<div style='background:#0f172a;border:1px solid #1e3a5f;"
+                    "border-radius:8px;padding:16px 20px;margin:10px 0'>"
+                    "<div style='color:#e2e8f0;font-size:0.82rem;line-height:2.2'>"
+                    "1️⃣ &nbsp;Confirm Order &amp; Produce<br/>"
+                    "2️⃣ &nbsp;Create Challan / Invoice<br/>"
+                    "3️⃣ &nbsp;<b style='color:#6366f1'>🚀 Dispatch</b> ← next step<br/>"
+                    "4️⃣ &nbsp;Confirm Delivery"
+                    "</div></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                try:
+                    from modules.backoffice.dispatch_panel import render_dispatch_panel
+                    render_dispatch_panel(order)
+                except Exception as _dp_err:
+                    st.error(f"Dispatch panel error: {_dp_err}")
+def show_status_update_modal(order: Dict):
+    """Show modal for updating order status"""
+    st.markdown("---")
+    st.markdown("###  Update Order Status")
+    
+    current_status = order.get('status', 'PENDING')
+
+    
+    new_status = st.selectbox(
+        "New Status",
+        [s.value for s in OrderStatus],
+        index=[s.value for s in OrderStatus].index(current_status) if current_status in [s.value for s in OrderStatus] else 0,
+        key=f"status_update_{get_display_order_id(order)}"
+    )
+    
+    notes = st.text_area(
+        "Status Update Notes",
+        key=f"status_notes_{get_display_order_id(order)}"
+    )
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button(" Update Status", type="primary", use_container_width=True):
+            # Update order status
+            for o in st.session_state.bo_active_orders:
+                if get_display_order_id(o) == get_display_order_id(order):
+                    o['status'] = new_status
+                    o['updated_at'] = datetime.datetime.now().isoformat()
+                    if notes:
+                        if 'status_history' not in o:
+                            o['status_history'] = []
+                        o['status_history'].append({
+                            'timestamp': datetime.datetime.now().isoformat(),
+                            'status': new_status,
+                            'notes': notes
+                        })
+            
+            st.success(f" Status updated to: {new_status}")
+            st.rerun()
+    
+    with col2:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
 
 
 # render_backoffice_dashboard, render_backoffice_management, and

@@ -193,8 +193,10 @@ def get_billed_lines_for_order(order_id: str) -> List[Dict]:
     already been dispatched — used to build the partial dispatch form.
     """
     lines = _q("""
-        SELECT ol.id, ol.product_name, ol.brand, ol.eye_side,
-               ol.billing_qty, ol.unit_price, ol.gst_percent,
+        SELECT ol.id, ol.billed_qty,
+               COALESCE(p.brand, ol.lens_params->>'brand', '') AS brand,
+               ol.eye_side,
+               ol.billed_qty, ol.unit_price, ol.gst_percent,
                ol.sph, ol.cyl, ol.axis,
                COALESCE(
                    (SELECT SUM(dl.dispatched_qty)
@@ -205,14 +207,17 @@ def get_billed_lines_for_order(order_id: str) -> List[Dict]:
                    0
                ) AS already_dispatched
         FROM order_lines ol
+        LEFT JOIN products p ON p.id = ol.product_id
         WHERE ol.order_id = %(oid)s::uuid
+          AND COALESCE(ol.billed_qty, 0) > 0
+          AND COALESCE(ol.is_deleted, FALSE) = FALSE
         ORDER BY ol.eye_side, ol.id
     """, {"oid": order_id})
 
     result = []
     for l in (lines or []):
         l = dict(l)
-        l["billing_qty"]        = int(l.get("billing_qty") or 0)
+        l["billing_qty"]        = int(l.get("billed_qty") or l.get("billing_qty") or 0)
         l["already_dispatched"] = int(l.get("already_dispatched") or 0)
         l["remaining_qty"]      = max(0, l["billing_qty"] - l["already_dispatched"])
         result.append(l)
@@ -288,147 +293,209 @@ def create_dispatch_event(
     except Exception:
         operator = "system"
 
-    # Insert dispatch master
-    ok = _w("""
-        INSERT INTO order_dispatches (
-            id, order_id, dispatch_no, dispatch_type, route_code,
-            carrier_name, tracking_no, dispatched_at, dispatched_by,
-            remarks, is_partial, billing_doc_ref, status,
-            dispatch_seq, created_at
-        ) VALUES (
-            %(id)s::uuid, %(order_id)s::uuid, %(dispatch_no)s,
-            %(dispatch_type)s, %(route_code)s,
-            %(carrier_name)s, %(tracking_no)s,
-            %(dispatched_at)s, %(dispatched_by)s,
-            %(remarks)s, %(is_partial)s, %(billing_doc_ref)s,
-            'DISPATCHED', %(seq)s, NOW()
-        )
-    """, {
-        "id":             dispatch_id,
-        "order_id":       order_id,
-        "dispatch_no":    dispatch_no,
-        "dispatch_type":  "PARTIAL" if is_partial else "FULL",
-        "route_code":     route_code,
-        "carrier_name":   carrier_name,
-        "tracking_no":    tracking_no,
-        "dispatched_at":  dispatch_date.isoformat(),
-        "dispatched_by":  operator,
-        "remarks":        remarks,
-        "is_partial":     is_partial,
-        "billing_doc_ref": billing_doc_ref,
-        "seq":            seq,
-    })
-    if not ok:
-        return False, "Failed to create dispatch record"
-
-    # Insert per-line quantities
-    for line_id, qty in line_qtys.items():
-        if qty <= 0:
-            continue
-        line = billed_map.get(str(line_id), {})
-        remaining_after = max(0, line.get("remaining_qty", 0) - qty)
-        _w("""
-            INSERT INTO order_dispatch_lines (
-                id, dispatch_id, order_line_id,
-                product_name, brand, eye_side,
-                dispatched_qty, remaining_qty, sph
-            ) VALUES (
-                gen_random_uuid(), %(did)s::uuid, %(lid)s::uuid,
-                %(pname)s, %(brand)s, %(eye)s,
-                %(dqty)s, %(rqty)s, %(sph)s
-            )
-        """, {
-            "did":   dispatch_id,
-            "lid":   line_id,
-            "pname": line.get("product_name", ""),
-            "brand": line.get("brand", ""),
-            "eye":   line.get("eye_side", ""),
-            "dqty":  qty,
-            "rqty":  remaining_after,
-            "sph":   str(line.get("sph") or ""),
-        })
-
-    # ── REAL STOCK DEDUCTION (quantity ↓ + allocated_qty ↓) ─────────────
-    # Per stock flow doc: Dispatch is the ONLY point where physical stock leaves.
-    # quantity       ↓  — real stock deducted
-    # allocated_qty  ↓  — soft reservation released (was held since order save)
-    # Uses idempotency: dispatched_qty column on order_lines prevents double deduction.
-    try:
-        from modules.sql_adapter import run_query as _rq_disp, run_write as _rw_disp
-
-        for line_id, qty in line_qtys.items():
-            if qty <= 0:
-                continue
-
-            # Atomic gate: mark dispatched_qty on the line first (idempotency)
-            # Only deduct if the RETURNING row is returned (first dispatch only)
-            _claimed = _rq_disp("""
-                UPDATE order_lines
-                SET dispatched_qty = COALESCE(dispatched_qty, 0) + %(qty)s,
-                    updated_at     = NOW()
-                WHERE id          = %(lid)s::uuid
-                  AND COALESCE(dispatched_qty, 0) + %(qty)s
-                      <= COALESCE(billing_qty, quantity, 0)
-                RETURNING id, product_id::text, lens_params
-            """, {"lid": line_id, "qty": qty}) or []
-
-            if not _claimed:
-                continue  # Already dispatched this qty or exceeds billed qty
-
-            _row    = _claimed[0]
-            _pid    = str(_row.get("product_id") or "")
-            _lp     = _row.get("lens_params") or {}
-            if isinstance(_lp, str):
-                import json as _jlm
-                try: _lp = _jlm.loads(_lp)
-                except: _lp = {}
-            _bno    = str(_lp.get("batch_no") or "")
-
-            if not _pid:
-                continue
-
-            # Deduct real quantity + release soft reservation atomically
-            _rw_disp("""
-                UPDATE inventory_stock
-                SET quantity      = GREATEST(0, COALESCE(quantity, 0)      - %(qty)s),
-                    allocated_qty = GREATEST(0, COALESCE(allocated_qty, 0) - %(qty)s),
-                    is_active     = CASE
-                                        WHEN GREATEST(0, COALESCE(quantity,0) - %(qty)s) <= 0
-                                        THEN FALSE ELSE TRUE
-                                    END,
-                    updated_at    = NOW()
-                WHERE product_id = %(pid)s::uuid
-                  AND (%(bno)s = '' OR batch_no = %(bno)s)
-                LIMIT 1
-            """, {"pid": _pid, "bno": _bno, "qty": qty})
-
-    except Exception as _disp_stk_err:
-        import logging as _dlog
-        _dlog.warning(f"[Dispatch] Stock deduction failed (non-fatal): {_disp_stk_err}")
-        # Non-fatal: dispatch is recorded, stock drift caught by reconciliation
-
-    # Write order_status_history entry
-    _w("""
-        INSERT INTO order_status_history (
-            history_id, order_id, from_status, to_status,
-            changed_at, changed_by_name, remarks
-        )
-        SELECT gen_random_uuid()::uuid, id,
-               status, 'DISPATCHED',
-               NOW(), %(by)s, %(rmk)s
-        FROM orders WHERE id = %(oid)s::uuid
-    """, {
-        "by":  operator,
-        "rmk": f"Dispatch {dispatch_no} — {carrier_name or route_code} — {tracking_no or 'no tracking'}",
-        "oid": order_id,
-    })
-
-    # Update order status
+    # All dispatch writes must succeed together. Earlier versions wrote the
+    # dispatch header first and treated stock deduction as non-fatal, which
+    # allowed a recorded dispatch with unchanged stock. Phase-3 makes this
+    # one transaction and records a DISPATCH row in inventory_stock_ledger.
     new_status = "DISPATCHED"  # Stays DISPATCHED for partial too; DELIVERED on confirm
-    _w("""
-        UPDATE orders SET status = %(st)s, updated_at = NOW()
-        WHERE id = %(oid)s::uuid
-    """, {"st": new_status, "oid": order_id})
+    try:
+        import json as _jlm
+        from psycopg2.extras import RealDictCursor
+        from modules.sql_adapter import get_transaction_connection
+
+        conn = get_transaction_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    INSERT INTO order_dispatches (
+                        id, order_id, dispatch_no, dispatch_type, route_code,
+                        carrier_name, tracking_no, dispatched_at, dispatched_by,
+                        remarks, is_partial, billing_doc_ref, status,
+                        dispatch_seq, created_at
+                    ) VALUES (
+                        %(id)s::uuid, %(order_id)s::uuid, %(dispatch_no)s,
+                        %(dispatch_type)s, %(route_code)s,
+                        %(carrier_name)s, %(tracking_no)s,
+                        %(dispatched_at)s, %(dispatched_by)s,
+                        %(remarks)s, %(is_partial)s, %(billing_doc_ref)s,
+                        'DISPATCHED', %(seq)s, NOW()
+                    )
+                """, {
+                    "id":             dispatch_id,
+                    "order_id":       order_id,
+                    "dispatch_no":    dispatch_no,
+                    "dispatch_type":  "PARTIAL" if is_partial else "FULL",
+                    "route_code":     route_code,
+                    "carrier_name":   carrier_name,
+                    "tracking_no":    tracking_no,
+                    "dispatched_at":  dispatch_date.isoformat(),
+                    "dispatched_by":  operator,
+                    "remarks":        remarks,
+                    "is_partial":     is_partial,
+                    "billing_doc_ref": billing_doc_ref,
+                    "seq":            seq,
+                })
+
+                for line_id, qty in line_qtys.items():
+                    if qty <= 0:
+                        continue
+                    line = billed_map.get(str(line_id), {})
+                    remaining_after = max(0, line.get("remaining_qty", 0) - qty)
+                    cur.execute("""
+                        INSERT INTO order_dispatch_lines (
+                            id, dispatch_id, order_line_id,
+                            product_name, brand, eye_side,
+                            dispatched_qty, remaining_qty, sph
+                        ) VALUES (
+                            gen_random_uuid(), %(did)s::uuid, %(lid)s::uuid,
+                            %(pname)s, %(brand)s, %(eye)s,
+                            %(dqty)s, %(rqty)s, %(sph)s
+                        )
+                    """, {
+                        "did":   dispatch_id,
+                        "lid":   line_id,
+                        "pname": line.get("product_name", ""),
+                        "brand": line.get("brand", ""),
+                        "eye":   line.get("eye_side", ""),
+                        "dqty":  qty,
+                        "rqty":  remaining_after,
+                        "sph":   str(line.get("sph") or ""),
+                    })
+
+                    cur.execute("""
+                        UPDATE order_lines
+                        SET dispatched_qty = COALESCE(dispatched_qty, 0) + %(qty)s
+                        WHERE id = %(lid)s::uuid
+                          AND COALESCE(dispatched_qty, 0) + %(qty)s
+                              <= COALESCE(billing_qty, quantity, 0)
+                        RETURNING id, product_id::text, lens_params
+                    """, {"lid": line_id, "qty": qty})
+                    claimed = cur.fetchone()
+                    if not claimed:
+                        raise RuntimeError(
+                            f"Dispatch blocked: line {line_id} is already dispatched "
+                            "or exceeds billed quantity."
+                        )
+
+                    pid = str(claimed.get("product_id") or "")
+                    lp = claimed.get("lens_params") or {}
+                    if isinstance(lp, str):
+                        try:
+                            lp = _jlm.loads(lp)
+                        except Exception:
+                            lp = {}
+                    bno = str((lp or {}).get("batch_no") or "")
+                    sid = str((lp or {}).get("stock_id") or (lp or {}).get("batch_id") or "")
+
+                    # batch_no / stock_id may be nested inside batch_allocation array
+                    # (set by retail stock allocator: lens_params.batch_allocation[0].batch_no)
+                    # Fall back to batch_allocation if top-level keys are empty.
+                    if not bno and not sid:
+                        try:
+                            _ba = (lp or {}).get("batch_allocation") or []
+                            if isinstance(_ba, str):
+                                import json as _jba
+                                _ba = _jba.loads(_ba)
+                            if _ba and isinstance(_ba, list) and _ba[0]:
+                                bno = str(_ba[0].get("batch_no") or "")
+                                sid = str(_ba[0].get("stock_id") or _ba[0].get("batch_id") or "")
+                        except Exception:
+                            pass
+
+                    # Services/non-stock lines may not carry product/stock identity.
+                    # Physical stock lines with a stock signal must deduct or the
+                    # whole dispatch rolls back.
+                    if not pid or (not sid and not bno):
+                        continue
+
+                    cur.execute("""
+                        WITH target_batch AS (
+                            SELECT id, batch_no
+                            FROM inventory_stock
+                            WHERE (
+                                    (%(sid)s <> '' AND id = NULLIF(%(sid)s,'')::uuid)
+                                 OR (%(sid)s = '' AND product_id = NULLIF(%(pid)s,'')::uuid
+                                     AND (%(bno)s = '' OR batch_no = %(bno)s))
+                            )
+                            ORDER BY
+                                CASE WHEN %(bno)s <> '' AND batch_no = %(bno)s THEN 0 ELSE 1 END,
+                                created_at NULLS LAST,
+                                id
+                            LIMIT 1
+                        ),
+                        upd AS (
+                            UPDATE inventory_stock s
+                            SET quantity      = GREATEST(0, COALESCE(s.quantity, 0) - %(qty)s),
+                                allocated_qty = GREATEST(0, COALESCE(s.allocated_qty, 0) - %(qty)s),
+                                is_active     = CASE
+                                                    WHEN GREATEST(0, COALESCE(s.quantity,0) - %(qty)s) <= 0
+                                                    THEN FALSE ELSE TRUE
+                                                END,
+                                updated_at    = NOW()
+                            FROM target_batch tb
+                            WHERE s.id = tb.id
+                            RETURNING s.id, s.batch_no
+                        )
+                        INSERT INTO inventory_stock_ledger (
+                            inventory_stock_id, product_id, batch_no, qty_change,
+                            ref_type, ref_id, ref_no, remarks, created_at, created_by
+                        )
+                        SELECT id, %(pid)s::uuid, COALESCE(batch_no, %(bno)s), -%(qty)s,
+                               'DISPATCH', %(did)s::uuid, %(dno)s,
+                               %(rmk)s, NOW(), %(by)s
+                        FROM upd
+                        RETURNING inventory_stock_id
+                    """, {
+                        "sid": sid,
+                        "pid": pid,
+                        "bno": bno,
+                        "qty": qty,
+                        "did": dispatch_id,
+                        "dno": dispatch_no,
+                        "rmk": f"Dispatch {dispatch_no} for order {order_no}",
+                        "by": operator,
+                    })
+                    ledger_row = cur.fetchone()
+                    if not ledger_row:
+                        raise RuntimeError(
+                            f"Dispatch blocked: stock row not found for line {line_id} "
+                            f"(stock_id={sid or '-'}, batch={bno or '-'})."
+                        )
+
+                cur.execute("""
+                    INSERT INTO order_status_history (
+                        history_id, order_id, from_status, to_status,
+                        changed_at, changed_by_name, remarks
+                    )
+                    SELECT gen_random_uuid()::uuid, id,
+                           status, 'DISPATCHED',
+                           NOW(), %(by)s, %(rmk)s
+                    FROM orders WHERE id = %(oid)s::uuid
+                """, {
+                    "by":  operator,
+                    "rmk": f"Dispatch {dispatch_no} - {carrier_name or route_code} - {tracking_no or 'no tracking'}",
+                    "oid": order_id,
+                })
+
+                cur.execute("""
+                    UPDATE orders SET status = %(st)s, updated_at = NOW()
+                    WHERE id = %(oid)s::uuid
+                """, {"st": new_status, "oid": order_id})
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    except Exception as _dispatch_err:
+        import logging as _dlog
+        _dlog.warning("[Dispatch] transaction rolled back: %s", _dispatch_err)
+        return False, f"Dispatch failed and was rolled back: {_dispatch_err}"
 
     # Update session state cache
     try:

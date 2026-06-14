@@ -117,7 +117,7 @@ def check_negative_stock() -> Dict:
         SELECT
             b.batch_no,
             b.material,
-            b.coating,
+            b.colour AS coating,
             b.qty_right       AS "qty_right",
             b.qty_left        AS "qty_left",
             b.qty_independent AS "qty_independent"

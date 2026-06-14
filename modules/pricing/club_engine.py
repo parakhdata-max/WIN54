@@ -54,6 +54,22 @@ _CLUB_CACHE_TS: float = 0.0
 _CLUB_CACHE_TTL: float = 60.0  # seconds
 
 
+def _ensure_club_schema() -> None:
+    """Lightweight idempotent guard for columns added after club offers launched."""
+    try:
+        from modules.sql_adapter import run_write
+        for ddl in [
+            "ALTER TABLE club_offers ADD COLUMN IF NOT EXISTS party_filter TEXT DEFAULT ''",
+            "ALTER TABLE club_offers ADD COLUMN IF NOT EXISTS application_mode TEXT DEFAULT 'SAME_ORDER'",
+            "ALTER TABLE club_offers ADD COLUMN IF NOT EXISTS nominal_billing_value NUMERIC(10,2) DEFAULT 1.00",
+            "ALTER TABLE club_offers ADD COLUMN IF NOT EXISTS entitlement_valid_days INT DEFAULT 0",
+            "ALTER TABLE club_offers ADD COLUMN IF NOT EXISTS entitlement_auto_apply BOOLEAN DEFAULT TRUE",
+        ]:
+            run_write(ddl)
+    except Exception:
+        pass
+
+
 def _load_club_offers() -> list:
     """Load active club offers from DB. Cached 60s."""
     import time
@@ -63,6 +79,7 @@ def _load_club_offers() -> list:
         return _CLUB_CACHE
 
     try:
+        _ensure_club_schema()
         from modules.sql_adapter import run_query
         rows = run_query("""
             SELECT
@@ -80,7 +97,11 @@ def _load_club_offers() -> list:
                 channel,               -- 'all' | 'wholesale' | 'retail'
                 stackable,             -- True = stacks on top of existing discount
                 display_label,
-                icon_emoji
+                icon_emoji,
+                COALESCE(party_filter,'') AS party_filter,
+                COALESCE(application_mode,'SAME_ORDER') AS application_mode,
+                COALESCE(nominal_billing_value,1)::float AS nominal_billing_value,
+                COALESCE(entitlement_valid_days,0) AS entitlement_valid_days
             FROM club_offers
             WHERE COALESCE(active, TRUE) = TRUE
               AND (valid_from IS NULL OR valid_from <= CURRENT_DATE)
@@ -199,7 +220,8 @@ def _apply_offer_to_line(line: dict, offer: dict) -> None:
     base = gross - existing_disc if stackable else gross
 
     if vtype == "free":
-        offer_disc = base          # 100% free
+        nominal = max(float(offer.get("nominal_billing_value") or 1), 0.0)
+        offer_disc = max(0.0, base - (nominal * qty))
     elif vtype == "percent" and value > 0:
         offer_disc = round(base * value / 100, 2)
     elif vtype == "fixed" and value > 0:
@@ -227,6 +249,7 @@ def _apply_offer_to_line(line: dict, offer: dict) -> None:
     line["discount_amount"]  = new_disc_amt
     line["discount_rule"]    = new_rule
     line["billing_total"]    = round(gross - new_disc_amt, 2)
+    line["total_price"]      = line["billing_total"]
     line["club_offer_id"]    = str(offer.get("id") or "")
     line["club_offer_name"]  = offer_name
 
@@ -245,6 +268,15 @@ def _apply_offer_to_line(line: dict, offer: dict) -> None:
         "name":  offer_name,
     })
     line["discount_breakdown"] = breakdown
+    lp = line.get("lens_params") if isinstance(line.get("lens_params"), dict) else {}
+    lp.update({
+        "club_offer_status": "APPLIED",
+        "club_offer_name": offer_name,
+        "club_offer_id": str(offer.get("id") or ""),
+        "club_offer_application_mode": str(offer.get("application_mode") or "SAME_ORDER"),
+        "club_offer_nominal_billing_value": float(offer.get("nominal_billing_value") or 1),
+    })
+    line["lens_params"] = lp
 
     log.debug(
         f"[ClubEngine] Club offer '{offer_name}' → "
@@ -256,6 +288,7 @@ def _apply_offer_to_line(line: dict, offer: dict) -> None:
 def apply_club_offers(
     cart_lines: list,
     order_type: str = "wholesale",
+    party_id: str = "",
 ) -> list:
     """
     PUBLIC API — Apply club offers to the full cart.
@@ -282,6 +315,14 @@ def apply_club_offers(
         order_type_upper = str(order_type).upper()
 
         for offer in offers:
+            mode = str(offer.get("application_mode") or "SAME_ORDER").upper()
+            if mode != "SAME_ORDER":
+                continue
+            pf = str(offer.get("party_filter") or "").strip()
+            if pf and party_id and pf != str(party_id):
+                continue
+            if pf and not party_id:
+                continue
             # Channel gate
             ch = str(offer.get("channel") or "all").lower()
             if ch not in ("all", order_type_upper.lower()):

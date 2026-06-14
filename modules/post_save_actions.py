@@ -8,6 +8,9 @@ Post-Save Actions — shown after every confirmed order (retail + wholesale)
 import streamlit as st
 import streamlit.components.v1
 import urllib.parse
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -34,34 +37,92 @@ def _reg(tid, name, fn):
 
 
 
+def _is_nonzero(v) -> bool:
+    try:
+        return v is not None and abs(float(v)) > 0.0001
+    except Exception:
+        return False
+
+
+def _whole_rupee(v) -> int:
+    try:
+        return int(round(float(v or 0)))
+    except Exception:
+        return 0
+
+
 def _fmt_power(sph, cyl, axis, add):
-    """Format lens power for WhatsApp - compact single line."""
-    def _f(v, decimals=2):
-        if v is None:
-            return None
+    """Format lens power for WhatsApp, hiding unused power fields."""
+    def _signed(v):
         try:
             n = float(v)
             sign = "+" if n >= 0 else ""
-            return f"{sign}{n:.{decimals}f}"
+            return f"{sign}{n:.2f}"
         except Exception:
             return None
+
+    def _plain(v):
+        try:
+            return f"{float(v):.2f}"
+        except Exception:
+            return None
+
     parts = []
-    s = _f(sph)
-    c = _f(cyl)
-    a = str(int(float(axis))) if axis is not None else None
-    ad = _f(add)
-    if s:  parts.append(f"Sph:{s}")
-    if c:  parts.append(f"Cyl:{c}")
-    if a:  parts.append(f"Ax:{a}")
-    if ad: parts.append(f"Add:{ad}")
+    s = _signed(sph) if _is_nonzero(sph) else None
+    c = _signed(cyl) if _is_nonzero(cyl) else None
+    a = str(int(round(float(axis)))) if _is_nonzero(axis) else None
+    ad = _plain(add) if _is_nonzero(add) else None
+    if s:
+        parts.append(f"Sph : {s}")
+    if c:
+        parts.append(f"Cyl : {c}")
+    if c and a:
+        parts.append(f"Axis : {a}")
+    if ad:
+        parts.append(f"Add : {ad}")
     return "  ".join(parts) if parts else ""
 
 
-def _build_product_lines(lines: list) -> str:
+def _lens_spec_text(line: dict) -> str:
+    """Return ophthalmic spec text to identify product + index + coating."""
+    lp = line.get("lens_params") or {}
+    if not isinstance(lp, dict):
+        return ""
+
+    idx = (
+        lp.get("lens_index")
+        or lp.get("index")
+        or lp.get("index_value")
+        or ""
+    )
+    coating = (
+        lp.get("coating")
+        or lp.get("coating_type")
+        or ""
+    )
+    treatment = lp.get("treatment") or ""
+    suffix = str(lp.get("display_suffix") or "").strip()
+
+    pieces = []
+    if idx:
+        pieces.append(f"Index {idx}")
+    if coating:
+        pieces.append(str(coating))
+    if treatment and str(treatment).strip().lower() != "clear":
+        pieces.append(str(treatment))
+
+    spec = " | ".join(pieces)
+    if suffix and not spec:
+        spec = suffix.lstrip("+ ").strip()
+    return spec
+
+
+def _build_product_lines(lines: list, ctx: dict = None) -> str:
     """
     Build compact product + power summary for WhatsApp.
     Works for new orders, edits, and backoffice saves.
     Skips lines with no product name (service charges, deleted lines).
+    ctx: optional context dict (may contain end_customer_name etc.)
     """
     if not lines:
         return ""
@@ -97,7 +158,53 @@ def _build_product_lines(lines: list) -> str:
         )
 
         eye_label = {"R": "👁 Right", "L": "👁 Left", "B": "👁👁 Both"}.get(eye, "")
-        prod_txt  = f"{brand} {pname}".strip() if brand else pname
+
+        # ── Product display name ──────────────────────────────────────────
+        _display_name = pname
+        if brand and pname.lower().startswith(brand.lower()):
+            _display_name = pname[len(brand):].lstrip(" -_|·")
+        if not _display_name:
+            _display_name = pname
+
+        # ── Spec text — deduplicate tokens already in product name ────────
+        spec_txt = _lens_spec_text(ln)
+        if spec_txt:
+            _name_lower = _display_name.lower()
+            _spec_tokens = [t.strip() for t in spec_txt.split("|")]
+            _new_tokens  = []
+            for _tok in _spec_tokens:
+                _tok_core = _tok.replace("Index ", "").strip()
+                if _tok_core and _tok_core.lower() not in _name_lower:
+                    _new_tokens.append(_tok.strip())
+                elif "Index" in _tok and _tok_core not in _name_lower:
+                    _new_tokens.append(_tok.strip())
+            spec_txt = " | ".join(_new_tokens)
+
+        prod_txt = f"{_display_name} | {spec_txt}".strip(" |") if spec_txt else _display_name
+
+        # ── Lens parameters (fitting, diameter, fitting height) ───────────
+        lp = ln.get("lens_params") or {}
+        if isinstance(lp, str):
+            try: lp = __import__("json").loads(lp)
+            except Exception as _e:
+                logger.warning("Suppressed error: %s", _e)
+                lp = {}
+        _lp_parts = []
+        _frame_type    = str(lp.get("frame_type") or "").strip()
+        _fitting_type  = str(lp.get("fitting_type") or "").strip()
+        _thickness     = str(lp.get("thickness") or "").strip()
+        _diameter      = str(lp.get("diameter") or "").strip()
+        _fitting_ht    = str(lp.get("fitting_height") or "").strip()
+        _corridor      = str(lp.get("corridor") or "").strip()
+        _instructions  = str(lp.get("instructions") or "").strip()
+        if _frame_type:    _lp_parts.append(f"Frame: {_frame_type}")
+        if _fitting_type:  _lp_parts.append(f"Fitting: {_fitting_type}")
+        if _thickness and _thickness.lower() not in ("regular",):
+            _lp_parts.append(f"Thick: {_thickness}")
+        if _diameter:      _lp_parts.append(f"Dia: {_diameter}")
+        if _fitting_ht:    _lp_parts.append(f"FH: {_fitting_ht}")
+        if _corridor:      _lp_parts.append(f"Corridor: {_corridor}")
+        _lp_str = "  |  ".join(_lp_parts)
 
         pw = _fmt_power(
             ln.get("sph"), ln.get("cyl"), ln.get("axis"), ln.get("add_power")
@@ -111,10 +218,21 @@ def _build_product_lines(lines: list) -> str:
             line_parts.append(f"Qty:{qty}")
         if pw:
             line_parts.append(f"[{pw}]")
+        if _lp_str:
+            line_parts.append(f"({_lp_str})")
+        if _instructions:
+            line_parts.append(f"📝 {_instructions}")
         if total > 0:
             line_parts.append(f"₹{total:,.0f}")
 
         parts.append("  ".join(line_parts))
+
+    # ── End customer name (appended once at end if present) ───────────────
+    _ec_name = ""
+    if ctx:
+        _ec_name = str(ctx.get("end_customer_name") or "").strip()
+    if _ec_name:
+        parts.append(f"👤 End Customer: *{_ec_name}*")
 
     return "\n".join(parts)
 
@@ -122,20 +240,20 @@ def _tpl_retail(ctx):
     s = _si()
     shop    = s.get("shop_name","DV Optical")
     phone   = s.get("shop_phone","")
-    total   = float(ctx.get("total",0))
-    advance = float(ctx.get("advance",0))
-    balance = max(round(total - advance, 2), 0)
+    total   = _whole_rupee(ctx.get("total",0))
+    advance = _whole_rupee(ctx.get("advance",0))
+    balance = max(total - advance, 0)
     delivery= ctx.get("delivery_date","")
-    prod_lines = _build_product_lines(ctx.get("lines") or [])
+    prod_lines = _build_product_lines(ctx.get("lines") or [], ctx=ctx)
     return (
         f"Hello {ctx.get('party_name','')} 👋\n\n"
         f"✅ *Order Confirmed!*\n"
         f"📋 Order No: *{ctx.get('order_no','')}*\n"
         f"🏪 {shop}\n"
         + (f"\n📦 *Order Details:*\n{prod_lines}\n" if prod_lines else "\n")
-        + f"\n💰 Order Total: ₹{total:,.2f}\n"
-        + (f"✅ Previously Paid: ₹{advance:,.2f}\n" if advance > 0 else "")
-        + (f"⏳ Balance Due: ₹{balance:,.2f}\n" if balance > 0 else "")
+        + f"\n💰 Order Total: ₹{total:,.0f}\n"
+        + (f"✅ Previously Paid: ₹{advance:,.0f}\n" if advance > 0 else "")
+        + (f"⏳ Balance Due: ₹{balance:,.0f}\n" if balance > 0 else "")
         + (f"📅 Expected Supply: {delivery}\n" if delivery else "")
         + f"\nQueries: {phone or 'contact the store'}\n"
         f"Thank you for choosing {shop}! 🙏"
@@ -151,17 +269,26 @@ def _tpl_wholesale(ctx):
     balance    = max(round(total - advance, 2), 0)
     on_account = ctx.get("on_account", True)
     bal_label  = "📒 Balance on Account" if on_account else "⏳ Balance on Delivery"
-    prod_lines = _build_product_lines(ctx.get("lines") or [])
+    prod_lines = _build_product_lines(ctx.get("lines") or [], ctx=ctx)
+    status_label = str(ctx.get("status_label") or "RECEIVED").upper()
+    if status_label == "CONFIRMED":
+        status_line = "✅ *Wholesale Order Confirmed*"
+    else:
+        status_line = "📥 *Order Received — Under Review*"
     return (
         f"Hello {ctx.get('party_name','')} 👋\n\n"
-        f"✅ *Wholesale Order Confirmed*\n"
+        f"{status_line}\n"
         f"📋 Order No: *{ctx.get('order_no','')}*\n"
         f"🏪 {shop}\n"
         + (f"\n📦 *Order Details:*\n{prod_lines}\n" if prod_lines else "\n")
         + f"\n💰 Order Value (incl. GST): ₹{total:,.2f}\n"
         + (f"✅ Previously Paid: ₹{advance:,.2f}\n" if advance > 0 else "")
         + (f"{bal_label}: ₹{balance:,.2f}\n" if balance > 0 else "✅ Fully Paid\n")
-        + f"\nThank you! 🙏"
+        + (
+            "\nWe will review and confirm your order shortly. 🙏"
+            if status_label != "CONFIRMED"
+            else "\nThank you! 🙏"
+        )
     )
 _reg("wholesale_confirmation", "Order Confirmation (Wholesale)", _tpl_wholesale)
 
@@ -188,7 +315,7 @@ def _tpl_ready(ctx):
     s = _si()
     shop  = s.get("shop_name","DV Optical")
     phone = s.get("shop_phone","")
-    prod_lines = _build_product_lines(ctx.get("lines") or [])
+    prod_lines = _build_product_lines(ctx.get("lines") or [], ctx=ctx)
     expected   = ctx.get("expected_date") or ctx.get("delivery_date") or ""
     return (
         f"Hello {ctx.get('party_name','')} 👋\n\n"
@@ -235,9 +362,15 @@ def render_post_save_actions(
     delivery_date: str = "",
     on_account: bool = True,
     lines: list = None,
+    status_label: str = "RECEIVED",
+    end_customer_name: str = "",
 ):
+    if str(order_type).upper() == "RETAIL":
+        total = _whole_rupee(total)
+        advance = _whole_rupee(advance)
     balance = max(round(total - advance, 2), 0)
     s = _si()
+    _money_fmt = ",.0f" if str(order_type).upper() == "RETAIL" else ",.2f"
 
     st.markdown(
         "<div style='background:#0f172a;border:1px solid #334155;"
@@ -247,8 +380,8 @@ def render_post_save_actions(
         "<div style='color:#94a3b8;font-size:0.78rem;margin-top:2px'>"
         f"Order: <b style='color:#e2e8f0'>{order_no}</b> &nbsp;·&nbsp; "
         f"Party: <b style='color:#e2e8f0'>{party_name}</b> &nbsp;·&nbsp; "
-        f"Total: <b style='color:#e2e8f0'>₹{total:,.2f}</b>"
-        + (f" &nbsp;·&nbsp; Balance: <b style='color:#f59e0b'>₹{balance:,.2f}</b>" if balance > 0 else "")
+        f"Total: <b style='color:#e2e8f0'>₹{total:{_money_fmt}}</b>"
+        + (f" &nbsp;·&nbsp; Balance: <b style='color:#f59e0b'>₹{balance:{_money_fmt}}</b>" if balance > 0 else "")
         + "</div></div>",
         unsafe_allow_html=True
     )
@@ -256,11 +389,19 @@ def render_post_save_actions(
     # Use expanders instead of tabs for compatibility
     # ── WhatsApp ──────────────────────────────────────────────────────────────
     with st.expander("💬 WhatsApp — Send order details", expanded=True):
-        _render_whatsapp(order_no, party_name, mobile, total, advance, order_type, delivery_date, s, on_account=on_account, lines=lines or [])
+        _render_whatsapp(order_no, party_name, mobile, total, advance, order_type, delivery_date, s, on_account=on_account, lines=lines or [], status_label=status_label, end_customer_name=end_customer_name)
 
     # ── Print Receipt ─────────────────────────────────────────────────────────
     with st.expander("🖨️ Print Confirmation Receipt", expanded=False):
         _render_print_receipt(order_no, party_name, mobile, total, advance, order_type, delivery_date, s, on_account=on_account, lines=lines or [])
+
+    # ── Patient ID Card (Evolis CR80 card + TSC 75×50 sticker) ──────────────────
+    with st.expander("💳 Patient ID Card — Evolis card / TSC 75×50 sticker", expanded=False):
+        try:
+            from modules.printing.patient_card_printer import render_patient_card_for_order
+            render_patient_card_for_order(key_prefix="ps")
+        except Exception as _pc_ex:
+            st.caption(f"Patient card unavailable: {_pc_ex}")
 
     # ── Razorpay ──────────────────────────────────────────────────────────────
     with st.expander("💳 Razorpay — Payment Link", expanded=False):
@@ -275,7 +416,7 @@ def render_post_save_actions(
 # WHATSAPP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _render_whatsapp(order_no, party_name, mobile, total, advance, order_type, delivery, si, on_account=True, lines=None):
+def _render_whatsapp(order_no, party_name, mobile, total, advance, order_type, delivery, si, on_account=True, lines=None, status_label="RECEIVED", end_customer_name=""):
     # Template selector
     _default = "retail_confirmation" if order_type == "RETAIL" else "wholesale_confirmation"
     _tpl_keys  = list(_TEMPLATES.keys())
@@ -294,13 +435,22 @@ def _render_whatsapp(order_no, party_name, mobile, total, advance, order_type, d
         )
         _sel_tpl = _tpl_keys[_sel_idx]
     with tc2:
-        _mob_in = st.text_input(
-            "Mobile",
-            value=mobile or "",
-            key=f"wa_mob_{order_no}",
-            placeholder="10-digit number",
-            label_visibility="collapsed"
-        )
+        try:
+            from modules.wa_contact_tools import render_mobile_field
+            _mob_in = render_mobile_field(
+                f"post_save_{order_no}",
+                name=party_name,
+                mobile=mobile or "",
+                label="Mobile",
+            )
+        except Exception:
+            _mob_in = st.text_input(
+                "Mobile",
+                value=mobile or "",
+                key=f"wa_mob_{order_no}",
+                placeholder="10-digit number",
+                label_visibility="collapsed"
+            )
 
     # Build message
     ctx = {
@@ -309,16 +459,37 @@ def _render_whatsapp(order_no, party_name, mobile, total, advance, order_type, d
         "delivery_date": delivery,
         "on_account": on_account,
         "lines": lines or [],
+        "status_label": status_label,
+        "end_customer_name": end_customer_name or "",
     }
     _msg_default = _TEMPLATES[_sel_tpl]["build"](ctx)
 
     # Editable preview — use session state key so edits persist
     _msg_key = f"wa_msg_{order_no}"
+    _sig_key = f"wa_sig_{order_no}"
+    _msg_sig = (
+        _sel_tpl,
+        str(total),
+        str(advance),
+        str(delivery),
+        len(lines or []),
+        "|".join(
+            str((ln or {}).get("product_name") or "")
+            for ln in (lines or [])
+            if isinstance(ln, dict)
+        ),
+    )
     # Refresh message when template changes
     _tpl_key = f"wa_last_tpl_{order_no}"
-    if st.session_state.get(_tpl_key) != _sel_tpl:
+    _cached_msg = str(st.session_state.get(_msg_key) or "").strip()
+    if (
+        st.session_state.get(_tpl_key) != _sel_tpl
+        or st.session_state.get(_sig_key) != _msg_sig
+        or not _cached_msg
+    ):
         st.session_state[_msg_key] = _msg_default
         st.session_state[_tpl_key] = _sel_tpl
+        st.session_state[_sig_key] = _msg_sig
 
     _edited = st.text_area(
         "Edit message before sending",
@@ -438,8 +609,28 @@ def _render_print_receipt(order_no, party_name, mobile, total, advance, order_ty
     if lines:
         _rows = ""
         for _ln in lines:
-            _eye  = str(_ln.get("eye_side") or "").upper()
-            _pn   = str(_ln.get("product_name") or "Item")
+            _eye   = str(_ln.get("eye_side") or "").upper()
+            _pname = str(_ln.get("product_name") or "Item")
+            _brand = str(_ln.get("brand") or "")
+
+            # Strip brand prefix if it's already at the start of product name
+            _display = _pname
+            if _brand and _pname.lower().startswith(_brand.lower()):
+                _display = _pname[len(_brand):].lstrip(" -_|·")
+            if not _display:
+                _display = _pname
+
+            # Deduplicate spec tokens already present in display name
+            _spec = _lens_spec_text(_ln)
+            if _spec:
+                _name_lo = _display.lower()
+                _kept = []
+                for _tok in [t.strip() for t in _spec.split("|")]:
+                    _core = _tok.replace("Index ", "").strip()
+                    if _core and _core.lower() not in _name_lo:
+                        _kept.append(_tok)
+                _spec = " | ".join(_kept)
+            _pn = f"{_display} | {_spec}".strip(" |") if _spec else _display
             _qty  = int(_ln.get("billing_qty") or _ln.get("quantity") or 0)
             _up   = float(_ln.get("unit_price") or 0)
             _tp   = float(_ln.get("total_price") or round(_up * _qty, 2))

@@ -1008,6 +1008,11 @@ def _render_po_pipeline_card(_po, _q, _w, mode="TRACK", stage_meta=None):
             if st.button("💾 Record Invoice & Close PO",
                          key=f"{_ak}_save_inv", type="primary",
                          use_container_width=True):
+                from modules.core.date_guard import validate_not_future
+                _ok_dt, _msg_dt = validate_not_future(_doc_dt, "Purchase invoice date")
+                if not _ok_dt:
+                    st.error(_msg_dt)
+                    return
                 _ok_all = True
                 for _i, _d in _inv_data.items():
                     if not _d.get("line_id"):
@@ -1185,6 +1190,11 @@ def _render_po_pipeline_card(_po, _q, _w, mode="TRACK", stage_meta=None):
                     if _sb1.button("💾 Save Secondary", key=f"{_sec_key}_save",
                                    type="primary", use_container_width=True):
                         if _sec_price > 0:
+                            from modules.core.date_guard import validate_not_future
+                            _ok_dt, _msg_dt = validate_not_future(_sec_dt, "Secondary purchase date")
+                            if not _ok_dt:
+                                st.error(_msg_dt)
+                                return
                             # Record as a purchase_acknowledgement with no order_line_id
                             # (secondary / misc charge, linked to PO by order_no)
                             _w("""
@@ -1718,7 +1728,7 @@ def _render_combined_order_tab(_q, _w):
     _mob_co = _q("""
         SELECT COALESCE(p.whatsapp, p.mobile,'') AS mob
         FROM supplier_orders so
-        JOIN parties p ON p.id = so.supplier_id
+        JOIN parties p ON p.id::text = so.supplier_id::text
         WHERE so.id = %(fid)s LIMIT 1
     """, {"fid": _sel_co[0]})
     _raw_co = (_mob_co[0].get("mob","") if _mob_co else "").replace(" ","")
@@ -1975,6 +1985,11 @@ def _render_combined_invoice_tab(_q, _w):
     with _sv1:
         if st.button("💾 Record Combined Invoice & Close Selected POs",
                      key="ci_save", type="primary", use_container_width=True):
+            from modules.core.date_guard import validate_not_future
+            _ok_dt, _msg_dt = validate_not_future(_inv_dt, "Purchase invoice date")
+            if not _ok_dt:
+                st.error(_msg_dt)
+                return
 
             _inv_num = (_inv_no.strip()
                         or f"CINV-{_sel_sup[:8]}-{datetime.date.today().strftime('%d%m%y')}")

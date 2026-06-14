@@ -6,14 +6,17 @@ Quick Add — add one record at a time, Tally-style.
 Rules enforced:
   1. Product-first — Frame/CL/Ophthalmic/Solution tabs require product to exist in master
      If not found → guided message: "Add product first in 📦 Product tab"
-  2. Barcode/alias unique — checked live before save, rejected with clear error
-  3. Batch_no unique per product — no silent duplicates
+  2. Scan Code / Item Code unique — checked live before save, rejected with clear error
+  3. Batch_no is a true batch/lot field for batch stock, not the frame scanning code
 
 Save flow: fill → save → green summary → form clears → ready for next
 """
 
 import uuid
+import logging
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 
 # ── Tiny helpers ──────────────────────────────────────────────────────────────
@@ -107,11 +110,15 @@ def render_party_name_warning(name: str, current_id: str = None):
 
 def _f(v, d=0.0):
     try: return float(v) if str(v).strip() not in ("","None") else d
-    except: return d
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
+        return d
 
 def _i(v, d=0):
     try: return int(float(v)) if str(v).strip() not in ("","None") else d
-    except: return d
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
+        return d
 
 def _saved(key, data):
     st.session_state[f"_qa_last_{key}"] = {k:v for k,v in data.items() if v}
@@ -136,7 +143,8 @@ def _barcode_exists(barcode: str, table: str, exclude_id: str = None) -> bool:
             sql += " AND id != %s"
             params.append(exclude_id)
         return bool(run_query(sql + " LIMIT 1", params))
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         return False
 
 def _item_code_exists(item_code: str, exclude_id: str = None) -> bool:
@@ -149,7 +157,8 @@ def _item_code_exists(item_code: str, exclude_id: str = None) -> bool:
         if exclude_id:
             sql += " AND id != %s"; params.append(exclude_id)
         return bool(run_query(sql + " LIMIT 1", params))
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         return False
 
 def _batch_exists(product_id: str, batch_no: str) -> bool:
@@ -161,7 +170,8 @@ def _batch_exists(product_id: str, batch_no: str) -> bool:
             "SELECT id FROM inventory_stock WHERE product_id=%s AND UPPER(TRIM(batch_no))=UPPER(TRIM(%s)) LIMIT 1",
             [product_id, batch_no.strip()]
         ))
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         return False
 
 def _product_name_exists(name: str) -> bool:
@@ -171,7 +181,8 @@ def _product_name_exists(name: str) -> bool:
             "SELECT id FROM products WHERE LOWER(TRIM(product_name))=LOWER(TRIM(%s)) LIMIT 1",
             [name.strip()]
         ))
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         return False
 
 
@@ -190,7 +201,8 @@ def _pick_product(key: str, main_groups: list, label: str = "Product *") -> tupl
               AND COALESCE(is_active,true)=true
             ORDER BY product_name
         """, [g.lower() for g in main_groups]) or []
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         prods = []
 
     if not prods:
@@ -226,7 +238,7 @@ def render_quick_add(default_tab: int = 0, render_id: str = "qa"):
         "padding:10px 16px;border-radius:6px;margin-bottom:12px'>"
         "<b style='color:#4ade80;font-size:1rem'>➕ Quick Add</b>"
         "<span style='color:#94a3b8;font-size:0.78rem;margin-left:10px'>"
-        "One record at a time · Barcode/alias must be unique</span>"
+        "One record at a time · Scan Code / Item Code must be unique</span>"
         "</div>", unsafe_allow_html=True
     )
 
@@ -267,7 +279,7 @@ def render_quick_add(default_tab: int = 0, render_id: str = "qa"):
 def _tab_product():
     st.markdown("#### 📦 Add / Edit Product Master")
     st.caption(
-        "Add a product here first. Then use the other tabs to add stock/SKUs for it. "
+        "Add a product here first. Then use the other tabs to add stock/scan codes for it. "
         "Product Name and Barcode must be unique."
     )
     _show_summary("product")
@@ -284,7 +296,7 @@ def _tab_product():
         )
 
     # ── Main Group selected OUTSIDE form so GST auto-fills on change ──────────
-    _GST_OPTIONS = [0, 5, 12, 18, 28]
+    _GST_OPTIONS = [0, 5, 18]
     _MG_OPTIONS  = ["Contact Lenses","Frames","Ophthalmic Lenses",
                     "Sunglasses","Solution","Service","Accessories"]
 
@@ -352,6 +364,11 @@ def _tab_product():
             "It is NOT saved and does NOT affect billing. "
             "To set the billing price, use the 🕶️ **Frame** tab to add stock with MRP."
         )
+        force_new = st.checkbox(
+            "Create even if a similar product name already exists",
+            value=False,
+            help="Tick only if this is genuinely a different product. This prevents accidental misspelled duplicates.",
+        )
         submitted = st.form_submit_button("💾 Save Product", type="primary", use_container_width=True)
 
     if submitted:
@@ -367,6 +384,36 @@ def _tab_product():
             )
         if barcode.strip() and _barcode_exists(barcode.strip(), "products"):
             errors.append(f"Barcode **{barcode.strip()}** already used by another product — must be unique")
+        if float(gst) > 0 and not hsn.strip():
+            errors.append(
+                "HSN Code is required for taxable products (GST > 0). Enter HSN, "
+                "or set GST to 0 only if the product is genuinely GST-exempt."
+            )
+        if name.strip() and not force_new:
+            try:
+                import difflib as _difflib
+                from modules.sql_adapter import run_query as _rq_dup
+                candidate = (brand.strip() + " " + name.strip()).strip().lower()
+                rows = _rq_dup(
+                    "SELECT product_name, COALESCE(brand,'') AS brand FROM products WHERE is_active = true"
+                ) or []
+                near = []
+                for row in rows:
+                    existing = (
+                        str(row.get("brand") or "") + " " + str(row.get("product_name") or "")
+                    ).strip().lower()
+                    if existing and existing != candidate:
+                        if _difflib.SequenceMatcher(None, candidate, existing).ratio() >= 0.88:
+                            near.append(str(row.get("product_name") or ""))
+                    if len(near) >= 5:
+                        break
+                if near:
+                    errors.append(
+                        "Similar product(s) already exist: " + ", ".join(near[:5]) +
+                        ". If this is genuinely new, tick the similar-name override and save again."
+                    )
+            except Exception:
+                pass
         if errors:
             for e in errors: st.error(e)
             return
@@ -405,26 +452,231 @@ def _tab_product():
 # ══════════════════════════════════════════════════════════════════════════════
 # 🕶️ FRAME
 # ══════════════════════════════════════════════════════════════════════════════
+def _render_old_frame_mrp_reprint():
+    """Update MRP for an existing frame Scan Code / Item Code and reprint its jewellery sticker."""
+    with st.expander("🏷️ Old Frame Sticker — Change MRP & Print", expanded=False):
+        st.caption("Use for old frame stock already in DB. Product comes from Product master; Scan Code / Item Code + MRP come from Frame Inventory.")
+
+        try:
+            from modules.sql_adapter import run_query
+            products = run_query("""
+                SELECT p.id::text AS product_id,
+                       COALESCE(p.product_name, '') AS product_name,
+                       COALESCE(p.brand, '') AS brand,
+                       COUNT(s.id) AS sku_count
+                FROM products p
+                JOIN inventory_stock s ON s.product_id = p.id
+                WHERE COALESCE(p.is_active, TRUE) = TRUE
+                  AND COALESCE(s.is_active, TRUE) = TRUE
+                  AND COALESCE(NULLIF(s.item_code, ''), NULLIF(s.batch_no, '')) IS NOT NULL
+                  AND (
+                      LOWER(COALESCE(p.main_group,'')) LIKE '%%frame%%'
+                      OR LOWER(COALESCE(p.main_group,'')) LIKE '%%sunglass%%'
+                  )
+                GROUP BY p.id, p.product_name, p.brand
+                ORDER BY p.product_name
+            """, []) or []
+        except Exception as ex:
+            st.error(f"Frame product list failed: {ex}")
+            products = []
+
+        if not products:
+            st.info("No frame inventory found yet.")
+            return
+
+        product_labels = [
+            f"{p['product_name']}"
+            + (f" · {p['brand']}" if p.get("brand") else "")
+            + f" · {int(p.get('sku_count') or 0)} scan code(s)"
+            for p in products
+        ]
+        product_label = st.selectbox(
+            "Product",
+            product_labels,
+            key="qa_old_frame_product_select",
+        )
+        product = products[product_labels.index(product_label)]
+
+        try:
+            from modules.sql_adapter import run_query
+            rows = run_query("""
+                SELECT s.id::text AS stock_id,
+                       COALESCE(NULLIF(s.item_code, ''), NULLIF(s.batch_no, '')) AS sku,
+                       COALESCE(s.barcode, '') AS barcode,
+                       GREATEST(0, COALESCE(s.quantity, 0) - COALESCE(s.allocated_qty, 0)) AS qty,
+                       COALESCE(s.mrp, 0) AS mrp,
+                       COALESCE(s.selling_price, 0) AS selling_price,
+                       COALESCE(s.purchase_rate, 0) AS purchase_rate,
+                       COALESCE(s.location, '') AS location,
+                       COALESCE(s.colour_mix, '') AS colour_mix,
+                       COALESCE(s.frame_group, '') AS frame_group,
+                       COALESCE(s.colour, '') AS colour,
+                       COALESCE(p.product_name, '') AS product_name,
+                       COALESCE(p.brand, '') AS brand
+                FROM inventory_stock s
+                JOIN products p ON p.id = s.product_id
+                WHERE s.product_id = %s::uuid
+                  AND COALESCE(s.is_active, TRUE) = TRUE
+                  AND COALESCE(NULLIF(s.item_code, ''), NULLIF(s.batch_no, '')) IS NOT NULL
+                ORDER BY COALESCE(NULLIF(s.item_code, ''), NULLIF(s.batch_no, ''))
+            """, [product["product_id"]]) or []
+        except Exception as ex:
+            st.error(f"Scan code list failed: {ex}")
+            rows = []
+
+        if not rows:
+            st.info("No scan code rows found for this product.")
+            return
+
+        scanned = st.text_input(
+            "Scan or type Scan Code / Item Code",
+            placeholder="e.g. D10007",
+            key="qa_old_frame_sku_scan",
+        ).strip().upper()
+
+        sku_match = None
+        if scanned:
+            sku_match = next((s for s in rows if str(s.get("sku") or "").upper() == scanned), None)
+            if not sku_match:
+                st.warning(f"Scan Code / Item Code {scanned!r} not found under selected product")
+
+        sku_labels = [
+            f"{s['sku']}  |  📍{s['location']}  |  ₹{float(s['mrp'] or 0):.0f}"
+            + (f"  |  {s['colour_mix']}" if s.get("colour_mix") else "")
+            + (f"  [{s['frame_group']}]" if s.get("frame_group") else "")
+            for s in rows
+        ]
+        default_idx = 0
+        if sku_match:
+            default_idx = next((i for i, s in enumerate(rows) if str(s.get("sku") or "").upper() == scanned), 0)
+
+        sku_label = st.selectbox(
+            f"Select Scan Code / Item Code ({len(rows)} in stock)",
+            sku_labels,
+            index=default_idx,
+            key="qa_old_frame_sku_select",
+        )
+        row = rows[sku_labels.index(sku_label)]
+        print_code = str(row.get("sku") or "").strip()
+        current_mrp = float(row.get("mrp") or 0)
+
+        st.success(
+            f"🕶️ {row.get('product_name','')} | {row.get('brand','')} | "
+            f"Scan Code: {print_code} | 📍{row.get('location','')} | ₹{current_mrp:.0f}"
+        )
+
+        c1, c2, c3 = st.columns([1, 1, 1])
+        c1.metric("Current MRP", f"₹{current_mrp:.0f}")
+        c2.metric("Qty", f"{float(row.get('qty') or 0):g}")
+        c3.metric("Sticker Code", print_code or "—")
+
+        new_mrp = st.number_input(
+            "New MRP ₹",
+            min_value=0.0,
+            step=0.50,
+            value=current_mrp,
+            key=f"qa_old_frame_new_mrp_{row['stock_id']}",
+        )
+
+        b1, b2 = st.columns([1, 1])
+        with b1:
+            if st.button(
+                "💾 Save MRP",
+                key=f"qa_old_frame_save_{row['stock_id']}",
+                type="primary",
+                use_container_width=True,
+            ):
+                if new_mrp <= 0:
+                    st.error("MRP must be > 0")
+                else:
+                    try:
+                        from modules.sql_adapter import run_write
+                        run_write("""
+                            UPDATE inventory_stock
+                            SET mrp = %s,
+                                updated_at = NOW()
+                            WHERE id = %s::uuid
+                        """, [float(new_mrp), row["stock_id"]])
+                        st.session_state["_qa_old_frame_print"] = {
+                            "code": print_code,
+                            "price": float(new_mrp),
+                            "name": row.get("product_name") or "",
+                        }
+                        st.success(f"MRP updated to ₹{float(new_mrp):.0f}")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"MRP update failed: {ex}")
+        with b2:
+            if print_code and st.button(
+                "🖨️ Print with Current MRP",
+                key=f"qa_old_frame_print_now_{row['stock_id']}",
+                use_container_width=True,
+            ):
+                st.session_state["_qa_old_frame_print"] = {
+                    "code": print_code,
+                    "price": float(new_mrp),
+                    "name": row.get("product_name") or "",
+                }
+                st.rerun()
+
+        old_print = st.session_state.get("_qa_old_frame_print")
+        if old_print:
+            st.success(
+                f"Ready to print — **{old_print.get('name','')}** · "
+                f"{old_print.get('code','')} · MRP ₹{float(old_print.get('price') or 0):.0f}"
+            )
+            if old_print.get("code") and float(old_print.get("price") or 0) > 0:
+                from modules.printing.label_print_ui import get_frame_barcode_print_name
+                _frame_label_name = get_frame_barcode_print_name()
+                try:
+                    from modules.printing.label_preview import render_label_preview
+                    render_label_preview(
+                        code=old_print["code"],
+                        shop=_frame_label_name,
+                        price=f"Rs.{float(old_print['price']):.0f}",
+                    )
+                except Exception:
+                    pass
+                from modules.printing.label_print_ui import render_print_button
+                render_print_button(
+                    code=old_print["code"],
+                    price=old_print["price"],
+                    label=f"🖨️ Print updated sticker ({old_print['code']})",
+                    key_suffix="old_frame_mrp",
+                    shop=_frame_label_name,
+                    compact=False,
+                )
+            if st.button("Clear old-frame print panel", key="qa_old_frame_clear", use_container_width=True):
+                st.session_state.pop("_qa_old_frame_print", None)
+                st.rerun()
+
+
 def _tab_frame():
-    st.markdown("#### 🕶️ Add Frame SKU")
-    st.caption("Product must exist in 📦 Product tab first. Each SKU = one physical frame. Barcode must be unique.")
+    st.markdown("#### 🕶️ Add Frame Scan Code")
+    st.caption(
+        "Product must exist in 📦 Product tab first. Each Scan Code / Item Code = one physical frame. "
+        "Saved in inventory_stock.item_code for scanner use; Batch No is not used for frame scanning."
+    )
+    _render_old_frame_mrp_reprint()
 
     # ── Step 1: Show print + done flow AFTER a successful save ───────────────
     _last_frame = st.session_state.get("_qa_last_frame_print")
     if _last_frame:
         st.success(
             f"✅ Saved — **{_last_frame['name']}** | "
-            f"SKU: {_last_frame['code']} | MRP ₹{_last_frame.get('price',0):.0f}"
+            f"Scan Code: {_last_frame['code']} | MRP ₹{_last_frame.get('price',0):.0f}"
         )
         col_print, col_done = st.columns(2)
         with col_print:
             if _last_frame.get("price", 0) > 0:
+                from modules.printing.label_print_ui import get_frame_barcode_print_name
+                _frame_label_name = get_frame_barcode_print_name()
                 # Show live preview first
                 try:
                     from modules.printing.label_preview import render_label_preview
                     render_label_preview(
                         code  = _last_frame["code"],
-                        shop  = "DV OPTICAL",
+                        shop  = _frame_label_name,
                         price = f"Rs.{_last_frame['price']:.0f}",
                     )
                 except Exception:
@@ -435,6 +687,7 @@ def _tab_frame():
                     price=_last_frame["price"],
                     label=f"🖨️ Print sticker ({_last_frame['code']})",
                     key_suffix="frame_post",
+                    shop=_frame_label_name,
                     compact=False,
                 )
             else:
@@ -457,7 +710,7 @@ def _tab_frame():
     # ── Step 3: Scan first, then form ────────────────────────────────────────
     st.markdown("**Step 1 — Scan the frame sticker**")
     _bc_typed = st.text_input(
-        "📷 Scan frame barcode",
+        "📷 Scan frame Scan Code / Item Code",
         placeholder="Point scanner here and scan the frame sticker",
         key="qa_frame_bc_scan",
     ).strip()
@@ -470,16 +723,16 @@ def _tab_frame():
     if _bc_val:
         st.success(f"✅ Scanned: **{_bc_val}** — now fill MRP and details below, then Save")
     else:
-        st.caption("Or skip and type the SKU manually in the form below")
+        st.caption("Or skip and type the Scan Code / Item Code manually in the form below")
 
     st.markdown("**Step 2 — Fill details and save**")
 
     # ── Step 4: Entry form ───────────────────────────────────────────────────
     with st.form("qa_frame", clear_on_submit=True):
         c1, c2 = st.columns(2)
-        sku     = c1.text_input("SKU / Batch Code *", value=_sku_pre, placeholder="D10007")
-        barcode = c2.text_input("Barcode", value=_bc_val,
-                                 placeholder="Unique — scan sticker or type")
+        item_code = c1.text_input("Scan Code / Item Code *", value=_sku_pre, placeholder="D10007")
+        barcode = c2.text_input("Product Barcode (optional)", value="",
+                                 placeholder="Usually blank for frames")
 
         c3, c4, c5 = st.columns(3)
         colour   = c3.text_input("Colour", placeholder="Black")
@@ -502,16 +755,16 @@ def _tab_frame():
         location  = c13.text_input("Location / Box", placeholder="D1")
         frame_grp = c14.text_input("Frame Group", placeholder="Near Dead / Sale / Premium")
 
-        submitted = st.form_submit_button("💾 Save Frame SKU", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("💾 Save Frame Scan Code", type="primary", use_container_width=True)
 
     if submitted:
         errors = []
-        if not sku.strip():
-            errors.append("SKU / Batch Code is required")
+        if not item_code.strip():
+            errors.append("Scan Code / Item Code is required")
         if mrp <= 0:
             errors.append("MRP must be > 0 — required for billing")
-        if sku.strip() and _batch_exists(prod_id, sku.strip()):
-            errors.append(f"SKU **{sku.strip()}** already exists for this product — use ✏️ Edit flow to update prices")
+        if item_code.strip() and _item_code_exists(item_code.strip()):
+            errors.append(f"Scan Code / Item Code **{item_code.strip()}** already exists — use ✏️ Edit flow to update prices")
         if barcode.strip() and _barcode_exists(barcode.strip(), "inventory_stock"):
             errors.append(f"Barcode **{barcode.strip()}** already used — must be unique across all stock")
         if errors:
@@ -521,12 +774,12 @@ def _tab_frame():
             from modules.sql_adapter import run_write
             run_write("""
                 INSERT INTO inventory_stock
-                (id, product_id, batch_no, quantity, mrp, selling_price, purchase_rate,
+                (id, product_id, item_code, batch_no, quantity, mrp, selling_price, purchase_rate,
                  barcode, location, colour, colour_mix, temple_colour,
                  size_a, size_b, dbl, temple_length, frame_group,
                  stock_type, is_active, created_at, updated_at)
-                VALUES (%s,%s,%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'BATCH',true,NOW(),NOW())
-            """, (str(uuid.uuid4()), prod_id, sku.strip().upper(),
+                VALUES (%s,%s,%s,NULL,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'BATCH',true,NOW(),NOW())
+            """, (str(uuid.uuid4()), prod_id, item_code.strip().upper(),
                   mrp, sell or None, cost or None,
                   barcode.strip() or None, location.strip() or None,
                   colour.strip() or None, col_mix.strip() or None, temple_c.strip() or None,
@@ -534,7 +787,7 @@ def _tab_frame():
                   frame_grp.strip() or None))
             # Store for print/done step — clears form and scanner
             st.session_state["_qa_last_frame_print"] = {
-                "code":  sku.strip().upper(),
+                "code":  item_code.strip().upper(),
                 "price": mrp,
                 "name":  prod_name,
             }
@@ -833,17 +1086,37 @@ def _tab_party():
             if errors:
                 for e in errors: st.error(e); return
             try:
-                from modules.sql_adapter import run_write
-                run_write("""
-                    INSERT INTO parties
-                    (id, party_name, party_type, mobile, gstin, barcode, is_active, created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,true,NOW())
-                    ON CONFLICT (party_name) DO UPDATE SET
-                        party_type=EXCLUDED.party_type,
-                        barcode=COALESCE(EXCLUDED.barcode, parties.barcode)
-                """, (str(uuid.uuid4()), name.strip(), ptype,
-                      mobile.strip() or None, gstin.strip().upper() or None,
-                      barcode.strip() or None))
+                from modules.sql_adapter import run_query, run_write
+                existing = run_query("""
+                    SELECT id::text AS id
+                    FROM parties
+                    WHERE LOWER(TRIM(party_name)) = LOWER(TRIM(%s))
+                    LIMIT 1
+                """, (name.strip(),)) or []
+                if existing:
+                    run_write("""
+                        UPDATE parties
+                        SET party_type = %s,
+                            mobile = COALESCE(NULLIF(%s,''), mobile),
+                            gstin = COALESCE(NULLIF(%s,''), gstin),
+                            barcode = COALESCE(NULLIF(%s,''), barcode),
+                            is_active = TRUE
+                        WHERE id = %s::uuid
+                    """, (
+                        ptype,
+                        mobile.strip(),
+                        gstin.strip().upper(),
+                        barcode.strip(),
+                        existing[0]["id"],
+                    ))
+                else:
+                    run_write("""
+                        INSERT INTO parties
+                        (id, party_name, party_type, mobile, gstin, barcode, is_active, created_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,true,NOW())
+                    """, (str(uuid.uuid4()), name.strip(), ptype,
+                          mobile.strip() or None, gstin.strip().upper() or None,
+                          barcode.strip() or None))
                 _saved("party", {"Name": name.strip(), "Type": ptype})
                 st.rerun()
             except Exception as e:
@@ -855,6 +1128,11 @@ def _tab_party():
 # ══════════════════════════════════════════════════════════════════════════════
 def _tab_patient():
     st.markdown("#### 🏥 Add Patient")
+    try:
+        from modules.loaders.patient_dedup import _ensure_patient_identity_columns
+        _ensure_patient_identity_columns()
+    except Exception:
+        pass
     st.caption(
         "Identity = **Name + Mobile together** (composite key). "
         "Same mobile, different name = different patient (son, wife etc.). "

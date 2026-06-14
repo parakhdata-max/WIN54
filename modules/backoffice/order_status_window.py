@@ -5,20 +5,27 @@ Renders the "Status" tab (tab3) and the inline train strip shown at the top of
 every order detail card.
 
 Public surfaces:
-  render_order_status_window(order)   – full tab3 view (includes stage buttons)
-  _render_train_inline(order)         – compact strip used above the line items
+  render_order_status_window(order)    — full tab3 view, READ-ONLY status display
+                                         + detected services strip
+                                         (stage advancement happens on the
+                                         Production page, not here)
+  _render_train_inline(order)          — compact strip used above the line items
+  render_production_stage_panel(order) — DEPRECATED: read-only shim only,
+                                         emits DeprecationWarning. Use
+                                         render_order_status_window() instead.
 
-Stage shifting:
+Stage transitions (for reference only — the backoffice no longer triggers them):
   The DB function advance_job_stage(job_id, next_stage, user_id) validates
-  transitions via job_stage_transitions table.  We mirror the allowed-
-  transition map here so the UI can show only legal "next" buttons without
-  an extra round-trip.  Special DB rules:
-    PRODUCTION_PICKED → requires blank_allocations entry (DB enforces)
-    READY_FOR_PACK    → DB auto-closes job + increments ready_qty on order_line
+  transitions via job_stage_transitions table. The Production page is the
+  single owner of stage advancement. Per spec:
+    READY_FOR_PACK → packing step, NOT billable, does NOT close the job
+    READY_TO_BILL  → the only stage that closes the job and opens billing
 ──────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 import datetime
+import html
+import json
 import streamlit as st
 from typing import Dict, List, Optional, Tuple
 
@@ -109,9 +116,10 @@ _STD_NEXT: Dict[str, List[str]] = {
     "HARDCOAT_COMPLETED":   ["ARC_RECEIVED", "PRODUCTION_COMPLETED"],
     "ARC_RECEIVED":         ["COLOURING_COMPLETED", "PRODUCTION_COMPLETED", "FINAL_QC"],
     "COLOURING_COMPLETED":  ["PRODUCTION_COMPLETED", "FINAL_QC"],
-    "PRODUCTION_COMPLETED": ["FINAL_QC", "READY_FOR_PACK"],
-    "FINAL_QC":             ["READY_FOR_PACK"],
-    "READY_FOR_PACK":       [],
+    "PRODUCTION_COMPLETED": ["FINAL_QC", "READY_FOR_PACK", "READY_TO_BILL"],
+    "FINAL_QC":             ["READY_FOR_PACK", "READY_TO_BILL"],
+    "READY_FOR_PACK":       ["READY_TO_BILL"],
+    "READY_TO_BILL":        [],
 }
 
 
@@ -129,242 +137,111 @@ def _get_allowed_next(current_stage: str, job_id: str) -> List[str]:
 
 
 def _advance_stage(job_id: str, next_stage: str, order_id: str) -> Tuple[bool, str]:
-    """Call DB function first; manual fallback if function unavailable."""
-    try:
-        from modules.sql_adapter import run_query
-        rows = run_query(
-            "SELECT advance_job_stage(%(jid)s::uuid, %(ns)s, NULL::uuid) AS result",
-            {"jid": job_id, "ns": next_stage}
-        )
-        if rows:
-            result = str(rows[0].get("result") or "")
-            if result.startswith("ERROR"):
-                return False, result
-            return True, f"Advanced to {next_stage}"
-    except Exception:
-        pass
-
-    # Manual fallback
-    try:
-        from modules.sql_adapter import run_write, run_query
-
-        # PRODUCTION_PICKED: blank must exist
-        if next_stage == "PRODUCTION_PICKED":
-            ba = run_query("""
-                SELECT 1 FROM blank_allocations ba
-                JOIN job_master jm ON jm.order_line_id = ba.order_line_id
-                WHERE jm.id = %(jid)s::uuid LIMIT 1
-            """, {"jid": job_id})
-            if not ba:
-                return False, "Blank not selected — save the job card in Documents → Job Cards first"
-
-        # READY_FOR_PACK: update ready_qty + close job
-        if next_stage == "READY_FOR_PACK":
-            info = run_query(
-                "SELECT total_qty, order_line_id::text FROM job_master WHERE id = %(jid)s::uuid",
-                {"jid": job_id}
-            )
-            if info:
-                total_qty = int(info[0].get("total_qty") or 0)
-                line_id   = info[0].get("order_line_id")
-                if line_id and total_qty > 0:
-                    run_write("""
-                        UPDATE order_lines
-                        SET ready_qty = COALESCE(ready_qty, 0) + %(qty)s,
-                            updated_at = NOW()
-                        WHERE id = %(lid)s::uuid
-                    """, {"qty": total_qty, "lid": line_id})
-            run_write(
-                "UPDATE job_master SET is_closed = TRUE, updated_at = NOW() WHERE id = %(jid)s::uuid",
-                {"jid": job_id}
-            )
-
-        # Advance stage on job_master
-        run_write(
-            "UPDATE job_master SET current_stage = %(ns)s, updated_at = NOW() WHERE id = %(jid)s::uuid",
-            {"jid": job_id, "ns": next_stage}
-        )
-
-        # Log event
-        try:
-            run_write("""
-                INSERT INTO job_stage_events
-                    (id, job_id, stage_id, stage_code, performed_by, department, created_at)
-                SELECT gen_random_uuid(), %(jid)s::uuid,
-                       COALESCE((SELECT id FROM job_stage_master WHERE stage_code=%(ns)s LIMIT 1),
-                                gen_random_uuid()),
-                       %(ns)s, NULL, 'backoffice', NOW()
-            """, {"jid": job_id, "ns": next_stage})
-        except Exception:
-            pass
-
-        return True, f"Advanced to {next_stage}"
-
-    except Exception as e:
-        return False, f"Stage advance failed: {e}"
+    """Disabled — stage advancement must happen via the Production page.
+    The old fallback logic (closing job at READY_FOR_PACK) conflicts with the
+    READY_TO_BILL final gate and is no longer safe to run from Backoffice.
+    """
+    return False, "Stage advancement is disabled in Backoffice. Use Production page."
 
 
 # ── production stage panel ────────────────────────────────────────────────────
 
 def render_production_stage_panel(order: dict) -> None:
     """
-    Shows all job_master rows for this order with current stage + advance buttons.
-    Call from tab3 (status tab) or anywhere a stage-shift button is needed.
+    READ-ONLY production stage panel.
+
+    Earlier versions of this function rendered stage-advance buttons and could
+    close jobs at READY_FOR_PACK. That conflicts with the rule that only
+    READY_TO_BILL closes/bills. The function is kept as a deprecated shim
+    rather than deleted so any caller that still imports it gets a safe
+    read-only render and a one-time deprecation warning instead of an
+    AttributeError.
+
+    Stage advancement now happens exclusively from the Production page.
+    Backoffice surfaces stage *visibility* through render_order_status_window().
     """
+    try:
+        import warnings
+        warnings.warn(
+            "render_production_stage_panel() is deprecated. Stage advancement "
+            "lives in production_page.py. Use render_order_status_window() for "
+            "read-only visibility.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    except Exception:
+        pass
+
     order_id = str(order.get("id") or "")
     order_no = str(order.get("order_no") or "")
     _oid     = order_id if len(order_id) == 36 else None
 
-    jobs = _q("""
-        SELECT
-            jm.id::text          AS job_id,
-            jm.current_stage,
-            jm.is_closed,
-            jm.total_qty,
-            jm.blank_allocated_qty,
-            jm.coating_path,
-            jm.updated_at,
-            ol.eye_side,
-            ol.id::text          AS line_id,
-            p.product_name
-        FROM job_master jm
-        JOIN order_lines ol ON ol.id = jm.order_line_id
-        JOIN orders o       ON o.id  = ol.order_id
-        LEFT JOIN products p ON p.id = ol.product_id
-        WHERE (%(oid)s IS NOT NULL AND o.id = %(oid)s::uuid
-            OR o.order_no = %(ono)s)
-        ORDER BY jm.is_closed, ol.eye_side, p.product_name
-    """, {"oid": _oid, "ono": order_no})
+    try:
+        jobs = _q("""
+            SELECT
+                jm.id::text          AS job_id,
+                jm.current_stage,
+                jm.is_closed,
+                jm.total_qty,
+                jm.blank_allocated_qty,
+                jm.coating_path,
+                jm.updated_at,
+                ol.eye_side,
+                ol.id::text          AS line_id,
+                p.product_name
+            FROM job_master jm
+            JOIN order_lines ol ON ol.id = jm.order_line_id
+            JOIN orders o       ON o.id  = ol.order_id
+            LEFT JOIN products p ON p.id = ol.product_id
+            WHERE (%(oid)s IS NOT NULL AND o.id = %(oid)s::uuid
+                OR o.order_no = %(ono)s)
+            ORDER BY jm.is_closed, ol.eye_side, p.product_name
+        """, {"oid": _oid, "ono": order_no})
+    except Exception:
+        jobs = []
 
     if not jobs:
-        st.info("No job cards found. Save a job card in Documents → Job Cards first.")
+        st.info("No job cards yet. Job cards are created on the Production page.")
         return
 
-    open_jobs   = [j for j in jobs if not j.get("is_closed")]
-    closed_jobs = [j for j in jobs if j.get("is_closed")]
+    st.caption(
+        "Stage advancement happens on the Production page. "
+        "This view is read-only."
+    )
 
-    # ── Open jobs ─────────────────────────────────────────────────────────────
-    for job in open_jobs:
-        job_id  = job["job_id"]
-        stage   = job.get("current_stage") or "JOB_CREATED"
-        eye     = (job.get("eye_side") or "").strip().upper()
-        eye_lbl = {"R": "👁 RE", "L": "👁 LE"}.get(eye, f"👁 {eye or '—'}")
-        pname   = (job.get("product_name") or "—")[:38]
-        sm      = _STAGE_META.get(stage, {"label": stage, "icon": "•", "color": "#64748b"})
-        s_idx   = _STAGE_IDX.get(stage, 0)
-        total   = len(_JOB_STAGES) - 1
-        pct     = int(100 * s_idx / total) if total else 0
-        updated = str(job.get("updated_at") or "")[:16].replace("T", " ")
+    # Read-only badge per job, alias-normalised.
+    try:
+        from modules.backoffice.production_page import normalize_stage_alias
+    except Exception:
+        def normalize_stage_alias(s):  # graceful fallback
+            return str(s or "").upper()
 
-        with st.container(border=True):
-            # Header
-            h1, h2 = st.columns([4, 2])
-            with h1:
-                st.markdown(
-                    f"<div style='display:flex;align-items:center;gap:8px'>"
-                    f"<b style='color:#94a3b8;font-size:0.75rem'>{eye_lbl}</b>"
-                    f"<span style='color:#e2e8f0;font-size:0.8rem'>{pname}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-            with h2:
-                st.caption(f"Updated: {updated}")
+    for job in jobs:
+        stage_raw = job.get("current_stage") or "JOB_CREATED"
+        stage     = normalize_stage_alias(stage_raw)
+        eye_l     = (job.get("eye_side") or "").strip().upper()
+        prod      = str(job.get("product_name") or "")[:30]
+        closed    = bool(job.get("is_closed"))
+        if closed:
+            color = "#10b981"; status_label = "✅ closed"
+        elif stage == "READY_TO_BILL":
+            color = "#f59e0b"; status_label = "⏳ ready to bill"
+        elif stage == "READY_FOR_PACK":
+            color = "#0d9488"; status_label = "📦 packing"
+        else:
+            color = "#3b82f6"; status_label = stage.replace("_", " ").lower()
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:10px;"
+            f"padding:6px 10px;background:{color}11;border:1px solid {color}33;"
+            f"border-radius:8px;margin-bottom:4px'>"
+            f"<span style='font-weight:700;color:{color}'>{eye_l or '·'}</span>"
+            f"<span style='flex:1;color:#475569;font-size:0.85rem'>{prod}</span>"
+            f"<span style='color:{color};font-size:0.75rem;font-weight:600'>"
+            f"{status_label}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
-            # Current stage badge
-            st.markdown(
-                f"<div style='margin:6px 0 4px;display:flex;align-items:center;gap:10px'>"
-                f"<span style='background:{sm['color']}22;color:{sm['color']};"
-                f"border:1.5px solid {sm['color']}66;border-radius:20px;"
-                f"padding:4px 14px;font-size:0.8rem;font-weight:800'>"
-                f"{sm['icon']} {sm['label']}</span>"
-                f"<span style='color:#475569;font-size:0.65rem'>Step {s_idx+1}/{total+1}</span>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-            # Progress bar
-            st.markdown(
-                f"<div style='background:#1e293b;border-radius:4px;height:5px;margin:4px 0 10px'>"
-                f"<div style='background:{sm['color']};width:{pct}%;height:100%;border-radius:4px'>"
-                f"</div></div>",
-                unsafe_allow_html=True,
-            )
-
-            # Mini stage dot trail
-            dots = []
-            for si, s in enumerate(_JOB_STAGES):
-                if si < s_idx:
-                    dots.append(f"<span title='{s['label']}' style='display:inline-block;"
-                                 f"width:10px;height:10px;background:{s['color']};"
-                                 f"border-radius:50%;flex-shrink:0'></span>")
-                elif si == s_idx:
-                    dots.append(f"<span title='{s['label']}' style='display:inline-block;"
-                                 f"width:14px;height:14px;background:{s['color']};"
-                                 f"border-radius:50%;box-shadow:0 0 0 3px {s['color']}44;"
-                                 f"flex-shrink:0'></span>")
-                else:
-                    dots.append(f"<span title='{s['label']}' style='display:inline-block;"
-                                 f"width:8px;height:8px;background:#1e293b;"
-                                 f"border:1.5px solid #334155;border-radius:50%;flex-shrink:0'></span>")
-                if si < len(_JOB_STAGES) - 1:
-                    conn = sm["color"] if si < s_idx else "#1e293b"
-                    dots.append(f"<span style='flex:1;height:2px;background:{conn};"
-                                 f"display:inline-block;min-width:4px;max-width:16px;"
-                                 f"margin:0 1px;align-self:center'></span>")
-
-            st.markdown(
-                "<div style='display:flex;align-items:center;gap:1px;"
-                "overflow:hidden;margin:2px 0 10px;padding:2px'>"
-                + "".join(dots) + "</div>",
-                unsafe_allow_html=True,
-            )
-
-            # ── Advance buttons ────────────────────────────────────────
-            allowed_next = _get_allowed_next(stage, job_id)
-            if allowed_next:
-                btn_cols = st.columns(min(len(allowed_next), 3))
-                for col, next_stage in zip(btn_cols, allowed_next):
-                    ns_meta = _STAGE_META.get(
-                        next_stage,
-                        {"label": next_stage, "icon": "→", "color": "#3b82f6"}
-                    )
-                    with col:
-                        if st.button(
-                            f"{ns_meta['icon']} → {ns_meta['label']}",
-                            key=f"adv_{job_id}_{next_stage}",
-                            use_container_width=True,
-                            type="primary",
-                        ):
-                            ok, msg = _advance_stage(job_id, next_stage, order_id)
-                            if ok:
-                                st.success(f"✅ {msg}")
-                                try:
-                                    from modules.backoffice.backoffice_helpers import load_orders_from_database
-                                    load_orders_from_database.clear()
-                                except Exception:
-                                    pass
-                                st.rerun()
-                            else:
-                                st.error(f"❌ {msg}")
-            else:
-                st.caption("No further transitions available for this stage.")
-
-    # ── Closed jobs summary ───────────────────────────────────────────────────
-    if closed_jobs:
-        with st.expander(f"✅ {len(closed_jobs)} completed job(s)", expanded=False):
-            for job in closed_jobs:
-                eye   = (job.get("eye_side") or "").strip().upper()
-                eye_l = {"R": "👁 RE", "L": "👁 LE"}.get(eye, eye or "—")
-                st.markdown(
-                    f"<div style='display:flex;gap:10px;padding:5px 0;"
-                    f"border-bottom:1px solid #1e293b'>"
-                    f"<span style='color:#64748b;font-size:0.75rem'>{eye_l}</span>"
-                    f"<span style='color:#94a3b8;font-size:0.78rem'>{job.get('product_name','—')}</span>"
-                    f"<span style='color:#4ade80;font-size:0.7rem;margin-left:auto'>"
-                    f"✅ {job.get('current_stage','READY_FOR_PACK')}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -409,6 +286,62 @@ def _get_job_rows_inline(order_id: str, order_no: str) -> list:
           AND NOT COALESCE(jm.is_closed, FALSE)
         ORDER BY ol.eye_side, p.product_name
     """, {"oid": _oid, "ono": order_no})
+
+
+def _render_structured_audit_log(order_id: str) -> None:
+    if not order_id:
+        return
+    try:
+        from modules.backoffice.audit_logger import get_audit_trail
+        rows = get_audit_trail(order_id, limit=50) or []
+    except Exception:
+        rows = []
+
+    with st.expander("Audit Log", expanded=False):
+        st.caption("Structured backoffice actions recorded for this order.")
+        if not rows:
+            st.info("No structured audit_log entries recorded for this order yet.")
+            return
+
+        for row in rows:
+            payload = row.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {"detail": payload}
+            if not isinstance(payload, dict):
+                payload = {"detail": str(payload)}
+
+            event = html.escape(str(row.get("event") or "audit_event"))
+            entity = html.escape(str(row.get("entity") or ""))
+            user = html.escape(str(row.get("user_id") or "system"))
+            at = html.escape(str(row.get("created_at") or "")[:16].replace("T", " "))
+
+            bits = []
+            for key in (
+                "action", "order_no", "status", "from_status", "to_status",
+                "product", "eye_side", "old_value", "new_value", "amount",
+                "ref_no", "reason", "refund_amount", "refund_mode",
+            ):
+                val = payload.get(key)
+                if val not in (None, ""):
+                    bits.append(f"{key.replace('_', ' ').title()}: {html.escape(str(val))}")
+            detail = " | ".join(bits) if bits else html.escape(json.dumps(payload, default=str))
+
+            st.markdown(
+                f"<div style='background:#0f172a;border:1px solid #334155;"
+                f"border-radius:8px;padding:8px 12px;margin:4px 0'>"
+                f"<div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
+                f"<span style='color:#93c5fd;font-weight:800;font-size:0.78rem'>{event}</span>"
+                f"<span style='color:#64748b;font-size:0.68rem'>{entity}</span>"
+                f"<span style='margin-left:auto;color:#94a3b8;font-size:0.68rem'>{at}</span>"
+                f"</div>"
+                f"<div style='color:#cbd5e1;font-size:0.74rem;margin-top:4px'>{detail}</div>"
+                f"<div style='color:#64748b;font-size:0.65rem;margin-top:3px'>by {user}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -582,6 +515,83 @@ def render_order_status_window(order: dict) -> None:
         unsafe_allow_html=True,
     )
 
+    # ── Detected Services Strip (read-only — production handles advancement) ──
+    # Shows at-a-glance whether colouring/fitting/frame are part of this order
+    # so backoffice staff can answer customer questions without bouncing to
+    # the production page.
+    try:
+        from modules.backoffice.production_page import detect_production_services
+        _svc = detect_production_services(order_id)
+    except Exception:
+        _svc = {"colouring": False, "fitting": False, "frame_name": "",
+                "frame_source": "NO_FRAME", "fitting_vendor": "", "fitting_note": ""}
+
+    def _svc_pill(label, on, color_on="#10b981", color_off="#475569"):
+        bg = color_on if on else color_off
+        ic = "✓" if on else "—"
+        return (f"<span style='background:{bg}22;border:1px solid {bg}66;"
+                f"color:{bg};padding:4px 10px;border-radius:14px;font-size:0.7rem;"
+                f"font-weight:700;white-space:nowrap'>{ic} {label}</span>")
+
+    _frame_label_map = {
+        "SOLD_WITH_ORDER": "Frame: sold with order",
+        "CUSTOMER_FRAME":  "Frame: customer's own",
+        "NO_FRAME":        "Frame: none",
+    }
+    _frame_pill_label = _frame_label_map.get(_svc.get("frame_source", "NO_FRAME"),
+                                             "Frame: —")
+    if _svc.get("frame_name"):
+        _frame_pill_label += f" · {_svc['frame_name']}"
+
+    # Next stage hint (best-effort) — only meaningful when in production
+    _next_hint = ""
+    try:
+        from modules.backoffice.production_page import (
+            build_optical_stage_flow, normalize_stage_alias
+        )
+        # Derive coating from any line if available; otherwise leave blank.
+        _coat_for_hint = ""
+        for _l in (order.get("inhouse_lines") or []) + (order.get("lines") or []):
+            _lp_h = _l.get("lens_params") or {}
+            if isinstance(_lp_h, dict):
+                _coat_for_hint = (str(_l.get("coating") or _lp_h.get("coating") or "")).strip()
+                if _coat_for_hint:
+                    break
+        if _coat_for_hint:
+            _flow = build_optical_stage_flow(
+                _coat_for_hint, _svc.get("colouring", False), _svc.get("fitting", False)
+            )
+            _cur_stage = ""
+            for _l in (order.get("inhouse_lines") or []):
+                _cur_stage = normalize_stage_alias(_l.get("current_stage") or _l.get("lab_stage") or "")
+                if _cur_stage in _flow:
+                    break
+            if _cur_stage and _cur_stage in _flow:
+                _idx = _flow.index(_cur_stage)
+                if _idx + 1 < len(_flow):
+                    _next_hint = _flow[_idx + 1]
+    except Exception:
+        _next_hint = ""
+
+    _pills = [
+        _svc_pill("Colouring", _svc.get("colouring", False)),
+        _svc_pill("Fitting",   _svc.get("fitting", False)),
+        _svc_pill(_frame_pill_label,
+                  _svc.get("frame_source") in ("SOLD_WITH_ORDER","CUSTOMER_FRAME"),
+                  color_on="#3b82f6"),
+    ]
+    if _svc.get("fitting_vendor"):
+        _pills.append(_svc_pill(f"Vendor: {_svc['fitting_vendor']}", True, color_on="#8b5cf6"))
+    if _next_hint:
+        _pills.append(_svc_pill(f"Next: {_next_hint}", True, color_on="#f59e0b"))
+
+    st.markdown(
+        "<div style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px'>"
+        + "".join(_pills) +
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
     # ── Two-column layout ─────────────────────────────────────────────────────
     col_tl, col_prod = st.columns([1, 1])
 
@@ -642,8 +652,71 @@ def render_order_status_window(order: dict) -> None:
             )
 
     with col_prod:
-        st.markdown("#### ⚙️ Production Stage Control")
-        render_production_stage_panel(order)
+        st.markdown("#### ⚙️ Production Stage  —  Current Status")
+        st.caption("View-only. Advance stages from the Production page.")
+        # Show job/supplier stage badges via production train
+        try:
+            from modules.backoffice.production_train import render_train_sidebar
+            render_train_sidebar(str(order.get("order_no") or ""))
+        except Exception:
+            pass
+        # Show detailed job stage per line
+        try:
+            from modules.sql_adapter import run_query as _rq_sw
+            _STAGE_META_SW = {
+                "JOB_CREATED":       ("🖨 Created",      "#64748b"),
+                "PRINTED":           ("🖨 Printed",       "#3b82f6"),
+                "JOB_PRINTED":       ("🖨 Printed",       "#3b82f6"),
+                "BLANK_ALLOCATED":   ("🎯 Blank",         "#8b5cf6"),
+                "PRODUCTION_PICKED": ("⚙ In Prod",       "#f59e0b"),
+                "PRODUCTION_DONE":   ("✨ Prod Done",     "#a855f7"),
+                "HARDCOAT_PICKED":   ("🛡 Hardcoat",      "#f59e0b"),
+                "HARDCOAT_DONE":     ("🛡 HC Done",       "#eab308"),
+                "COLOURING_PICKED":  ("🎨 Colouring",     "#ec4899"),
+                "COLOURING_DONE":    ("🎨 Colour Done",   "#db2777"),
+                "ARC_SENT":          ("🔬 ARC Sent",      "#06b6d4"),
+                "ARC_RECEIVED":      ("🔬 ARC Rcvd",      "#10b981"),
+                "INSPECTION":        ("🔍 Inspect",       "#ef4444"),
+                "FINAL_QC":          ("🔍 Final QC",      "#0d9488"),
+                "READY_FOR_PACK":    ("📦 Pack Ready",    "#0d9488"),
+                "READY_TO_BILL":     ("💰 Ready→Bill",    "#059669"),
+                "FITTING_DONE":      ("✅ Fit Done",      "#4c1d95"),
+                "REJECTED":          ("🚫 Rejected",      "#dc2626"),
+            }
+            _jm_rows = _rq_sw("""
+                SELECT jm.current_stage, jm.is_closed,
+                       ol.eye_side,
+                       COALESCE(ol.lens_params->>'manufacturing_route','') AS route,
+                       COALESCE(ol.lens_params->>'supplier_stage','') AS supplier_stage
+                FROM job_master jm
+                JOIN order_lines ol ON ol.id = jm.order_line_id
+                JOIN orders o ON o.id = ol.order_id
+                WHERE o.order_no = %(ono)s
+                ORDER BY ol.eye_side
+            """, {"ono": order.get("order_no","")})
+
+            if _jm_rows:
+                for _jrow in _jm_rows:
+                    _stg   = str(_jrow.get("current_stage") or "JOB_CREATED").upper()
+                    _eye   = str(_jrow.get("eye_side") or "").upper()
+                    _eye_l = {"R":"RE","L":"LE"}.get(_eye, _eye or "—")
+                    _lbl, _clr = _STAGE_META_SW.get(_stg, (f"⚙ {_stg}", "#64748b"))
+                    _closed = _jrow.get("is_closed", False)
+                    _bdr   = f"border:2px solid {_clr}" if _closed else f"border:1px solid {_clr}44"
+                    st.markdown(
+                        f"<div style='background:{_clr}12;{_bdr};border-radius:6px;"
+                        f"padding:6px 12px;margin:4px 0;display:flex;align-items:center;gap:10px'>"
+                        f"<span style='color:{_clr};font-weight:700;font-size:0.75rem'>{_eye_l}</span>"
+                        f"<span style='color:#e2e8f0;font-size:0.8rem'>{_lbl}</span>"
+                        + (f"<span style='color:#22c55e;font-size:0.65rem;margin-left:auto'>"
+                           f"✅ Billing Ready</span>" if _closed else "")
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("No job cards created yet for this order.")
+        except Exception as _sw_e:
+            st.caption(f"Stage load: {_sw_e}")
 
     # ── Billing documents ─────────────────────────────────────────────────────
     _oid_q = order_id if len(order_id) == 36 else "__none__"
@@ -727,3 +800,6 @@ def render_order_status_window(order: dict) -> None:
                 f"{pstat}</div></div></div>",
                 unsafe_allow_html=True,
             )
+
+    st.markdown("---")
+    _render_structured_audit_log(_oid_q if _oid_q != "__none__" else order_id)

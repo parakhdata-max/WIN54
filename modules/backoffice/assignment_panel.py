@@ -37,6 +37,8 @@ DB IMPACT
   No DB write happens here — save_order_to_db() does that on Save.
 """
 
+import json
+import logging
 import streamlit as st
 from typing import Dict, List, Optional
 
@@ -66,6 +68,8 @@ ROUTE_INHOUSE      = "INHOUSE"
 ROUTE_EXTERNAL_LAB = "EXTERNAL_LAB"
 ROUTE_STOCK        = "STOCK"
 
+log = logging.getLogger(__name__)
+
 ROUTE_LABELS = {
     ROUTE_VENDOR:       "🏭 Supplier (Direct)",
     ROUTE_INHOUSE:      "🔬 In-house Lab",
@@ -91,7 +95,8 @@ def init_assignment_state(all_lines=None):
 
     if all_lines:
         _has_job_card = _any_line_has_job_card(all_lines)
-        if _has_job_card:
+        _has_pipeline_started = _any_line_pipeline_started(all_lines)
+        if _has_job_card or _has_pipeline_started:
             st.session_state.bo_assignments_locked = True
 
         # ── Auto-populate assignments from existing line data ─────────────
@@ -114,17 +119,20 @@ def init_assignment_state(all_lines=None):
             # This is the primary STOCK signal for frames/accessories.
             # manufacturing_route is decoded from lens_params JSON by order_loader
             # and takes precedence when explicitly set.
-            _lp = line.get("lens_params") or {}
-            _lp = _lp if isinstance(_lp, dict) else {}
+            _lp = _lens_params_dict(line)
             _batch_no = str(line.get("batch_no") or _lp.get("batch_no") or "").strip()
+            _batch_status = str(line.get("batch_status") or _lp.get("batch_status") or "").upper()
 
-            # Resolve route: explicit saved route wins; batch_no is next;
-            # allocated_qty is last resort (lenses only, never reliable for frames).
-            if not route:
-                if _batch_no:
+            # Resolve route: explicit saved route wins; then stock/RX/brand rules.
+            if (not route) or (route == "VENDOR" and not supp):
+                if _batch_no or _batch_status == "ALLOCATED" or _is_stock_allocated(line) or _has_stock_available(line):
                     route = "STOCK"   # batch_no set → item was picked from inventory
                 elif alloc >= needed and needed > 0:
                     route = "STOCK"   # lens allocation recorded in DB
+                elif _is_rx(line):
+                    route = "VENDOR"  # RX order is supplier assignment
+                elif _is_inhouse_lab_brand(line):
+                    route = "INHOUSE" # configured production brand
 
             if route == "STOCK":
                 assignments[lk] = {
@@ -138,7 +146,7 @@ def init_assignment_state(all_lines=None):
                     "route":       ROUTE_VENDOR,
                     "supplier_id": supp,
                     "supplier_name": str(line.get("supplier_name") or ""),
-                    "confirmed":   bool(supp),
+                    "confirmed":   True,
                 }
                 _any_auto = True
             elif route == "INHOUSE":
@@ -154,7 +162,7 @@ def init_assignment_state(all_lines=None):
                 assignments.get(_line_key(l, i), {}).get("confirmed")
                 for i, l in enumerate(all_lines)
             )
-            if _all_confirmed and not _has_job_card:
+            if _all_confirmed and (_has_job_card or _has_pipeline_started):
                 st.session_state.bo_assignments_locked = True
 
 
@@ -164,6 +172,8 @@ def _safe_unlock(all_lines) -> bool:
     Returns True if unlock succeeded, False if blocked.
     """
     if _any_line_has_job_card(all_lines):
+        return False
+    if _any_line_pipeline_started(all_lines):
         return False
     st.session_state.bo_assignments_locked = False
     return True
@@ -207,6 +217,29 @@ def _any_line_has_job_card(all_lines) -> bool:
     return False
 
 
+def _line_pipeline_started(line: dict) -> bool:
+    """True once supplier/lab/stock/in-house processing has moved beyond editable assignment."""
+    lp = _lens_params_dict(line)
+    route = str(line.get("manufacturing_route") or lp.get("manufacturing_route") or "").upper()
+    supplier_stage = str(
+        line.get("supplier_stage")
+        or lp.get("supplier_stage")
+        or lp.get("external_lab_stage")
+        or ""
+    ).upper()
+    repl_status = str(lp.get("replenishment_status") or "").upper()
+
+    if route in ("VENDOR", "EXTERNAL_LAB"):
+        return supplier_stage not in ("", "ORDER_PLACED", "PENDING", "ASSIGNED")
+    if route == "STOCK":
+        return repl_status in ("PO_SENT", "ORDERED", "PROCURED") or str(line.get("batch_status") or "").upper() in ("DISPATCHED", "BILLED")
+    return False
+
+
+def _any_line_pipeline_started(all_lines) -> bool:
+    return any(_line_pipeline_started(line) for line in (all_lines or []))
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════
@@ -216,8 +249,48 @@ def _line_key(line: Dict, idx: int) -> str:
     return f"{line.get('product_id', 'unk')}_{line.get('eye_side', 'B')}_{idx}"
 
 
+def _lens_params_dict(line: Dict) -> Dict:
+    lp = line.get("lens_params") or {}
+    if isinstance(lp, dict):
+        return lp
+    if isinstance(lp, str):
+        try:
+            parsed = json.loads(lp)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def _is_rx(line: Dict) -> bool:
-    return str(line.get("lens_item_type", "")).upper() == "RX"
+    lp = _lens_params_dict(line)
+    values = [
+        line.get("lens_item_type"),
+        line.get("item_type"),
+        line.get("batch_status"),
+        lp.get("lens_item_type"),
+        lp.get("item_type"),
+        lp.get("fulfillment_type"),
+        lp.get("batch_status"),
+    ]
+    for value in values:
+        text = str(value or "").strip().upper().replace("_", " ")
+        if text == "RX" or "RX ORDER" in text:
+            return True
+    return False
+
+
+def _configured_inhouse_brands() -> set[str]:
+    try:
+        from modules.settings.shop_master import get_inhouse_lab_brands
+        return get_inhouse_lab_brands()
+    except Exception:
+        return set()
+
+
+def _is_inhouse_lab_brand(line: Dict) -> bool:
+    brand = str(line.get("brand") or _lens_params_dict(line).get("brand") or "").strip().lower()
+    return bool(brand and brand in _configured_inhouse_brands())
 
 
 def _is_stock_allocated(line: Dict) -> bool:
@@ -238,16 +311,121 @@ def _is_stock_allocated(line: Dict) -> bool:
         return True
 
     # batch_no present → SKU was picked from inventory at punching time
-    _lp       = line.get("lens_params") or {}
-    _lp       = _lp if isinstance(_lp, dict) else {}
+    _lp       = _lens_params_dict(line)
+    _batch_status = str(line.get("batch_status") or _lp.get("batch_status") or "").upper()
+    if _batch_status == "ALLOCATED":
+        return True
+
     _batch_no = str(line.get("batch_no") or _lp.get("batch_no") or "").strip()
     if _batch_no:
+        return True
+
+    if line.get("batch_allocation") or _lp.get("batch_allocation"):
         return True
 
     # Fallback for lenses: allocation recorded in DB
     alloc  = int(line.get("allocated_qty") or 0)
     needed = int(line.get("billing_qty") or line.get("quantity") or 1)
     return alloc >= needed and needed > 0
+
+
+def _release_inventory_allocation(line: Dict, reason: str = "assignment_change") -> None:
+    """Release inventory_stock.allocated_qty for a line moving away from stock."""
+    try:
+        from modules.sql_adapter import run_write as _rw_release
+        lp = _lens_params_dict(line)
+        alloc_qty_total = int(line.get("allocated_qty") or 0)
+        alloc_rows = line.get("batch_allocation") or lp.get("batch_allocation") or []
+        if isinstance(alloc_rows, dict):
+            alloc_rows = [alloc_rows]
+        if not alloc_rows and alloc_qty_total > 0:
+            sid = str(lp.get("stock_id") or lp.get("batch_id") or "").strip()
+            bno = str(lp.get("batch_no") or line.get("batch_no") or "").strip()
+            alloc_rows = [{
+                "stock_id": sid,
+                "batch_id": sid,
+                "batch_no": bno,
+                "allocated_qty": alloc_qty_total,
+            }]
+
+        pid = str(line.get("product_id") or "").strip()
+        for alloc in alloc_rows:
+            if not isinstance(alloc, dict):
+                continue
+            qty = int(float(alloc.get("allocated_qty") or alloc.get("qty") or 0))
+            if qty <= 0:
+                continue
+            sid = str(alloc.get("stock_id") or alloc.get("batch_id") or "").strip()
+            bno = str(alloc.get("batch_no") or "").strip()
+            if sid:
+                _rw_release(
+                    """
+                    UPDATE inventory_stock
+                       SET allocated_qty = GREATEST(0, COALESCE(allocated_qty,0) - %(qty)s),
+                           updated_at = NOW()
+                     WHERE id = %(sid)s::uuid
+                    """,
+                    {"qty": qty, "sid": sid},
+                )
+            elif pid and bno:
+                _rw_release(
+                    """
+                    UPDATE inventory_stock
+                       SET allocated_qty = GREATEST(0, COALESCE(allocated_qty,0) - %(qty)s),
+                           updated_at = NOW()
+                     WHERE product_id = %(pid)s::uuid
+                       AND UPPER(TRIM(batch_no)) = UPPER(TRIM(%(bno)s))
+                    """,
+                    {"qty": qty, "pid": pid, "bno": bno},
+                )
+    except Exception as _rel_err:
+        log.warning("[assignment] release allocation failed (%s): %s", reason, _rel_err)
+
+
+def _has_stock_available(line: Dict) -> bool:
+    """True when inventory has enough stock for this product/power/SKU right now."""
+    product_id = str(line.get("product_id") or "")
+    needed = int(line.get("billing_qty") or line.get("quantity") or 1)
+    if not product_id or needed <= 0:
+        return False
+
+    lp = _lens_params_dict(line)
+    sku = str(line.get("batch_no") or lp.get("batch_no") or "").strip()
+    if sku:
+        try:
+            from modules.sql_adapter import run_query
+            rows = run_query(
+                """
+                SELECT COALESCE(quantity,0) - COALESCE(allocated_qty,0) AS available_qty
+                FROM inventory_stock
+                WHERE product_id=%(pid)s::uuid
+                  AND UPPER(TRIM(batch_no)) = UPPER(TRIM(%(sku)s))
+                  AND COALESCE(is_active, true)=true
+                LIMIT 1
+                """,
+                {"pid": product_id, "sku": sku},
+            ) or []
+            return bool(rows and int(rows[0].get("available_qty") or 0) >= needed)
+        except Exception:
+            return False
+
+    try:
+        from modules.batch_manager import get_batches_fifo
+        eye = None if _is_stock_only_product(line) else str(line.get("eye_side") or "").upper()
+        batches = get_batches_fifo(
+            product_id,
+            sph=line.get("sph"),
+            cyl=line.get("cyl"),
+            axis=line.get("axis"),
+            add_power=line.get("add_power"),
+            eye_side=eye,
+        )
+        if batches is not None and not batches.empty:
+            col = "available_qty" if "available_qty" in batches.columns else "quantity"
+            return int(batches[col].sum()) >= needed
+    except Exception:
+        pass
+    return False
 
 
 def _is_frame_line(line: Dict) -> bool:
@@ -399,6 +577,41 @@ def _get_ranked_suppliers_for_product(
     except Exception:
         pass
 
+    # Priority 1B: products.preferred_supplier_id — direct product attachment.
+    try:
+        from modules.sql_adapter import run_query
+        pref_rows = run_query(
+            """
+            SELECT p.preferred_supplier_id::text AS supplier_id,
+                   pt.party_name AS supplier_name
+            FROM products p
+            JOIN parties pt ON pt.id = p.preferred_supplier_id
+            WHERE p.id = %(pid)s::uuid
+              AND p.preferred_supplier_id IS NOT NULL
+              AND COALESCE(pt.is_active, true)=true
+            LIMIT 1
+            """,
+            {"pid": str(product_id)},
+        ) or []
+        if pref_rows:
+            pref_id = pref_rows[0]["supplier_id"]
+            all_sups = _get_suppliers()
+            extras = [s for s in all_sups if s["id"] != pref_id]
+            return [{
+                "id": pref_id,
+                "name": pref_rows[0]["supplier_name"],
+                "past_orders": 0,
+                "is_primary": True,
+                "notes": "Preferred supplier",
+                "rank": 1,
+            }] + [
+                {"id": s["id"], "name": s.get("name",""), "past_orders": 0,
+                 "is_primary": False, "notes": "", "rank": 99}
+                for s in extras
+            ]
+    except Exception:
+        pass
+
     # Priority 2: order history
     try:
         from modules.sql_adapter import run_query
@@ -517,39 +730,34 @@ def _get_job_card_routes_for_line(line: Dict):
     """
     Return (available_routes, default_route) based on product type.
 
-    Ophthalmic lens  → [Supplier, In-house, External Lab]   default=In-house
+    Stock allocated  → [Stock]                              default=Stock
+    RX order         → [Supplier]                           default=Supplier
+    In-house brand   → [In-house, External Lab]             default=In-house
+    Ophthalmic lens  → [Supplier]                           default=Supplier
     Stock-only item  → [Supplier, Stock]                     default=Stock (or Supplier)
-    Contact lens/RX  → handled separately by _is_rx()
     Everything else  → all 4 routes                          default=Supplier
     """
+    if _is_stock_allocated(line) or _has_stock_available(line):
+        return [ROUTE_STOCK], ROUTE_STOCK
+
+    if _is_rx(line):
+        return [ROUTE_VENDOR], ROUTE_VENDOR
+
+    if _is_ophthalmic_lens(line) and _is_inhouse_lab_brand(line):
+        saved = str(line.get("manufacturing_route") or "").upper()
+        routes = [ROUTE_INHOUSE, ROUTE_EXTERNAL_LAB]
+        return routes, saved if saved in routes else ROUTE_INHOUSE
+
     if _is_ophthalmic_lens(line):
-        # Ophthalmic lens routes — all four are valid:
-        # Stock        = pre-made lens available in inventory (allocated)
-        # In-house Lab = we surface/process in-house
-        # External Lab = send to external lab for processing
-        # Supplier     = direct from supplier (pre-made, ordered in)
-        routes = [ROUTE_STOCK, ROUTE_INHOUSE, ROUTE_EXTERNAL_LAB, ROUTE_VENDOR]
-        # Smart default: if batch_no set or already allocated from stock → STOCK
-        _lp_oph     = line.get("lens_params") or {}
-        _lp_oph     = _lp_oph if isinstance(_lp_oph, dict) else {}
-        _bn_oph     = str(line.get("batch_no") or _lp_oph.get("batch_no") or "").strip()
-        _alloc_oph  = int(line.get("allocated_qty") or 0)
-        _needed_oph = int(line.get("billing_qty") or line.get("quantity") or 1)
-        _bs_oph     = str(line.get("batch_status") or "").upper()
-        if _bn_oph or _alloc_oph >= _needed_oph or _bs_oph == "ALLOCATED":
-            default = ROUTE_STOCK
-        else:
-            # Fall back to whatever is already saved, else INHOUSE
-            _saved_route = str(line.get("manufacturing_route") or "").upper()
-            default = _saved_route if _saved_route in routes else ROUTE_INHOUSE
-        return routes, default
+        # Normal RX/non-stock ophthalmic products should go to supplier.
+        # In-house and External Lab are reserved for Shop Master configured brands.
+        return [ROUTE_VENDOR], ROUTE_VENDOR
 
     if _is_stock_only_product(line):
         # Frame/accessory: STOCK if batch_no is set (SKU picked at punching),
         # or if allocated_qty is filled (legacy lens-style allocation).
         # Never INHOUSE — no lab processing for frames/accessories.
-        _lp       = line.get("lens_params") or {}
-        _lp       = _lp if isinstance(_lp, dict) else {}
+        _lp       = _lens_params_dict(line)
         _batch_no = str(line.get("batch_no") or _lp.get("batch_no") or "").strip()
         _alloc    = int(line.get("allocated_qty") or 0)
         _needed   = int(line.get("billing_qty") or line.get("quantity") or 1)
@@ -559,8 +767,7 @@ def _get_job_card_routes_for_line(line: Dict):
     if _requires_batch_expiry(line):
         # Solutions / cleaners / drops: STOCK (FEFO batch) or VENDOR
         # Never INHOUSE — these are dispensed, not processed
-        _lp       = line.get("lens_params") or {}
-        _lp       = _lp if isinstance(_lp, dict) else {}
+        _lp       = _lens_params_dict(line)
         _batch_no = str(line.get("batch_no") or _lp.get("batch_no") or "").strip()
         _alloc    = int(line.get("allocated_qty") or 0)
         _needed   = int(line.get("billing_qty") or line.get("quantity") or 1)
@@ -656,9 +863,15 @@ def render_assignment_panel(order: Dict, all_lines: List[Dict]) -> None:
                 use_container_width=True,
                 help="Confirm all assignments and lock for saving"
             ):
-                _apply_all_assignments(order, all_lines)
-                st.session_state.bo_assignments_locked = True
-                st.rerun()
+                blockers = _assignment_blockers(all_lines)
+                if blockers:
+                    st.error("Assignment incomplete:")
+                    for msg in blockers:
+                        st.warning("• " + msg)
+                else:
+                    _apply_all_assignments(order, all_lines)
+                    st.session_state.bo_assignments_locked = True
+                    st.rerun()
         else:
             st.markdown(
                 "<div style='text-align:center;padding:6px 4px;"
@@ -734,9 +947,15 @@ def render_assignment_panel(order: Dict, all_lines: List[Dict]) -> None:
                 use_container_width=True,
                 key=f"confirm_assignments_{oid}",
             ):
-                _apply_all_assignments(order, all_lines)
-                st.session_state.bo_assignments_locked = True
-                st.rerun()
+                blockers = _assignment_blockers(all_lines)
+                if blockers:
+                    st.error("Assignment incomplete:")
+                    for msg in blockers:
+                        st.warning("• " + msg)
+                else:
+                    _apply_all_assignments(order, all_lines)
+                    st.session_state.bo_assignments_locked = True
+                    st.rerun()
         else:
             # Check if order is already confirmed
             current_status = order.get("status", "")
@@ -767,14 +986,17 @@ def render_assignment_panel(order: Dict, all_lines: List[Dict]) -> None:
     with col_unlock:
         if locked:
             _job_card_locked = _any_line_has_job_card(all_lines)
-            if _job_card_locked:
+            _pipeline_locked = _any_line_pipeline_started(all_lines)
+            if _job_card_locked or _pipeline_locked:
+                _lock_title = "Job card saved" if _job_card_locked else "Pipeline started"
+                _lock_hint = "Cancel job card first" if _job_card_locked else "Cancel/reverse supplier or stock flow first"
                 st.markdown(
                     "<div style='background:#1a0a00;border:1px solid #f97316;"
                     "border-radius:6px;padding:6px 12px;text-align:center'>"
                     "<span style='color:#fb923c;font-size:0.8rem;font-weight:700'>"
-                    "🔒 Job card saved<br>"
+                    f"🔒 {_lock_title}<br>"
                     "<span style='font-size:0.72rem;font-weight:400'>"
-                    "Cancel job card first</span></span></div>",
+                    f"{_lock_hint}</span></span></div>",
                     unsafe_allow_html=True
                 )
             else:
@@ -791,6 +1013,23 @@ def render_assignment_panel(order: Dict, all_lines: List[Dict]) -> None:
         _render_assignment_summary_chips(all_lines, oid)
 
 
+def _assignment_blockers(all_lines: List[Dict]) -> List[str]:
+    """Return human-readable blockers before assignments can be locked."""
+    blockers = []
+    assignments = st.session_state.get("bo_assignments", {})
+    for idx, line in enumerate(all_lines):
+        lk = _line_key(line, idx)
+        asgn = assignments.get(lk, {})
+        route = str(asgn.get("route") or line.get("manufacturing_route") or "").upper()
+        name = str(line.get("product_name") or "Product").split(" | ")[0]
+        eye = _eye_badge(line)
+        if route == ROUTE_STOCK and not (_is_stock_allocated(line) or _has_stock_available(line) or asgn.get("batch_allocation")):
+            blockers.append(f"{eye} {name} — stock not available/allotted")
+        elif not route:
+            blockers.append(f"{eye} {name} — route not selected")
+    return blockers
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # ROW RENDERER (unlocked / editing state)
 # ═══════════════════════════════════════════════════════════════════════
@@ -799,6 +1038,17 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
     """Render assignment rows — R and L side by side grouped by product."""
 
     assignments = st.session_state.bo_assignments
+
+    def _group_product_name(grp: Dict, fallback: str = "Product") -> str:
+        raw = (grp or {}).get("product_name")
+        if not raw:
+            for eye_key in ("R", "L"):
+                line = (grp or {}).get(eye_key)
+                if isinstance(line, dict) and line.get("product_name"):
+                    raw = line.get("product_name")
+                    break
+        name = str(raw or fallback).split(" | ")[0].strip()
+        return name or fallback
 
     # ── Group lines R/L by product ───────────────────────────────────
     # SERVICE lines are filtered out at render_assignment_panel entry — safe to iterate
@@ -810,7 +1060,7 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
         pid = line.get("product_id") or line.get("product_name", f"line_{idx}")
         if pid not in groups:
             groups[pid] = {
-                "product_name": line.get("product_name", "Unknown"),
+                "product_name": line.get("product_name") or "Unknown",
                 "R": None, "R_idx": None,
                 "L": None, "L_idx": None,
             }
@@ -825,7 +1075,7 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
             # Solo / unmatched — own group
             solo_key = f"{pid}_{idx}"
             groups[solo_key] = {
-                "product_name": line.get("product_name", "Unknown"),
+                "product_name": line.get("product_name") or "Unknown",
                 "R": line, "R_idx": idx,
                 "L": None,  "L_idx": None,
             }
@@ -885,6 +1135,12 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
 
                 # Use assignment route as canonical (may differ from line if user just changed it)
                 _cur_asgn_route = str(assignments.get(_fl_lk, {}).get("route") or _fl_route).upper()
+                if _fl_sku and _cur_asgn_route == ROUTE_VENDOR and _has_stock_available(_fl):
+                    # Legacy/stale frame rows sometimes carry VENDOR even though the
+                    # selected SKU exists in inventory. Frames are stock-first; if
+                    # stock is available, bring the assignment back to STOCK.
+                    _cur_asgn_route = ROUTE_STOCK
+                    assignments[_fl_lk] = {"route": ROUTE_STOCK, "confirmed": True}
 
                 # ── Status chip ───────────────────────────────────────
                 # A frame is "from stock" when:
@@ -912,7 +1168,7 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                         f"border-radius:6px;padding:6px 12px'>"
                         f"<div style='display:flex;justify-content:space-between;align-items:center'>"
                         f"<span style='color:#a78bfa;font-size:0.82rem;font-weight:700'>"
-                        f"🖼 {grp['product_name'].split(' | ')[0]}</span>"
+                        f"🖼 {_group_product_name(grp)}</span>"
                         f"<span style='color:#86efac;font-size:0.72rem'>{_stock_sub}"
                         f"</span></div></div>",
                         unsafe_allow_html=True
@@ -945,9 +1201,8 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                         label_visibility="collapsed",
                     )
                     if _new_route == ROUTE_VENDOR:
-                        _render_supplier_selector(_fl, _fl_idx, _fl_lk, assignments, oid, label="Supplier")
-                        if assignments.get(_fl_lk, {}).get("supplier_id"):
-                            assignments[_fl_lk]["confirmed"] = True
+                        assignments[_fl_lk] = {"route": ROUTE_VENDOR, "confirmed": True}
+                        st.caption("Supplier will be selected by procurement team in Production → Supplier.")
                     else:
                         assignments[_fl_lk] = {"route": ROUTE_STOCK, "confirmed": True}
                     continue
@@ -961,7 +1216,7 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                         f"border-radius:6px;padding:6px 12px'>"
                         f"<div style='display:flex;justify-content:space-between;align-items:center'>"
                         f"<span style='color:#a78bfa;font-size:0.82rem;font-weight:700'>"
-                        f"🖼 {grp['product_name'].split(' | ')[0]}</span>"
+                        f"🖼 {_group_product_name(grp)}</span>"
                         f"<span style='color:#fcd34d;font-size:0.72rem'>"
                         f"🏭 {'Via: '+_supp_label if _supp_label else 'Assign Supplier'}"
                         f"{'  · SKU: '+_fl_sku if _fl_sku else ''}"
@@ -982,9 +1237,8 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                         label_visibility="collapsed",
                     )
                     if _new_route == ROUTE_VENDOR:
-                        _render_supplier_selector(_fl, _fl_idx, _fl_lk, assignments, oid, label="Supplier")
-                        if assignments.get(_fl_lk, {}).get("supplier_id"):
-                            assignments[_fl_lk]["confirmed"] = True
+                        assignments[_fl_lk] = {"route": ROUTE_VENDOR, "confirmed": True}
+                        st.caption("Supplier will be selected by procurement team in Production → Supplier.")
                     else:
                         # Operator switched to Stock — auto-confirm (no extra button)
                         _apply_shift(
@@ -1009,27 +1263,26 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                         key=f"frame_route_chg_{_fl_lk}",
                     )
                     if _chg_route == ROUTE_VENDOR:
-                        _render_supplier_selector(_fl, _fl_idx, _fl_lk, assignments, oid,
-                                                  label="Supplier")
+                        st.caption("Supplier will be selected by procurement team in Production → Supplier.")
                     if _chg_route != ROUTE_STOCK:
                         _apply_shift(
                             line=_fl, new_route=_chg_route,
-                            supplier_id=assignments.get(_fl_lk, {}).get("supplier_id"),
-                            supplier_name=assignments.get(_fl_lk, {}).get("supplier_name"),
+                            supplier_id=None,
+                            supplier_name=None,
                             order=order, lk=_fl_lk,
                         )
                         assignments[_fl_lk] = {
                             "route":         _chg_route,
                             "confirmed":     True,
-                            "supplier_id":   assignments.get(_fl_lk, {}).get("supplier_id", ""),
-                            "supplier_name": assignments.get(_fl_lk, {}).get("supplier_name", ""),
+                            "supplier_id":   "",
+                            "supplier_name": "",
                         }
                         st.rerun()
 
             continue  # Skip full lens card rendering for frames
 
         # ── Full card for lens R/L lines ─────────────────────────
-        st.markdown(f"#### 👁️ {grp['product_name'].split(' | ')[0]}")
+        st.markdown(f"#### 👁️ {_group_product_name(grp)}")
 
         if has_r and has_l:
             col_r, col_l = st.columns(2)
@@ -1066,7 +1319,7 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                             f"<div style='font-weight:700;color:#94a3b8;"
                             f"font-size:0.8rem'>{eye_title}</div>"
                             f"<div style='color:#e2e8f0;font-size:0.85rem'>"
-                            f"{grp['product_name'].split(' | ')[0]}"
+                            f"{_group_product_name(grp)}"
                             + (f"  <code style='font-size:0.75rem'>{pwr}</code>" if pwr else "")
                             + "</div>",
                             unsafe_allow_html=True
@@ -1076,7 +1329,20 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
 
                     # ── CASE 1: Stock-allocated ───────────────────────
                     if _is_stock_allocated(line):
+                        _ba_for_chip = (
+                            line.get("batch_allocation")
+                            or _lens_params_dict(line).get("batch_allocation")
+                            or []
+                        )
                         alloc_qty = int(line.get("allocated_qty") or 0)
+                        if alloc_qty <= 0 and isinstance(_ba_for_chip, list):
+                            alloc_qty = sum(
+                                int(float((b or {}).get("allocated_qty") or 0))
+                                for b in _ba_for_chip
+                                if isinstance(b, dict)
+                            )
+                            if alloc_qty > 0:
+                                line["allocated_qty"] = alloc_qty
                         st.success(f"📦 Stock — {alloc_qty} allotted")
                         with st.expander("⚙️ Shift route?", expanded=False):
                             _render_shift_inline(line, idx, lk, order, all_lines, oid)
@@ -1085,7 +1351,11 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                     # ── CASE 2: RX order ─────────────────────────────
                     if _is_rx(line):
                         st.info("📋 **RX Order** — always fulfilled by Supplier")
-                        _render_supplier_selector(line, idx, lk, assignments, oid, force=True)
+                        if lk not in assignments:
+                            assignments[lk] = {}
+                        assignments[lk]["route"] = ROUTE_VENDOR
+                        assignments[lk]["confirmed"] = True
+                        st.caption("Supplier will be selected by procurement team in Production → Supplier.")
                         continue
 
                     # ── CASE 3: Normal line — smart route radio ────────
@@ -1130,7 +1400,8 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                     assignments[lk]["route"] = chosen_route
 
                     if chosen_route == ROUTE_VENDOR:
-                        _render_supplier_selector(line, idx, lk, assignments, oid)
+                        assignments[lk]["confirmed"] = True
+                        st.caption("Supplier will be selected by procurement team in Production → Supplier.")
 
                     elif chosen_route == ROUTE_INHOUSE:
                         note = st.text_input(
@@ -1143,10 +1414,9 @@ def _render_assignment_rows(order: Dict, all_lines: List[Dict], oid: str):
                         assignments[lk]["job_type"]  = "INHOUSE"
 
                     elif chosen_route == ROUTE_EXTERNAL_LAB:
-                        _render_supplier_selector(
-                            line, idx, lk, assignments, oid, label="External Lab / Supplier"
-                        )
                         assignments[lk]["job_type"] = "EXTERNAL_LAB"
+                        assignments[lk]["confirmed"] = True
+                        st.caption("External supplier/lab will be selected in Production → External Supplier.")
 
                     elif chosen_route == ROUTE_STOCK:
                         # ── Expiry-tracked products (solutions, cleaners, drops):
@@ -1424,16 +1694,20 @@ def _render_supplier_selector(
         else:
             option_labels[s["id"]] = name
 
-    # Auto-select: saved → primary → first in list
+    # Auto-select only when product has a mapped/primary supplier.
+    # Otherwise stay blank so Backoffice does not silently confirm a supplier.
     saved_id = assignments.get(lk, {}).get("supplier_id")
     if not saved_id:
-        # Auto-fill primary supplier
         primary = next((s for s in suppliers if s.get("is_primary")), None)
         if primary:
             saved_id = primary["id"]
             if lk not in assignments: assignments[lk] = {}
             assignments[lk]["supplier_id"]   = saved_id
             assignments[lk]["supplier_name"] = option_labels.get(saved_id, "")
+        else:
+            saved_id = ""
+            options = [""] + options
+            option_labels[""] = "— Select supplier —"
     try:
         default_idx = options.index(saved_id) if saved_id in options else 0
     except (ValueError, TypeError):
@@ -1450,7 +1724,8 @@ def _render_supplier_selector(
     if lk not in assignments:
         assignments[lk] = {}
     assignments[lk]["supplier_id"]   = chosen_id
-    assignments[lk]["supplier_name"] = option_labels.get(chosen_id, chosen_id)
+    assignments[lk]["supplier_name"] = "" if not chosen_id else option_labels.get(chosen_id, chosen_id)
+    assignments[lk]["confirmed"] = bool(chosen_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1618,14 +1893,14 @@ def _render_frame_sku_editor(
                             UPDATE inventory_stock
                             SET allocated_qty = GREATEST(0, COALESCE(allocated_qty,0) - %(qty)s)
                             WHERE product_id = %(pid)s::uuid
-                              AND batch_no   = %(bno)s
+                              AND UPPER(TRIM(batch_no)) = UPPER(TRIM(%(bno)s))
                         """, {"pid": _old_pid, "bno": current_sku, "qty": _old_qty})
                         # Reserve new allocation
                         _rw_alloc_rev("""
                             UPDATE inventory_stock
                             SET allocated_qty = COALESCE(allocated_qty,0) + %(qty)s
                             WHERE product_id = %(pid)s::uuid
-                              AND batch_no   = %(bno)s
+                              AND UPPER(TRIM(batch_no)) = UPPER(TRIM(%(bno)s))
                         """, {"pid": _old_pid, "bno": chosen_sku, "qty": _old_qty})
                 except Exception as _alloc_e:
                     import logging
@@ -1710,22 +1985,19 @@ def _render_shift_inline(
     )
     new_route = all_routes[all_labels.index(new_label)]
 
+    # Backoffice decides ROUTE only. Supplier selection belongs to the procurement
+    # team in Production → Supplier / External Supplier tab. We leave supplier
+    # blank here and stamp it later when the production team places the order.
     supplier_id   = None
     supplier_name = None
 
     if new_route in (ROUTE_VENDOR, ROUTE_EXTERNAL_LAB):
-        suppliers = _get_ranked_suppliers_for_product(line.get("product_id"))
-        if suppliers:
-            opts   = [s["id"] for s in suppliers]
-            olabels = {s["id"]: s["name"] for s in suppliers}
-            sid = st.selectbox(
-                "Supplier",
-                opts,
-                format_func=lambda x: olabels.get(x, x),
-                key=f"shift_supplier_{lk}_{oid}",
-            )
-            supplier_id   = sid
-            supplier_name = olabels.get(sid, sid)
+        _route_caption = (
+            "🏭 Supplier will be selected by procurement team in **Production → Supplier**."
+            if new_route == ROUTE_VENDOR
+            else "🧪 External supplier/lab will be selected in **Production → External Supplier**."
+        )
+        st.caption(_route_caption)
 
     if st.button(
         f"⚡ Apply Shift",
@@ -1754,16 +2026,74 @@ def _apply_shift(
 ):
     """
     Mutate the line dict and re-categorise order.
-    If shifting away from STOCK: clear batch_allocation so stock is freed.
+    If shifting away from STOCK: clear batch_allocation so stock is freed,
+    and clear replenishment pipeline state in DB.
+    If shifting away from VENDOR/EXTERNAL_LAB: clear supplier pipeline state in DB.
     If shifting to STOCK: only allowed if batch already allocated elsewhere.
     """
     old_route = line.get("manufacturing_route")
 
     # If leaving stock — clear allocation so inventory is not double-counted
     if old_route == ROUTE_STOCK and new_route != ROUTE_STOCK:
+        _release_inventory_allocation(line, "route_shift")
         line["batch_allocation"] = []
         line["allocated_qty"]    = 0
         line["batch_status"]     = "PENDING"
+        # Clear stock replenishment pipeline state in DB so the line doesn't
+        # continue in Stock tab as PO_SENT/ORDERED after route is changed.
+        _lid = str(line.get("line_id") or line.get("id") or "")
+        if _lid and len(_lid) > 10:
+            try:
+                import json as _json_shift
+                from modules.sql_adapter import run_query as _rq_shift, run_write as _rw_shift
+                _lp_rows = _rq_shift(
+                    "SELECT COALESCE(lens_params,'{}')::text AS lp FROM order_lines WHERE id=%(lid)s::uuid LIMIT 1",
+                    {"lid": _lid}
+                ) or []
+                _lp_s = _json_shift.loads(_lp_rows[0]["lp"]) if _lp_rows else {}
+                # Only clear if not already past ORDERED (PROCURED lines should not be cleared)
+                _cur_repl = str(_lp_s.get("replenishment_status") or "").upper()
+                if _cur_repl not in ("PROCURED", "PURCHASE_ACKED", "READY_FOR_BILLING"):
+                    for _clr_key in (
+                        "replenishment_status", "replenishment_po_no",
+                        "supplier_confirmation_no", "supplier_confirmed_at",
+                    ):
+                        _lp_s.pop(_clr_key, None)
+                    _rw_shift(
+                        "UPDATE order_lines SET lens_params=%(lp)s::jsonb WHERE id=%(lid)s::uuid",
+                        {"lp": _json_shift.dumps(_lp_s), "lid": _lid}
+                    )
+            except Exception as _se:
+                import logging as _slog
+                _slog.getLogger(__name__).warning(f"[shift] stock state clear failed for {_lid}: {_se}")
+
+    # If leaving VENDOR/EXTERNAL_LAB — clear supplier pipeline state in DB
+    elif old_route in (ROUTE_VENDOR, ROUTE_EXTERNAL_LAB) and new_route not in (ROUTE_VENDOR, ROUTE_EXTERNAL_LAB):
+        _lid = str(line.get("line_id") or line.get("id") or "")
+        if _lid and len(_lid) > 10:
+            try:
+                import json as _json_shift2
+                from modules.sql_adapter import run_query as _rq_shift2, run_write as _rw_shift2
+                _lp_rows2 = _rq_shift2(
+                    "SELECT COALESCE(lens_params,'{}')::text AS lp FROM order_lines WHERE id=%(lid)s::uuid LIMIT 1",
+                    {"lid": _lid}
+                ) or []
+                _lp_s2 = _json_shift2.loads(_lp_rows2[0]["lp"]) if _lp_rows2 else {}
+                # Only clear if not yet received/procured
+                _cur_stage = str(_lp_s2.get("supplier_stage") or "").upper()
+                if _cur_stage not in ("RECEIVED", "INSPECTION", "READY_FOR_BILLING", "READY_TO_BILL"):
+                    for _clr_key2 in (
+                        "supplier_stage", "supplier_order_no",
+                        "supplier_confirmation_no", "supplier_confirmed_at",
+                    ):
+                        _lp_s2.pop(_clr_key2, None)
+                    _rw_shift2(
+                        "UPDATE order_lines SET lens_params=%(lp)s::jsonb WHERE id=%(lid)s::uuid",
+                        {"lp": _json_shift2.dumps(_lp_s2), "lid": _lid}
+                    )
+            except Exception as _se2:
+                import logging as _slog2
+                _slog2.getLogger(__name__).warning(f"[shift] vendor state clear failed for {_lid}: {_se2}")
 
     line["manufacturing_route"] = new_route
 
@@ -1790,6 +2120,17 @@ def _apply_shift(
     )
     order["lines"] = all_lines
     categorize_order_lines(order)
+    try:
+        from modules.backoffice.backoffice_helpers import ensure_order_production_refs
+        ensure_order_production_refs(
+            order_no=str(order.get("order_no") or ""),
+            order_id=str(order.get("id") or order.get("order_id") or ""),
+        )
+    except Exception as _prod_ref_shift_err:
+        import logging as _prod_ref_log
+        _prod_ref_log.getLogger(__name__).warning(
+            f"[assignment] production_ref fill after route shift failed: {_prod_ref_shift_err}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1881,6 +2222,9 @@ def _apply_all_assignments(order: Dict, all_lines: List[Dict]):
         if asgn.get("supplier_id"):
             line["supplier_id"]   = asgn["supplier_id"]
             line["supplier_name"] = asgn.get("supplier_name", "")
+        elif route in (ROUTE_VENDOR, ROUTE_EXTERNAL_LAB):
+            line.pop("supplier_id", None)
+            line.pop("supplier_name", None)
 
         if asgn.get("job_notes"):
             line["job_notes"] = asgn["job_notes"]
@@ -1902,10 +2246,81 @@ def _apply_all_assignments(order: Dict, all_lines: List[Dict]):
                         {"lid": _lid}
                     ) or []
                     _lp = _json.loads(_lp_row[0]["lp"]) if _lp_row else {}
+                    _old_route_db = str(_lp.get("manufacturing_route") or "").upper()
                     _lp["manufacturing_route"] = route
                     if asgn.get("supplier_id"):
                         _lp["supplier_id"]   = asgn["supplier_id"]
                         _lp["supplier_name"] = asgn.get("supplier_name","")
+                    elif route in (ROUTE_VENDOR, ROUTE_EXTERNAL_LAB):
+                        _lp.pop("supplier_id", None)
+                        _lp.pop("supplier_name", None)
+                        # Assignment only chooses the route. The supplier stage must
+                        # be stamped by Production when an order is actually sent.
+                        for _stage_key in ("supplier_stage", "external_lab_stage"):
+                            _lp.pop(_stage_key, None)
+                        # ── Clear stale pipeline state when route changes ──────
+                    # Prevents old route lines from ghost-appearing in Stock
+                    # replenishment or Supplier tabs after a reallot.
+                    if _old_route_db and _old_route_db != route.upper():
+                        if _old_route_db == "STOCK":
+                            _release_inventory_allocation(line, "assignment_save_route_change")
+                            # Clear stock replenishment state (only if not yet PROCURED)
+                            _cur_repl = str(_lp.get("replenishment_status") or "").upper()
+                            if _cur_repl not in ("PROCURED", "PURCHASE_ACKED", "READY_FOR_BILLING"):
+                                for _clr in ("replenishment_status", "replenishment_po_no",
+                                             "supplier_confirmation_no", "supplier_confirmed_at"):
+                                    _lp.pop(_clr, None)
+                        elif _old_route_db in ("VENDOR", "EXTERNAL_LAB"):
+                            # Clear supplier pipeline state (only if not yet received)
+                            _cur_stage = str(_lp.get("supplier_stage") or "").upper()
+                            if _cur_stage not in ("RECEIVED", "INSPECTION", "READY_FOR_BILLING", "READY_TO_BILL"):
+                                for _clr2 in ("supplier_stage", "supplier_order_no",
+                                              "supplier_confirmation_no", "supplier_confirmed_at"):
+                                    _lp.pop(_clr2, None)
+                                # Cancel open PO items linked to this line so PO reports
+                                # don't ghost-show stale supplier orders after reassignment.
+                                try:
+                                    # Step 1: cancel the specific item rows for this line
+                                    _rw_asgn(
+                                        """
+                                        UPDATE supplier_order_items
+                                           SET item_status = 'CANCELLED'
+                                         WHERE customer_line_id::text = %(lid)s
+                                           AND UPPER(COALESCE(item_status, ''))
+                                               NOT IN ('RECEIVED','CLOSED','CANCELLED','VOID','PROCURED')
+                                        """,
+                                        {"lid": _lid}
+                                    )
+                                    # Step 2: cancel parent PO if it now has no remaining
+                                    # active items (i.e. every item is terminal).
+                                    # Only cancel POs that are not already finalised.
+                                    _rw_asgn(
+                                        """
+                                        UPDATE supplier_orders
+                                           SET status = 'CANCELLED'
+                                         WHERE id IN (
+                                               SELECT DISTINCT soi.supplier_order_id
+                                                 FROM supplier_order_items soi
+                                                WHERE soi.customer_line_id::text = %(lid)s
+                                         )
+                                           AND status NOT IN ('RECEIVED','CLOSED','CANCELLED','VOID')
+                                           AND NOT EXISTS (
+                                               SELECT 1
+                                                 FROM supplier_order_items active_soi
+                                                WHERE active_soi.supplier_order_id = supplier_orders.id
+                                                  AND UPPER(COALESCE(active_soi.item_status, ''))
+                                                      NOT IN ('RECEIVED','CLOSED','CANCELLED',
+                                                              'VOID','PROCURED')
+                                         )
+                                        """,
+                                        {"lid": _lid}
+                                    )
+                                except Exception as _po_cancel_err:
+                                    import logging as _pc_log
+                                    _pc_log.getLogger(__name__).warning(
+                                        f"[assignment] PO cancel on reassign failed "
+                                        f"for {_lid}: {_po_cancel_err}"
+                                    )
                     _rw_asgn(
                         "UPDATE order_lines SET lens_params=%(lp)s::jsonb "
                         "WHERE id=%(lid)s::uuid",
@@ -1931,6 +2346,17 @@ def _apply_all_assignments(order: Dict, all_lines: List[Dict]):
                 )
 
     order["lines"] = all_lines
+    try:
+        from modules.backoffice.backoffice_helpers import ensure_order_production_refs
+        ensure_order_production_refs(
+            order_no=str(order.get("order_no") or ""),
+            order_id=str(order.get("id") or order.get("order_id") or ""),
+        )
+    except Exception as _prod_ref_assign_err:
+        import logging as _prod_ref_log2
+        _prod_ref_log2.getLogger(__name__).warning(
+            f"[assignment] production_ref fill after assignment save failed: {_prod_ref_assign_err}"
+        )
     categorize_order_lines(order)
 
 

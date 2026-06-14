@@ -19,8 +19,8 @@ Usage:
     from modules.loaders.smart.ai_change_advisor import advise
 
     advice = advise(change_report)
-    print(advice.summary)
-    print(advice.recommendation)
+    logger.debug(advice.summary)
+    logger.debug(advice.recommendation)
     # In UI: show advice.prompt_text and Yes/No buttons
 """
 

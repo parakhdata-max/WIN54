@@ -149,11 +149,47 @@ def _check_duplicate_invoice_lines() -> Tuple[int, list]:
     return len(rows), rows
 
 
+def _check_document_number_integrity() -> Tuple[int, list]:
+    try:
+        from modules.db.order_number_registry import audit_document_number_integrity
+        rows = audit_document_number_integrity() or []
+        return len(rows), rows
+    except Exception as exc:
+        return 1, [{"error": str(exc)}]
+
+
 # ── Render ─────────────────────────────────────────────────────────────────────
 
 def render_system_health():
     st.title("🩺 ERP System Health Monitor")
     st.caption(f"Last checked: {date.today().strftime('%d %b %Y')} — All checks should show ✅ OK")
+
+    # ── PostgreSQL / deployment health ───────────────────────────────────────
+    try:
+        from modules.sql_adapter import get_database_info
+        dbi = get_database_info() or {}
+        st.markdown("### PostgreSQL Health")
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Mode", str(dbi.get("deployment_mode") or "—"))
+        d2.metric("Database", str(dbi.get("database") or "—"))
+        d3.metric("Connections", f"{int(dbi.get('active_connections') or 0)} / {int(dbi.get('max_connections') or 0)}")
+        d4.metric("Waiting Locks", int(dbi.get("waiting_locks") or 0))
+        _size_mb = int(dbi.get("db_size_bytes") or 0) / (1024 * 1024)
+        d5.metric("DB Size", f"{_size_mb:,.1f} MB")
+        st.caption(
+            f"Host: {dbi.get('host') or '—'} · Server: {dbi.get('server_addr') or '—'}:{dbi.get('server_port') or '—'} · "
+            f"Role: {'Standby/replica' if dbi.get('standby') else 'Primary'}"
+        )
+        if str(dbi.get("status")) != "ok":
+            st.error(f"PostgreSQL connection issue: {dbi.get('error') or 'unknown'}")
+        elif int(dbi.get("waiting_locks") or 0) > 0:
+            st.warning("PostgreSQL has waiting locks. If saves feel stuck, check long transactions before repeated posting.")
+        elif int(dbi.get("max_connections") or 0) and int(dbi.get("active_connections") or 0) > int(dbi.get("max_connections") or 1) * 0.8:
+            st.warning("PostgreSQL connection usage is high. LAN/cloud workers may need pooling or old sessions closed.")
+        else:
+            st.success("PostgreSQL connection health looks OK.")
+    except Exception as _dbi_e:
+        st.warning(f"PostgreSQL health unavailable: {_dbi_e}")
 
     checks = [
         ("Overbilling Errors",              _check_overbilling),
@@ -166,6 +202,7 @@ def render_system_health():
         ("Negative Inventory Stock",         _check_negative_stock),
         ("Duplicate Challan Lines",          _check_duplicate_challan_lines),
         ("Duplicate Invoice Lines",          _check_duplicate_invoice_lines),
+        ("Document Number Integrity",        _check_document_number_integrity),
     ]
 
     results = []

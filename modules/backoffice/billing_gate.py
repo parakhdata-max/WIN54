@@ -60,13 +60,20 @@ def _fetch_order_lines(order_id_text: str) -> List[Dict]:
         SELECT ol.id, ol.eye_side,
                ol.quantity, ol.unit_price, ol.total_price, ol.status,
                ol.allocated_qty, ol.ready_qty, ol.billed_qty, ol.dispatched_qty,
-               p.product_name, p.box_size, p.unit,
+               COALESCE(p.product_name,
+                        ol.lens_params->>'service_display_name',
+                        ol.lens_params->>'display_product_name',
+                        ol.lens_params->>'service_description',
+                        'Service') AS product_name,
+               COALESCE(p.box_size, 1) AS box_size,
+               COALESCE(p.unit, CASE WHEN COALESCE(ol.is_service_line,FALSE) THEN 'SERVICE' ELSE 'PCS' END) AS unit,
                COALESCE(ol.is_service_line, FALSE)   AS is_service_line,
                COALESCE(o.order_source, '')           AS order_source
         FROM order_lines ol
         JOIN orders o   ON o.id  = ol.order_id
-        JOIN products p ON p.id  = ol.product_id
+        LEFT JOIN products p ON p.id  = ol.product_id
         WHERE o.order_no = %(ono)s
+          AND COALESCE(ol.is_deleted, FALSE) = FALSE
         ORDER BY ol.eye_side, ol.id
     """, {"ono": order_id_text})
 
@@ -187,7 +194,8 @@ def render_billing_gate(order: Dict):
     if not db_lines:
         all_lines = (order.get("stock_lines", []) +
                      order.get("inhouse_lines", []) +
-                     order.get("lab_order_lines", []))
+                     order.get("lab_order_lines", []) +
+                     order.get("service_lines", []))
         if not all_lines:
             st.info("No line items found for billing.")
             return

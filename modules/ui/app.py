@@ -321,6 +321,105 @@ section[data-testid="stSidebar"] .stRadio input[type="radio"] {
 </style>
 """, unsafe_allow_html=True)
 
+# App-wide readability pass: keep muted text/dividers visible on light panels.
+st.markdown("""
+<style>
+:root {
+    --dv-muted-readable: #374151;
+    --dv-muted-readable-strong: #1f2937;
+    --dv-line-readable: #6b7280;
+}
+
+[data-testid="stCaptionContainer"],
+[data-testid="stMarkdownContainer"] small,
+[data-testid="stMarkdownContainer"] .caption,
+[data-testid="stMarkdownContainer"] [style*="color:#94a3b8"],
+[data-testid="stMarkdownContainer"] [style*="color: #94a3b8"],
+[data-testid="stMarkdownContainer"] [style*="color:#9ca3af"],
+[data-testid="stMarkdownContainer"] [style*="color: #9ca3af"],
+[data-testid="stMarkdownContainer"] [style*="color:#cbd5e1"],
+[data-testid="stMarkdownContainer"] [style*="color: #cbd5e1"],
+[data-testid="stMarkdownContainer"] [style*="color:gray"],
+[data-testid="stMarkdownContainer"] [style*="color: gray"],
+[data-testid="stMarkdownContainer"] [style*="color:grey"],
+[data-testid="stMarkdownContainer"] [style*="color: grey"] {
+    color: var(--dv-muted-readable) !important;
+}
+
+[data-testid="stAppViewContainer"] [style*="color:#94a3b8"],
+[data-testid="stAppViewContainer"] [style*="color: #94a3b8"],
+[data-testid="stAppViewContainer"] [style*="color:#9ca3af"],
+[data-testid="stAppViewContainer"] [style*="color: #9ca3af"],
+[data-testid="stAppViewContainer"] [style*="color:#cbd5e1"],
+[data-testid="stAppViewContainer"] [style*="color: #cbd5e1"],
+[data-testid="stAppViewContainer"] [style*="color:#64748b"],
+[data-testid="stAppViewContainer"] [style*="color: #64748b"],
+[data-testid="stAppViewContainer"] [style*="color:#6b7280"],
+[data-testid="stAppViewContainer"] [style*="color: #6b7280"],
+[data-testid="stAppViewContainer"] [style*="color:gray"],
+[data-testid="stAppViewContainer"] [style*="color: gray"],
+[data-testid="stAppViewContainer"] [style*="color:grey"],
+[data-testid="stAppViewContainer"] [style*="color: grey"] {
+    color: var(--dv-muted-readable) !important;
+}
+
+[data-testid="stMarkdownContainer"] [style*="border-color:#e2e8f0"],
+[data-testid="stMarkdownContainer"] [style*="border-color: #e2e8f0"],
+[data-testid="stMarkdownContainer"] [style*="border-color:#cbd5e1"],
+[data-testid="stMarkdownContainer"] [style*="border-color: #cbd5e1"],
+[data-testid="stMarkdownContainer"] [style*="border-color:#e5e7eb"],
+[data-testid="stMarkdownContainer"] [style*="border-color: #e5e7eb"],
+[data-testid="stMarkdownContainer"] [style*="border:1px solid #e5e7eb"],
+[data-testid="stMarkdownContainer"] [style*="border: 1px solid #e5e7eb"],
+[data-testid="stMarkdownContainer"] [style*="border-bottom:1px solid #f3f4f6"],
+[data-testid="stMarkdownContainer"] [style*="border-bottom: 1px solid #f3f4f6"],
+[data-testid="stMarkdownContainer"] [style*="border-top:1px solid #f3f4f6"],
+[data-testid="stMarkdownContainer"] [style*="border-top: 1px solid #f3f4f6"],
+hr {
+    border-color: var(--dv-line-readable) !important;
+}
+
+[data-testid="stAppViewContainer"] [style*="border-color:#e2e8f0"],
+[data-testid="stAppViewContainer"] [style*="border-color: #e2e8f0"],
+[data-testid="stAppViewContainer"] [style*="border-color:#cbd5e1"],
+[data-testid="stAppViewContainer"] [style*="border-color: #cbd5e1"],
+[data-testid="stAppViewContainer"] [style*="border-color:#e5e7eb"],
+[data-testid="stAppViewContainer"] [style*="border-color: #e5e7eb"],
+[data-testid="stAppViewContainer"] [style*="border:1px solid #e5e7eb"],
+[data-testid="stAppViewContainer"] [style*="border: 1px solid #e5e7eb"],
+[data-testid="stAppViewContainer"] [style*="border-bottom:1px solid #f3f4f6"],
+[data-testid="stAppViewContainer"] [style*="border-bottom: 1px solid #f3f4f6"],
+[data-testid="stAppViewContainer"] [style*="border-top:1px solid #f3f4f6"],
+[data-testid="stAppViewContainer"] [style*="border-top: 1px solid #f3f4f6"] {
+    border-color: var(--dv-line-readable) !important;
+}
+
+div[data-testid="stCheckbox"],
+div[data-testid="stCheckbox"] *,
+[data-testid="stWidgetLabel"],
+[data-testid="stWidgetLabel"] * {
+    opacity: 1 !important;
+}
+
+div[data-testid="stCheckbox"] label,
+div[data-testid="stCheckbox"] label *,
+div[data-testid="stCheckbox"] p,
+div[data-testid="stCheckbox"] span,
+[data-testid="stWidgetLabel"],
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] span {
+    color: var(--dv-muted-readable-strong) !important;
+}
+
+div[data-testid="stCheckbox"] [aria-disabled="true"],
+div[data-testid="stCheckbox"] [disabled],
+div[data-testid="stCheckbox"] [data-disabled="true"] {
+    opacity: 1 !important;
+    color: var(--dv-muted-readable-strong) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ── User pill ─────────────────────────────────────────────────────────────
 _role_color = _ROLE_COLORS.get(_role, "#6b7280")
 st.sidebar.markdown(

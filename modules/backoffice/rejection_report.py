@@ -299,3 +299,57 @@ def render_rejection_report():
             )
         except Exception as e:
             st.error(f"Export failed: {e}")
+
+    # ── Rejection Bin (material-side counterpart) ────────────────────────
+    st.markdown("---")
+    st.markdown("### Rejection Bin - Material Status")
+    st.caption(
+        "Source: production_rejection_bin. Each row is one rejected lens/item. "
+        "Use status later to mark items SCRAPPED or RECLAIMED."
+    )
+
+    try:
+        bin_rows = _q("""
+            SELECT b.id::text AS bin_id,
+                   b.rejected_at::date AS rej_date,
+                   b.status,
+                   b.eye_side,
+                   b.qty,
+                   COALESCE(p.product_name, '—') AS product_name,
+                   COALESCE(p.category, '—') AS category,
+                   COALESCE(o.order_no, '—') AS order_no,
+                   COALESCE(b.reason, '—') AS reason,
+                   COALESCE(b.rejected_by, '—') AS rejected_by,
+                   b.blank_id::text AS blank_id
+            FROM production_rejection_bin b
+            LEFT JOIN products p ON p.id = b.product_id
+            LEFT JOIN orders o ON o.id = b.order_id
+            WHERE DATE(b.rejected_at) BETWEEN %(from)s AND %(to)s
+            ORDER BY b.rejected_at DESC
+        """, {"from": str(date_from), "to": str(date_to)})
+    except Exception as e:
+        st.info(
+            "Rejection bin table not yet available. Run migration "
+            f"0025_production_rejection_bin.sql. Error: {e}"
+        )
+        bin_rows = []
+
+    if not bin_rows:
+        st.info("No items in the rejection bin for this date range.")
+    else:
+        from collections import Counter
+        status_counts = Counter(r.get("status") or "IN_BIN" for r in bin_rows)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total in Bin", len(bin_rows))
+        c2.metric("IN_BIN", status_counts.get("IN_BIN", 0))
+        c3.metric("SCRAPPED", status_counts.get("SCRAPPED", 0))
+        c4.metric("RECLAIMED", status_counts.get("RECLAIMED", 0))
+
+        prod_counts = Counter(r.get("product_name") or "—" for r in bin_rows)
+        st.markdown("**By Product (top 10):**")
+        for prod, cnt in sorted(prod_counts.items(), key=lambda x: -x[1])[:10]:
+            st.write(f"- {prod}: **{cnt}**")
+
+        with st.expander("Show all rejection-bin rows", expanded=False):
+            import pandas as _pd
+            st.dataframe(_pd.DataFrame(bin_rows), use_container_width=True, hide_index=True)

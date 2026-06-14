@@ -269,24 +269,24 @@ def render_import_dashboard():
         where = f"AND file_type = '{ft_filter}'" if ft_filter != "ALL" else ""
         recent = _q(f"""
             SELECT
-                import_id,
+                id AS import_id,
                 file_name,
                 file_type,
-                mode,
+                import_mode AS mode,
                 stock_mode,
                 status,
                 rows_total,
                 rows_ok,
-                rows_skipped,
+                skipped_rows AS rows_skipped,
                 error_count,
-                "user",
+                user_name AS "user",
                 ROUND(duration_s::NUMERIC, 2)  AS duration_s,
                 imported_at
             FROM loader_import_log
             WHERE 1=1 {where}
             ORDER BY imported_at DESC
-            LIMIT %s
-        """, (limit,))
+            LIMIT %(limit)s
+        """, {"limit": limit})
 
         if recent:
             import pandas as pd
@@ -331,8 +331,8 @@ def render_import_dashboard():
             SELECT
                 file_type,
                 COUNT(*)               AS unique_rows_hashed,
-                MIN(imported_at)       AS first_seen,
-                MAX(imported_at)       AS last_seen
+                MIN(created_at)        AS first_seen,
+                MAX(created_at)        AS last_seen
             FROM loader_row_history
             GROUP BY file_type
             ORDER BY file_type

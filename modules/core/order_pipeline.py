@@ -159,6 +159,24 @@ class OrderPipeline:
                 from modules.pricing.club_engine import apply_club_offers
                 apply_club_offers(order["lines"], order_type=_ot)
             except Exception: pass
+            # Supplier/own-product schemes are per-line; cart schemes are
+            # multi-line offers like 1+1 or CL 12+2. Run them before GST is
+            # stamped so tax reflects the final scheme-adjusted amount.
+            try:
+                from modules.pricing.supplier_scheme_engine import apply_customer_scheme_to_line
+                order["lines"] = [
+                    apply_customer_scheme_to_line(_ol, party_id=_pid, order_type=_ot)
+                    for _ol in order["lines"]
+                ]
+            except Exception: pass
+            try:
+                from modules.pricing.cart_scheme_engine import apply_cart_schemes
+                order["lines"], _cart_result = apply_cart_schemes(
+                    order["lines"], party_id=_pid, order_type=_ot
+                )
+                if getattr(_cart_result, "applied", False):
+                    order.setdefault("pricing_audit", {})["cart_scheme"] = getattr(_cart_result, "message", "")
+            except Exception: pass
             # Re-stamp GST on net price after discount
             try:
                 from modules.pricing.tax_engine import apply_taxes as _at
@@ -181,6 +199,23 @@ class OrderPipeline:
             _disc_amt = float(l.get("discount_amount") or 0)
             _gross    = float(l.get("total_price") or 0)
             _net      = round(_gross - _disc_amt, 2) if _disc_amt > 0 else _gross
+            if _net < 0:
+                _net = 0.0
+
+            _gst_pct = float(l.get("gst_percent") or 0)
+            _gst_amt = float(l.get("gst_amount") or 0)
+            _lp_svc = l.get("lens_params") if isinstance(l.get("lens_params"), dict) else {}
+            _is_svc = (
+                bool(l.get("is_service_line"))
+                or str(l.get("eye_side") or "").upper() in ("S", "SERVICE")
+                or bool(_lp_svc.get("service_type") or _lp_svc.get("charge_type"))
+            )
+            _order_type_line = str(order.get("order_type") or l.get("order_type") or "WHOLESALE").upper()
+            _billing_total = (
+                round(_net + _gst_amt, 2)
+                if _is_svc and _order_type_line != "RETAIL" and _gst_pct > 0
+                else _net
+            )
 
             db_lines.append({
                 "product_id":           l.get("product_id"),
@@ -191,8 +226,12 @@ class OrderPipeline:
                 "eye_side":             l.get("eye_side"),
                 "quantity":             l.get("billing_qty"),
                 "unit_price":           l.get("unit_price"),
-                "total_price":          l.get("total_price"),
-                "billing_total":        _net,
+                # total_price persisted as NET so reports/accounting that read
+                # this column directly (without going through the loader's
+                # billing_total alias) see the post-discount value.
+                # Mirrors retail_punching after restamp_line_totals.
+                "total_price":          _net,
+                "billing_total":        _billing_total,
                 "gst_percent":          l.get("gst_percent", 0),
                 "gst_amount":           l.get("gst_amount", 0),
                 "discount_percent":     l.get("discount_percent", 0),
@@ -201,6 +240,19 @@ class OrderPipeline:
                 "boxing_params":        l.get("boxing_params", {}),
                 "suggested_allocation": l.get("batch_allocation", []),
             })
+
+        # ── Recompute order header total_value AS NET ──────────────────────
+        # order_engine.convert_cart_to_order ran BEFORE apply_discounts above,
+        # so order["total_value"] there is sum(total_price) at that moment —
+        # gross when discounts hadn't been applied yet. Now that discounts
+        # are stamped and net is known, re-roll the header total so
+        # orders.total_value lands as net in the DB.
+        try:
+            _net_total = sum(float(_d.get("billing_total") or 0) for _d in db_lines)
+            order["total_value"]         = round(_net_total, 2)
+            db_order_data["total_value"] = round(_net_total, 2)
+        except Exception:
+            pass
 
         # -------------------------------------------------
         # 5. Save to Database

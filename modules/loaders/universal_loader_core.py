@@ -478,7 +478,7 @@ def _get_required_columns(file_type: str):
     # Static fallback — used if registry unavailable
     return {
         "PRODUCT":  ["product_name"],
-        "OPH_SPEC":  ["product", "index_value", "coating"],
+        "OPH_SPEC":  ["product_name", "index_value", "coating"],
         "OPH_ADDON": ["brand", "addon_name"],
         "FRAME":    ["batch_no"],
         "PARTY":    ["party_name"],
@@ -486,7 +486,7 @@ def _get_required_columns(file_type: str):
         "OPHLENS":  ["product_name"],
         "CLENS":    ["product_name", "quantity"],
         "SOL":      ["product_name", "quantity"],
-        "BLANK":    ["brand", "category", "material", "add_power"],
+        "BLANK":    ["brand", "category", "material", "add_power", "base_recommended"],
     }.get(file_type, [])
 
 # Keep REQUIRED_COLUMNS dict for backward compatibility — reads from registry
@@ -498,7 +498,7 @@ REQUIRED_COLUMNS = {
     "OPHLENS":  ["product_name", "quantity"],
     "CLENS":    ["product_name", "quantity"],
     "SOL":      ["product_name", "quantity"],
-    "BLANK":    ["brand", "category", "material", "add_power"],
+    "BLANK":    ["brand", "category", "material", "add_power", "base_recommended"],
 }
 
 
@@ -1576,13 +1576,13 @@ def _import_products(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_ta
         except Exception as _tx_ex:
             if _conn:
                 try: _conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0,"DB-BATCH",f"PRODUCT batch write failed — all rows rolled back: {_tx_ex}")
             result.inserted = 0; result.updated = 0
         finally:
             if _conn:
                 try: close_connection(_conn)
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
 
     # ── Extension columns (new DB columns not in hardcoded SQL) ─────────────
@@ -1739,13 +1739,13 @@ def _import_frames(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag:
         except Exception as _tx_ex:
             if _conn:
                 try: _conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0, "DB-BATCH", f"FRAME batch write failed — all rows rolled back: {_tx_ex}")
             result.inserted = 0; result.updated = 0
         finally:
             if _conn:
                 try: close_connection(_conn)
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
     # ── Extension columns (any extra cols not in core set) ────────────────────
     try:
@@ -1948,13 +1948,13 @@ def _import_parties(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag
         except Exception as e:
             if conn:
                 try: conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0, "DB-INSERT", f"Party batch insert failed: {e}")
         finally:
             try: cur.close()
-            except: pass
+            except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             try: close_connection(conn)
-            except: pass
+            except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
     # UPDATE batch
     if updates:
@@ -1981,13 +1981,13 @@ def _import_parties(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag
         except Exception as e:
             if conn:
                 try: conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0, "DB-UPDATE", f"Party batch update failed: {e}")
         finally:
             try: cur.close()
-            except: pass
+            except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             try: close_connection(conn)
-            except: pass
+            except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
     # ── Extension columns: write any new DB columns not in the hardcoded SQL ──
     # e.g. billing_preference, payment_mode, print_with_powers, order_cutoff_time
@@ -2040,12 +2040,12 @@ def _import_parties(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag
                 except Exception as ex:
                     if conn:
                         try: conn.rollback()
-                        except: pass
+                        except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
                     logger.warning(f"[party_loader] extension cols update failed: {ex}")
                 finally:
                     if conn:
                         try: close_connection(conn)
-                        except: pass
+                        except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
     except Exception as ex:
         logger.warning(f"[party_loader] extension cols skipped: {ex}")
 
@@ -2187,13 +2187,13 @@ def _import_patients(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_ta
         except Exception as _tx_ex:
             if _conn:
                 try: _conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0,"DB-BATCH",f"PATIENT batch write failed — all rows rolled back: {_tx_ex}")
             result.inserted = 0
         finally:
             if _conn:
                 try: close_connection(_conn)
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
     # ── Extension columns (va_distance_aided_r/l, notes, etc.) ──────────────
     try:
@@ -2565,13 +2565,13 @@ def _import_ophlens(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag
         except Exception as _tx_ex:
             if _conn:
                 try: _conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0,"DB-BATCH",f"OPHLENS batch write failed — all rows rolled back: {_tx_ex}")
             result.inserted = 0; result.updated = 0
         finally:
             if _conn:
                 try: close_connection(_conn)
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
 
     # ── Extension columns (barcode, item_code, coating, etc.) ───────────────
@@ -2930,13 +2930,13 @@ def _import_clens(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag: 
         except Exception as _tx_ex:
             if _conn:
                 try: _conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0,"DB-BATCH",f"CLENS batch write failed — all rows rolled back: {_tx_ex}")
             result.inserted = 0; result.updated = 0
         finally:
             if _conn:
                 try: close_connection(_conn)
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
 
     # ── Extension columns (barcode, item_code, coating, etc.) ───────────────
@@ -3055,13 +3055,13 @@ def _import_sol(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag: st
         except Exception as _tx_ex:
             if _conn:
                 try: _conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0, "DB-BATCH", f"SOL batch write failed — all rows rolled back: {_tx_ex}")
             result.inserted = 0; result.updated = 0
         finally:
             if _conn:
                 try: close_connection(_conn)
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
 
     # ── Extension columns ──────────────────────────────────────────────────────
@@ -3108,9 +3108,15 @@ def _import_blanks(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag:
         category = _safe_str(row.get("category"))
         material = _safe_str(row.get("material"))
         add_p    = _safe_float(row.get("add_power"))
+        base_rec = _safe_float(row.get("base_recommended"))
 
         if not all([brand, category, material]):
             result.add_error(row_num, "required", "Missing brand/category/material")
+            result.skipped += 1
+            continue
+
+        if base_rec is None:
+            result.add_error(row_num, "base_recommended", "Recommended Base is required for blank inventory")
             result.skipped += 1
             continue
 
@@ -3131,7 +3137,7 @@ def _import_blanks(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag:
             row_params = (
                 brand, category, material, colour, add_p,
                 excel_qty_right, excel_qty_left, excel_qty_ind,
-                _safe_float(row.get("base_recommended")),
+                base_rec,
                 _safe_float(row.get("base_1")),
                 _safe_float(row.get("base_2")),
                 _safe_float(row.get("base_3")),
@@ -3163,7 +3169,7 @@ def _import_blanks(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag:
                      base_recommended,base_1,base_2,base_3,
                      cost_price,min_stock,company_billing_name,created_by)
                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'LOADER')
-                    ON CONFLICT(brand,category,material,colour,add_power)
+                    ON CONFLICT(brand,category,material,colour,add_power,base_recommended)
                     DO UPDATE SET
                         qty_right=EXCLUDED.qty_right,
                         qty_left=EXCLUDED.qty_left,
@@ -3185,7 +3191,7 @@ def _import_blanks(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag:
                      base_recommended,base_1,base_2,base_3,
                      cost_price,min_stock,company_billing_name,created_by)
                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'LOADER')
-                    ON CONFLICT(brand,category,material,colour,add_power)
+                    ON CONFLICT(brand,category,material,colour,add_power,base_recommended)
                     DO UPDATE SET
                         qty_right=blank_inventory.qty_right+EXCLUDED.qty_right,
                         qty_left=blank_inventory.qty_left+EXCLUDED.qty_left,
@@ -3203,13 +3209,28 @@ def _import_blanks(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag:
 
             # ── Alias insert: store company_billing_name → blank_supplier_alias ──────
             # Runs in a separate transaction so alias failures don't roll back stock
-            _alias_rows = [
-                (r[0],  # brand
-                 _safe_str(df.iloc[i].get("company_billing_name"))
-                 )
-                for i, r in enumerate(_blank_add + _blank_opening)
-                if _safe_str(df.iloc[i].get("company_billing_name") if i < len(df) else None)
-            ]
+            _alias_candidates = []
+            for r in (_blank_add + _blank_opening):
+                supplier_name = _safe_str(r[14])
+                if supplier_name:
+                    _alias_candidates.append((
+                        r[0],   # brand
+                        r[1],   # category
+                        r[2],   # material
+                        r[3],   # colour
+                        r[4],   # add_power
+                        r[8],   # base_recommended
+                        supplier_name,
+                    ))
+            _alias_counts = {}
+            for a in _alias_candidates:
+                _alias_counts[(a[0], a[6])] = _alias_counts.get((a[0], a[6]), 0) + 1
+            # blank_supplier_alias is keyed only by brand + supplier_name in old
+            # schema, so only save aliases where that pair maps to one exact
+            # blank row in this upload. Multi-base rows are skipped rather than
+            # attaching OCR alias to the wrong base.
+            _alias_rows = [a for a in _alias_candidates if _alias_counts.get((a[0], a[6]), 0) == 1]
+            _alias_skipped = len(_alias_candidates) - len(_alias_rows)
             if _alias_rows:
                 try:
                     _alias_conn = get_transaction_connection()
@@ -3221,34 +3242,46 @@ def _import_blanks(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag:
                             %s AS brand,
                             %s AS supplier_name,
                             CONCAT_WS(' ',b.brand,b.category,b.material,
-                                      b.colour,b.add_power::text) AS our_name,
+                                      b.colour,b.add_power::text,b.base_recommended::text) AS our_name,
                             b.id AS blank_inventory_id
                         FROM blank_inventory b
                         WHERE b.brand=%s
+                          AND b.category=%s
+                          AND b.material=%s
+                          AND b.colour IS NOT DISTINCT FROM %s
+                          AND b.add_power IS NOT DISTINCT FROM %s
+                          AND b.base_recommended IS NOT DISTINCT FROM %s
                         LIMIT 1
                         ON CONFLICT (brand, supplier_name)
                         DO UPDATE SET
                             supplier_name = EXCLUDED.supplier_name,
                             updated_at    = NOW()
-                    """, [(a[0], a[1], a[0]) for a in _alias_rows], page_size=200)
+                    """, [
+                        (a[0], a[6], a[0], a[1], a[2], a[3], a[4], a[5])
+                        for a in _alias_rows
+                    ], page_size=200)
                     _alias_conn.commit()
                     result.add_warning(f"ℹ️ {len(_alias_rows)} supplier alias(es) saved for OCR matching.")
+                    if _alias_skipped:
+                        result.add_warning(f"ℹ️ {_alias_skipped} multi-base alias row(s) skipped to avoid wrong base matching.")
                 except Exception as _alias_ex:
                     result.add_warning(f"⚠️ Alias save failed (non-critical): {_alias_ex}")
                 finally:
                     try: close_connection(_alias_conn)
-                    except: pass
+                    except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
+            elif _alias_skipped:
+                result.add_warning(f"ℹ️ {_alias_skipped} multi-base alias row(s) skipped to avoid wrong base matching.")
 
         except Exception as _tx_ex:
             if _conn:
                 try: _conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(0,"DB-BATCH",f"BLANK batch write failed — all rows rolled back: {_tx_ex}")
             result.inserted = 0
         finally:
             if _conn:
                 try: close_connection(_conn)
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
 
     # ── Extension columns (barcode, item_code, min_stock, cost_price, etc.) ──
@@ -3262,7 +3295,7 @@ def _import_blanks(df: pd.DataFrame, result: LoadResult, dry_run: bool, env_tag:
         }
         write_extension_cols(
             "blank_inventory", df,
-            ["brand","category","material","colour","add_power"],
+            ["brand","category","material","colour","add_power","base_recommended"],
             _BLANK_CORE, dry_run
         )
     except Exception as _ex:
@@ -3381,12 +3414,12 @@ def _import_price(df: pd.DataFrame, result: LoadResult, dry_run: bool,
         except Exception as e:
             if conn:
                 try: conn.rollback()
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
             result.add_error(row_num, "DB", f"Price insert failed: {e}")
         finally:
             if conn:
                 try: close_connection(conn)
-                except: pass
+                except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
 
 
 
@@ -3477,7 +3510,7 @@ def _import_ophthalmic_specs(df, result: LoadResult, dry_run: bool, env_tag: str
     """
     df = apply_column_map(df, OPH_SPEC_COLUMN_MAP)
 
-    required = ["product", "index_value", "coating"]
+    required = ["product_name", "index_value", "coating"]
     for col in required:
         if col not in df.columns:
             result.add_error(0, col, f"Required column missing: {col}")
@@ -3487,7 +3520,7 @@ def _import_ophthalmic_specs(df, result: LoadResult, dry_run: bool, env_tag: str
     inserts = []; updates = []; skipped = 0
 
     for row_num, row in enumerate(df.to_dict("records"), start=2):
-        product_name = _safe_str(row.get("product"))
+        product_name = _safe_str(row.get("product_name") or row.get("product"))
         brand        = _safe_str(row.get("brand"))
         lens_cat     = _safe_str(row.get("lens_category")) or "SV RX"
         index_val    = _safe_str(row.get("index_value"))
@@ -3626,11 +3659,11 @@ def _import_ophthalmic_specs(df, result: LoadResult, dry_run: bool, env_tag: str
     except Exception as e:
         if _conn:
             try: _conn.rollback()
-            except: pass
+            except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
         result.add_error(0, "DB-BATCH", f"Ophthalmic spec batch failed: {e}")
     finally:
         try: cur.close()
-        except: pass
+        except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
         close_connection(_conn)
 
 
@@ -3754,11 +3787,11 @@ def _import_ophthalmic_addons(df, result: LoadResult, dry_run: bool, env_tag: st
     except Exception as e:
         if _conn:
             try: _conn.rollback()
-            except: pass
+            except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
         result.add_error(0, "DB-BATCH", f"Add-on batch failed: {e}")
     finally:
         try: cur.close()
-        except: pass
+        except Exception as e: logger.debug("Ignored non-critical loader exception: %s", e)
         close_connection(_conn)
 
 
@@ -4046,3 +4079,4 @@ def _canonical_to_db_columns(df: pd.DataFrame) -> pd.DataFrame:
         "qtyavailable":      "qty_available",
     }
     return df.rename(columns={k: v for k, v in BRIDGE_MAP.items() if k in df.columns})
+

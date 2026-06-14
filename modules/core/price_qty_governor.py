@@ -138,15 +138,14 @@ def is_gst_inclusive(order_type: str) -> bool:
 def is_box_product(product: dict) -> bool:
     """
     A product is a box product if:
-      - unit == 'BOX'  AND  box_size > 1
+      - box_size > 1
 
     Rule: unit alone is unreliable (can be 'NOS', 'PCS' even for box products
     entered inconsistently). box_size > 1 is the definitive signal.
     This function is the single definition — not duplicated in retail/wholesale.
     """
-    unit     = str(product.get("unit") or "").upper().strip()
     box_size = int(product.get("box_size") or 0)
-    return unit == "BOX" and box_size > 1
+    return box_size > 1
 
 
 def normalize_to_pcs_price(raw_price, product: dict) -> float:

@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 
 _ORDERS_EXTRA_COLS_EXIST: bool | None = None   # party_id, created_by, updated_at, updated_by
 _LINE_PRICING_COLS_EXIST: bool | None = None   # gst_percent, gst_amount, discount_*
+_LINE_PRODUCTION_REF_EXISTS: bool | None = None
 
 
 def _ensure_orders_columns(cursor) -> bool:
@@ -142,6 +143,26 @@ def _ensure_line_pricing_columns(cursor) -> bool:
         return False
 
 
+def _line_production_ref_exists(cursor) -> bool:
+    """Check for order_lines.production_ref without creating it."""
+    global _LINE_PRODUCTION_REF_EXISTS
+    if _LINE_PRODUCTION_REF_EXISTS is not None:
+        return _LINE_PRODUCTION_REF_EXISTS
+    try:
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_name = 'order_lines'
+              AND column_name = 'production_ref'
+        """)
+        _LINE_PRODUCTION_REF_EXISTS = cursor.fetchone()[0] > 0
+        return _LINE_PRODUCTION_REF_EXISTS
+    except Exception as exc:
+        logger.warning("[order_persistence] Could not verify production_ref column: %s", exc)
+        _LINE_PRODUCTION_REF_EXISTS = False
+        return False
+
+
 # ==========================================================
 # AUDIT HELPER
 # ==========================================================
@@ -181,6 +202,7 @@ def save_order_to_db(order: Dict):
         # ── 1. Self-healing migrations ─────────────────────────────────
         has_extra_order_cols = _ensure_orders_columns(cur)
         has_line_pricing     = _ensure_line_pricing_columns(cur)
+        has_production_ref   = _line_production_ref_exists(cur)
 
         # ── 2. Resolve order_id ────────────────────────────────────────
         import re as _re_oid
@@ -413,7 +435,29 @@ def save_order_to_db(order: Dict):
         # ON CONFLICT: if line id already exists (e.g. re-save of same line),
         # update it in place rather than insert a duplicate.
         # ──────────────────────────────────────────────────────────────
-        if has_line_pricing:
+        if has_line_pricing and has_production_ref:
+            insert_sql = """
+                INSERT INTO order_lines (
+                    id, order_id, product_id,
+                    sph, cyl, axis, add_power, eye_side,
+                    quantity, unit_price, total_price,
+                    gst_percent, gst_amount,
+                    discount_percent, discount_amount,
+                    status, lens_params, boxing_params, allocated_qty,
+                    production_ref
+                )
+                VALUES (%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s, %s,%s, %s,%s, %s,%s,%s,%s,%s)
+                ON CONFLICT (id) DO UPDATE SET
+                    quantity=EXCLUDED.quantity, unit_price=EXCLUDED.unit_price,
+                    total_price=EXCLUDED.total_price, gst_percent=EXCLUDED.gst_percent,
+                    gst_amount=EXCLUDED.gst_amount, discount_percent=EXCLUDED.discount_percent,
+                    discount_amount=EXCLUDED.discount_amount, status=EXCLUDED.status,
+                    lens_params=EXCLUDED.lens_params, boxing_params=EXCLUDED.boxing_params,
+                    allocated_qty=EXCLUDED.allocated_qty,
+                    production_ref=COALESCE(order_lines.production_ref, EXCLUDED.production_ref),
+                    is_deleted=FALSE, deleted_at=NULL
+            """
+        elif has_line_pricing:
             insert_sql = """
                 INSERT INTO order_lines (
                     id, order_id, product_id,
@@ -431,6 +475,24 @@ def save_order_to_db(order: Dict):
                     discount_amount=EXCLUDED.discount_amount, status=EXCLUDED.status,
                     lens_params=EXCLUDED.lens_params, boxing_params=EXCLUDED.boxing_params,
                     allocated_qty=EXCLUDED.allocated_qty, is_deleted=FALSE, deleted_at=NULL
+            """
+        elif has_production_ref:
+            insert_sql = """
+                INSERT INTO order_lines (
+                    id, order_id, product_id,
+                    sph, cyl, axis, add_power, eye_side,
+                    quantity, unit_price, total_price,
+                    status, lens_params, boxing_params, allocated_qty,
+                    production_ref
+                )
+                VALUES (%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s,%s)
+                ON CONFLICT (id) DO UPDATE SET
+                    quantity=EXCLUDED.quantity, unit_price=EXCLUDED.unit_price,
+                    total_price=EXCLUDED.total_price, status=EXCLUDED.status,
+                    lens_params=EXCLUDED.lens_params, boxing_params=EXCLUDED.boxing_params,
+                    allocated_qty=EXCLUDED.allocated_qty,
+                    production_ref=COALESCE(order_lines.production_ref, EXCLUDED.production_ref),
+                    is_deleted=FALSE, deleted_at=NULL
             """
         else:
             insert_sql = """
@@ -460,7 +522,9 @@ def save_order_to_db(order: Dict):
                 if _mth.isnan(fa): fa = 0.0
                 if _mth.isnan(fb): fb = 0.0
                 return abs(fa - fb) < 0.02
-            except: return True
+            except Exception as _e:
+                logger.warning("Suppressed error: %s", _e)
+                return True
 
         _lock_errors = []
         try:
@@ -529,6 +593,12 @@ def save_order_to_db(order: Dict):
             except (TypeError, ValueError):
                 return None
 
+        try:
+            from modules.backoffice.backoffice_helpers import derive_production_ref
+        except Exception as _prod_ref_import_err:
+            logger.warning("[Persistence] production_ref helper unavailable: %s", _prod_ref_import_err)
+            derive_production_ref = None
+
         for line in all_lines:
             # Persist manufacturing_route inside lens_params so it round-trips
             lens_params = dict(line.get("lens_params") or {})
@@ -550,8 +620,25 @@ def save_order_to_db(order: Dict):
             if _ba_save:
                 lens_params["batch_allocation"] = _ba_save
                 lens_params["batch_status"]     = line.get("batch_status", "ALLOCATED")
+                if not line.get("allocated_qty"):
+                    line["allocated_qty"] = sum(
+                        int(float((b or {}).get("allocated_qty") or 0))
+                        for b in _ba_save
+                        if isinstance(b, dict)
+                    )
+                if line.get("allocated_qty") and not line.get("manufacturing_route"):
+                    line["manufacturing_route"] = "STOCK"
+                    lens_params["manufacturing_route"] = "STOCK"
             elif "batch_allocation" not in lens_params:
                 lens_params["batch_allocation"] = []
+
+            production_ref = line.get("production_ref")
+            if has_production_ref and not production_ref and derive_production_ref:
+                _line_for_ref = dict(line)
+                _line_for_ref["lens_params"] = lens_params
+                production_ref = derive_production_ref(_line_for_ref, str(order.get("order_no") or ""))
+                if production_ref:
+                    line["production_ref"] = production_ref
 
             quantity    = int(line.get("billing_qty")    or line.get("quantity")    or 0)
             total_price = float(line.get("billing_total") or line.get("total_price") or 0)
@@ -581,7 +668,22 @@ def save_order_to_db(order: Dict):
                 total_price,
             )
 
-            if has_line_pricing:
+            if has_line_pricing and has_production_ref:
+                pricing = (
+                    float(line.get("gst_percent")      or 0),
+                    float(line.get("gst_amount")       or 0),
+                    float(line.get("discount_percent") or 0),
+                    float(line.get("discount_amount")  or 0),
+                )
+                tail = (
+                    line.get("status", "PENDING"),
+                    json.dumps(lens_params),
+                    json.dumps(line.get("boxing_params") or {}),
+                    int(line.get("allocated_qty") or 0),
+                    production_ref,
+                )
+                cur.execute(insert_sql, base + pricing + tail)
+            elif has_line_pricing:
                 pricing = (
                     float(line.get("gst_percent")      or 0),
                     float(line.get("gst_amount")       or 0),
@@ -595,6 +697,15 @@ def save_order_to_db(order: Dict):
                     int(line.get("allocated_qty") or 0),
                 )
                 cur.execute(insert_sql, base + pricing + tail)
+            elif has_production_ref:
+                tail = (
+                    line.get("status", "PENDING"),
+                    json.dumps(lens_params),
+                    json.dumps(line.get("boxing_params") or {}),
+                    int(line.get("allocated_qty") or 0),
+                    production_ref,
+                )
+                cur.execute(insert_sql, base + tail)
             else:
                 tail = (
                     line.get("status", "PENDING"),

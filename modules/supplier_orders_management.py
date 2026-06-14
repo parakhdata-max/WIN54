@@ -51,6 +51,20 @@ def safe_axis(value):
         return "N/A"
 
 
+def _sync_supplier_orders_id_sequence() -> None:
+    try:
+        from modules.sql_adapter import run_write
+        run_write("""
+            SELECT setval(
+                pg_get_serial_sequence('supplier_orders','id'),
+                GREATEST((SELECT COALESCE(MAX(id), 0) FROM supplier_orders), 1),
+                TRUE
+            )
+        """, {})
+    except Exception:
+        pass
+
+
 # ============================================================================
 # ENUMS & CONSTANTS
 # ============================================================================
@@ -172,6 +186,7 @@ def create_supplier_order_from_lines(customer_order: Dict, vendor_lines: List[Di
     # INSERT supplier_orders — let DB generate integer id
     # supplier_order_id varchar is NOT NULL so we use a temp placeholder,
     # then immediately update it to SO-{id} once we have the real PK.
+    _sync_supplier_orders_id_sequence()
     new_id = run_query("""
         INSERT INTO supplier_orders (
             supplier_order_id,

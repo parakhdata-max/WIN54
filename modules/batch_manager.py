@@ -20,6 +20,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Your existing imports (keep them as is)
 from modules.sql_adapter import (
@@ -29,6 +32,13 @@ from modules.sql_adapter import (
     read_frame_sku,
     read_product_master
 )
+
+DEBUG_STOCK_LOOKUP = False
+
+
+def _debug_print(*args, **kwargs):
+    if DEBUG_STOCK_LOOKUP:
+        logger.debug(" ".join(str(a) for a in args))
 
 # ============================================================================
 # PRODUCT TYPE DETECTION - UUID FIXED
@@ -91,7 +101,8 @@ def eye_side_matches(batch_eye, requested_eye) -> bool:
     try:
         batch_eye_clean = str(batch_eye).strip().upper()
         requested_eye_clean = str(requested_eye).strip().upper()
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         return False
     
     # Empty strings don't match
@@ -167,19 +178,19 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
     batch_df = read_ophthalmic_stock()
     
     if batch_df.empty:
-        print("DEBUG: inventory_stock table is empty")
+        _debug_print("DEBUG: inventory_stock table is empty")
         return pd.DataFrame()
     
-    print(f"\n{'='*80}")
-    print(f"DEBUG get_contact_lens_stock: Total rows in inventory_stock: {len(batch_df)}")
-    print(f"DEBUG: Searching for product_id={product_id} (type: {type(product_id)})")
-    print(f"DEBUG: Power requested: SPH={sph}, CYL={cyl}, AXIS={axis}, ADD={add_power}, EYE={eye_side}")
+    _debug_print(f"\n{'='*80}")
+    _debug_print(f"DEBUG get_contact_lens_stock: Total rows in inventory_stock: {len(batch_df)}")
+    _debug_print(f"DEBUG: Searching for product_id={product_id} (type: {type(product_id)})")
+    _debug_print(f"DEBUG: Power requested: SPH={sph}, CYL={cyl}, AXIS={axis}, ADD={add_power}, EYE={eye_side}")
     
     # ✅ CRITICAL FIX: Convert product_id column to string for comparison
-    print(f"DEBUG: product_id column type before: {batch_df['product_id'].dtype}")
+    _debug_print(f"DEBUG: product_id column type before: {batch_df['product_id'].dtype}")
     batch_df['product_id'] = batch_df['product_id'].astype(str)
     product_id_str = str(product_id)
-    print(f"DEBUG: Comparing with product_id_str={product_id_str}")
+    _debug_print(f"DEBUG: Comparing with product_id_str={product_id_str}")
     
     # ================= NORMALIZE NUMERIC COLUMNS =================
     num_cols = ['sph', 'cyl', 'axis', 'add_power', 'quantity']
@@ -195,17 +206,17 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
     
     # Show what product_ids exist
     available_products = batch_df['product_id'].unique()
-    print(f"DEBUG: Available product_ids in batch table (first 5): {list(available_products[:5])}")
+    _debug_print(f"DEBUG: Available product_ids in batch table (first 5): {list(available_products[:5])}")
     
     # ✅ FIX: Clean eye_side column — 'NONE' string and empty both treated as B (any eye)
     if 'eye_side' in batch_df.columns:
         batch_df['eye_side'] = batch_df['eye_side'].astype(str).str.strip().str.upper()
         batch_df['eye_side'] = batch_df['eye_side'].replace({'': 'B', 'NONE': 'B', 'NAN': 'B', 'NAT': 'B'})
-        print(f"DEBUG: Unique eye_side values: {batch_df['eye_side'].unique()}")
+        _debug_print(f"DEBUG: Unique eye_side values: {batch_df['eye_side'].unique()}")
     
     # ================= DEBUG AFTER NORMALIZATION =================
-    print("\nDEBUG: After normalization (sample 5 rows):")
-    print(
+    _debug_print("\nDEBUG: After normalization (sample 5 rows):")
+    _debug_print(
         batch_df[
             ['product_id', 'sph', 'cyl', 'axis', 'add_power', 'eye_side', 'quantity']
         ]
@@ -216,11 +227,11 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
     # ✅ FIXED: Use string comparison for product_id
     product_rows = batch_df[batch_df['product_id'] == product_id_str]
 
-    print("\nDEBUG: Available powers for this product:")
-    print("SPH :", sorted(product_rows['sph'].dropna().unique()) if not product_rows.empty else "[]")
-    print("CYL :", sorted(product_rows['cyl'].dropna().unique()) if not product_rows.empty else "[]")
-    print("AXIS:", sorted(product_rows['axis'].dropna().unique()) if not product_rows.empty else "[]")
-    print("EYE :", list(product_rows['eye_side'].dropna().unique()) if not product_rows.empty else "[]")
+    _debug_print("\nDEBUG: Available powers for this product:")
+    _debug_print("SPH :", sorted(product_rows['sph'].dropna().unique()) if not product_rows.empty else "[]")
+    _debug_print("CYL :", sorted(product_rows['cyl'].dropna().unique()) if not product_rows.empty else "[]")
+    _debug_print("AXIS:", sorted(product_rows['axis'].dropna().unique()) if not product_rows.empty else "[]")
+    _debug_print("EYE :", list(product_rows['eye_side'].dropna().unique()) if not product_rows.empty else "[]")
 
     # ✅ FIXED: Filter by product using string comparison
     mask = (batch_df['product_id'] == product_id_str) & (batch_df['quantity'] > 0)
@@ -228,11 +239,11 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
     # Base filtered dataset (always defined)
     filtered = batch_df[mask].copy()
 
-    print(f"DEBUG: After product_id filter: {mask.sum()} rows")
+    _debug_print(f"DEBUG: After product_id filter: {mask.sum()} rows")
     
     if mask.sum() == 0:
-        print(f"❌ ERROR: No batches found for product_id={product_id_str}")
-        print(f"   Available product_ids (first 10): {list(available_products[:10])}")
+        _debug_print(f"❌ ERROR: No batches found for product_id={product_id_str}")
+        _debug_print(f"   Available product_ids (first 10): {list(available_products[:10])}")
         return pd.DataFrame()
 
     # ================= DETECT LENS DESIGN (FIXED) =================
@@ -260,12 +271,12 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
     else:
         lens_design = "SPHERICAL"
 
-    print(f"DEBUG: Lens design detected = {lens_design}")
+    _debug_print(f"DEBUG: Lens design detected = {lens_design}")
 
     # ================= SAMPLE DEBUG =================
 
-    print("\nDEBUG: Sample after product filter:")
-    print(
+    _debug_print("\nDEBUG: Sample after product filter:")
+    _debug_print(
         filtered[['id','sph','cyl','axis','add_power','eye_side','quantity']]
         .head(5)
         .to_string()
@@ -278,7 +289,7 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
         # For STOCK lenses: axis may be NULL in DB (stocked without specific axis)
         # For RX lenses: axis must match
 
-        print("DEBUG: Enforcing TORIC rows only")
+        _debug_print("DEBUG: Enforcing TORIC rows only")
 
         filtered = filtered[filtered['cyl'].notna()]
 
@@ -289,7 +300,7 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
     # SPHERICAL — match rows where cyl is NULL or 0, and axis is NULL or 0
     elif cyl in (None, 0):
 
-        print("DEBUG: Enforcing SPH-only rows")
+        _debug_print("DEBUG: Enforcing SPH-only rows")
 
         filtered = filtered[
             (filtered['cyl'].isna() | (filtered['cyl'] == 0.0)) &
@@ -299,7 +310,7 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
     # MULTIFOCAL
     if add_power not in (None, 0):
 
-        print("DEBUG: Enforcing MULTIFOCAL rows")
+        _debug_print("DEBUG: Enforcing MULTIFOCAL rows")
 
         filtered = filtered[
             filtered['add_power'].notna()
@@ -320,18 +331,8 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
             np.isclose(filtered['cyl'].astype(float), float(cyl), atol=0.01)
         ]
 
-    # AXIS — only filter by axis if the DB rows have axis set (RX stock)
-    # Stock SV lenses have NULL axis → match any axis the user enters
-    if axis not in (None, 0):
-        _has_axis_in_db = filtered['axis'].notna().any()
-        if _has_axis_in_db:
-            # Some rows have axis (RX-specific) — filter to matching axis
-            # Rows with NULL axis (stock lenses) remain available to any axis
-            filtered = filtered[
-                filtered['axis'].isna() |
-                np.isclose(filtered['axis'].fillna(-9999), float(axis), atol=1)
-            ]
-        # else: all rows have NULL axis (pure stock) — no axis filtering needed
+    # AXIS is ignored for ophthalmic stock. SV/progressive lenses match by
+    # SPH/CYL/ADD and the requested axis is fitted during edging.
 
     # ADD
     if add_power not in (None, 0):
@@ -340,8 +341,8 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
         ]
 
 
-    print("DEBUG: Final matched rows =", len(filtered))
-    print(filtered[['sph','cyl','axis','add_power','quantity']].head())
+    _debug_print("DEBUG: Final matched rows =", len(filtered))
+    _debug_print(filtered[['sph','cyl','axis','add_power','quantity']].head())
 
     if filtered.empty:
         return pd.DataFrame()
@@ -350,7 +351,7 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
     # ================= EYE SIDE FILTER =================
     
     if eye_side and eye_side.upper() in ['L', 'R']:
-        print(f"\nDEBUG: Applying eye_side={eye_side} filter...")
+        _debug_print(f"\nDEBUG: Applying eye_side={eye_side} filter...")
         before = len(filtered)
         
         eye_side_upper = str(eye_side).strip().upper()
@@ -363,20 +364,20 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
         
         filtered = filtered[eye_match_mask]
         
-        print(f"   Before: {before} rows, After: {len(filtered)} rows")
+        _debug_print(f"   Before: {before} rows, After: {len(filtered)} rows")
         
         if filtered.empty:
             available_eyes = batch_df[batch_df['product_id'] == product_id_str]['eye_side'].dropna().unique()
-            print(f"   ❌ No matches for eye_side={eye_side}")
-            print(f"   Available eye_side values: {list(available_eyes)}")
+            _debug_print(f"   ❌ No matches for eye_side={eye_side}")
+            _debug_print(f"   Available eye_side values: {list(available_eyes)}")
             return pd.DataFrame()
 
 
     # ================= FINAL RESULT =================
 
-    print(f"\n✅ FINAL MATCHED BATCHES: {len(filtered)}")
+    _debug_print(f"\n✅ FINAL MATCHED BATCHES: {len(filtered)}")
     if not filtered.empty:
-        print(
+        _debug_print(
             filtered[['id','batch_no','sph','cyl','axis','eye_side','quantity']]
             .head(10)
             .to_string()
@@ -392,11 +393,11 @@ def get_contact_lens_stock(product_id,  # ✅ REMOVED int type hint
         if 'expiry_date' in filtered.columns:
             filtered['expiry_date'] = pd.to_datetime(filtered['expiry_date'], errors='coerce')
 
-        print(f"✅ Total quantity: {filtered['available_qty'].sum()}")
+        _debug_print(f"✅ Total quantity: {filtered['available_qty'].sum()}")
     else:
-        print("❌ NO MATCHES FOUND after all filters")
+        _debug_print("❌ NO MATCHES FOUND after all filters")
     
-    print(f"{'='*80}\n")
+    _debug_print(f"{'='*80}\n")
 
     return filtered
 
@@ -436,19 +437,21 @@ def get_ophthalmic_lens_stock(product_id,  # ✅ REMOVED int type hint
         sph_mask = stock_df['sph'].notna() & np.isclose(stock_df['sph'], float(sph), atol=0.01)
         mask &= sph_mask
 
-    # CYL: no CYL or 0 → spherical → match null/0 only
-    #       specific CYL → exact match only (spherical stock ≠ toric)
+    # CYL: generic progressive stock can be blank and match by SPH+ADD, but
+    # RX-stock rows with CYL filled must match the entered CYL.
+    _has_add_request = add_power is not None and abs(float(add_power)) > 0.01
     if cyl is None or (cyl is not None and abs(float(cyl)) < 0.01):
         cyl_mask = stock_df['cyl'].isna() | np.isclose(stock_df['cyl'].fillna(0), 0, atol=0.01)
         mask &= cyl_mask
     else:
-        cyl_mask = stock_df['cyl'].notna() & np.isclose(stock_df['cyl'], float(cyl), atol=0.01)
-        mask &= cyl_mask
+        exact_cyl = stock_df['cyl'].notna() & np.isclose(stock_df['cyl'], float(cyl), atol=0.01)
+        generic_progressive = _has_add_request & (stock_df['cyl'].isna() | np.isclose(stock_df['cyl'].fillna(0), 0, atol=0.01))
+        mask &= (exact_cyl | generic_progressive)
 
-    # AXIS: stock lenses with NULL axis fit any axis — always match
-    #        only filter when stock has a specific axis value
+    # AXIS: generic blank-axis rows match any axis. RX-stock rows with a
+    # specific axis must match, same as toric stock.
     if axis is not None and abs(float(axis)) > 0:
-        axis_mask = stock_df['axis'].isna() | np.isclose(stock_df['axis'].fillna(0), float(axis), atol=5.0)
+        axis_mask = stock_df['axis'].isna() | np.isclose(stock_df['axis'].fillna(0), 0, atol=0.01) | np.isclose(stock_df['axis'].fillna(-9999), float(axis), atol=1)
         mask &= axis_mask
 
     # ADD power
@@ -466,7 +469,10 @@ def get_ophthalmic_lens_stock(product_id,  # ✅ REMOVED int type hint
 
     # Coating filter — only filter when coating is specified
     if coating and 'coating' in stock_df.columns:
-        coat_mask = stock_df['coating'].fillna('').str.lower() == coating.lower()
+        _coats = [coating.lower()]
+        if _has_add_request and str(coating).strip().lower() == "green":
+            _coats.append("murk vision")
+        coat_mask = stock_df['coating'].fillna('').str.lower().isin(_coats)
         mask &= coat_mask
 
     result = stock_df[mask].copy()
@@ -528,14 +534,19 @@ def get_frame_stock(product_id) -> pd.DataFrame:  # ✅ REMOVED int type hint
     
     if 'quantity' in sku_df.columns:
         sku_df['quantity'] = pd.to_numeric(sku_df['quantity'], errors='coerce')
+    if 'allocated_qty' in sku_df.columns:
+        sku_df['allocated_qty'] = pd.to_numeric(sku_df['allocated_qty'], errors='coerce').fillna(0)
+    else:
+        sku_df['allocated_qty'] = 0
     
-    mask = (sku_df['product_id'] == product_id_str) & (sku_df['quantity'] > 0)
+    sku_df['available_qty'] = (sku_df['quantity'].fillna(0) - sku_df['allocated_qty'].fillna(0)).clip(lower=0)
+    mask = (sku_df['product_id'] == product_id_str) & (sku_df['available_qty'] > 0)
     
     result = sku_df[mask].copy()
     
     if not result.empty:
         result['source'] = 'frame'
-        result['available_qty'] = result['quantity']
+        result['quantity'] = result['available_qty']
         # ── Normalise all three price tiers ───────────────────────────
         result = _normalise_prices(result)
 
@@ -583,16 +594,20 @@ def get_available_stock(product_id,  # ✅ REMOVED int type hint
     else:
         # Generic fallback — query inventory_stock directly for any other product type
         try:
-            from modules.sql_adapter import run_query
-            rows = run_query("""
-                SELECT id, product_id, batch_no, eye_side, quantity,
+            from modules.sql_adapter import run_query, _inventory_alloc_expr
+            _alloc_expr = _inventory_alloc_expr()
+            rows = run_query(f"""
+                SELECT id, product_id, batch_no, eye_side,
+                       COALESCE(quantity, 0) AS physical_qty,
+                       {_alloc_expr} AS allocated_qty,
+                       GREATEST(0, COALESCE(quantity, 0) - {_alloc_expr}) AS quantity,
                        COALESCE(mrp, selling_price, 0)       AS mrp,
                        COALESCE(selling_price, mrp, 0)       AS selling_price,
                        COALESCE(purchase_rate, 0)            AS purchase_rate,
                        location, updated_at
                 FROM inventory_stock
                 WHERE product_id::text = %(pid)s
-                  AND quantity > 0
+                  AND GREATEST(0, COALESCE(quantity, 0) - {_alloc_expr}) > 0
                   AND COALESCE(is_active, true) = true
             """, {"pid": str(product_id)})
             if rows:
@@ -662,10 +677,11 @@ def get_batches_fifo(product_id,
                     cyl: float = None,
                     axis: float = None, 
                     add_power: float = None,
-                    eye_side: str = None) -> pd.DataFrame:
+                    eye_side: str = None,
+                    coating: str = None) -> pd.DataFrame:
     """Get available batches sorted by FIFO (First In, First Out) for allocation"""
 
-    stock_df = get_available_stock(product_id, sph, cyl, axis, add_power, eye_side)
+    stock_df = get_available_stock(product_id, sph, cyl, axis, add_power, eye_side, coating=coating)
     
     if stock_df.empty:
         return pd.DataFrame()
@@ -829,20 +845,20 @@ def create_allocation_record(
     """
     product_type = get_product_type(product_id)
     
-    print(f"\nDEBUG create_allocation_record: product_type={product_type}")
-    print(f"DEBUG: product_id={product_id}, sph={sph}, cyl={cyl}, axis={axis}, add={add_power}, eye={eye_side}, qty={required_qty}")
+    _debug_print(f"\nDEBUG create_allocation_record: product_type={product_type}")
+    _debug_print(f"DEBUG: product_id={product_id}, sph={sph}, cyl={cyl}, axis={axis}, add={add_power}, eye={eye_side}, qty={required_qty}")
     
     if product_type in ['contact_lens', 'solution']:
         batches_df = get_batches_fifo(product_id, sph, cyl, axis, add_power, eye_side)
         
-        print(f"DEBUG: get_batches_fifo returned {len(batches_df)} batches")
+        _debug_print(f"DEBUG: get_batches_fifo returned {len(batches_df)} batches")
         
         batches_df = allocate_batches_fifo(batches_df, required_qty)
         
         allocated_qty = batches_df['allocated_qty'].sum() if not batches_df.empty else 0
         pending_qty = max(required_qty - allocated_qty, 0)
         
-        print(f"DEBUG: allocated_qty={allocated_qty}, pending_qty={pending_qty}")
+        _debug_print(f"DEBUG: allocated_qty={allocated_qty}, pending_qty={pending_qty}")
         
         return {
             'type': product_type,
@@ -870,3 +886,4 @@ def create_allocation_record(
             'status': 'READY' if pending_qty == 0 else ('PARTIAL' if allocated_qty > 0 else 'PENDING'),
             'batches': []
         }
+

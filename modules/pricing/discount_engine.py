@@ -345,7 +345,7 @@ def _get_party_tier_discount(party_id: str) -> tuple:
                 COALESCE(pt.allow_stacking, TRUE) AS allow_stack
             FROM parties p
             LEFT JOIN pricing_tiers pt
-                   ON pt.tier_name = COALESCE(p.price_tier, p.pricing_tier, 'standard')
+                   ON pt.tier_name = COALESCE(p.price_tier, 'standard')
             WHERE p.id = %s::uuid
             LIMIT 1
         """, (party_id,)) or []
@@ -425,6 +425,22 @@ def _build_line_item(line: dict, party_id: str, order_type: str):
             elif ot == "RETAIL":
                 party_tags = ["retail"]
 
+    _raw_cost = None
+    try:
+        if line.get("purchase_rate") and float(line["purchase_rate"]) > 0:
+            _raw_cost = Decimal(str(line["purchase_rate"]))
+        elif line.get("cost_price") and float(line["cost_price"]) > 0:
+            _raw_cost = Decimal(str(line["cost_price"]))
+        _box_size = int(float(line.get("box_size") or 1))
+        # Cart/order unit_price is always per PCS. Inventory purchase_rate for
+        # contact-lens boxes is often stored per BOX, so normalize it to PCS
+        # before margin calculation. Otherwise a ₹1667 box cost is compared
+        # against a ₹297 pcs sell price and creates false -500% hard stops.
+        if _raw_cost is not None and _box_size > 1 and _raw_cost > Decimal(str(unit_price)) * Decimal("1.5"):
+            _raw_cost = (_raw_cost / Decimal(_box_size)).quantize(Decimal("0.01"))
+    except Exception:
+        _raw_cost = None
+
     return LineItem(
         base_price  = Decimal(str(unit_price)),
         quantity    = qty,
@@ -438,15 +454,7 @@ def _build_line_item(line: dict, party_id: str, order_type: str):
         # Phase 2D: pass cost_price so engine can compute margin status.
         # purchase_rate is the cost column stamped on cart lines from stock table.
         # Falls back to cost_price if already normalised. None = margin skipped.
-        cost_price  = (
-            Decimal(str(line["purchase_rate"]))
-            if line.get("purchase_rate") and float(line["purchase_rate"]) > 0
-            else (
-                Decimal(str(line["cost_price"]))
-                if line.get("cost_price") and float(line["cost_price"]) > 0
-                else None
-            )
-        ),
+        cost_price  = _raw_cost,
     )
 
 
@@ -545,7 +553,7 @@ def _apply_to_line(line: dict, engine, party_id: str, order_type: str) -> None:
             try:
                 from modules.sql_adapter import run_query as _rq_t
                 _trows = _rq_t(
-                    "SELECT COALESCE(price_tier, pricing_tier, 'standard') AS tier "
+                    "SELECT COALESCE(price_tier, 'standard') AS tier "
                     "FROM parties WHERE id=%s::uuid LIMIT 1",
                     (_pid_for_tier,)
                 ) or []
@@ -750,6 +758,12 @@ def _stamp_line(
 
         if m_status == "hard_stop":
             cost_pr = float(line.get("purchase_rate") or line.get("cost_price") or 0)
+            try:
+                _bs_m = int(float(line.get("box_size") or 1))
+                if _bs_m > 1 and cost_pr > float(line.get("unit_price") or 0) * 1.5:
+                    cost_pr = round(cost_pr / _bs_m, 2)
+            except Exception:
+                pass
             if cost_pr > 0 and gross > 0:
                 min_net      = cost_pr * qty * (1 + _MIN_MARGIN_PCT / 100)
                 max_disc     = max(0.0, gross - min_net)
@@ -813,6 +827,11 @@ def apply_discounts(
         engine = _load_engine(channel=channel)
         for line in lines:
             _apply_to_line(line, engine, party_id, order_type)
+            try:
+                from modules.pricing.supplier_scheme_engine import apply_customer_scheme_to_line
+                apply_customer_scheme_to_line(line, party_id=party_id, order_type=order_type)
+            except Exception:
+                pass
 
     except Exception as e:
         log.error(f"[DiscountEngine] apply_discounts failed: {e} — product fallback")

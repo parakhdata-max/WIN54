@@ -40,8 +40,43 @@ class TaxValidator(BaseValidator):
         # If True → missing gst_percent is ERROR (blocks save)
         # If False → WARNING only (saves but flags)
         self.strict_gst = rules.get("strict_gst_required", True)
+        # If True → a 0% line that is not marked GST-exempt is an ERROR.
+        # Keep configurable so live rollout can start in warning mode while
+        # product GST master cleanup is completed.
+        self.block_zero_gst_unless_exempt = rules.get("block_zero_gst_unless_exempt", False)
         # Allowed GST slabs — empty list = accept any value
-        self.valid_slabs = rules.get("valid_gst_slabs", [0, 5, 12, 18, 28])
+        self.valid_slabs = rules.get("valid_gst_slabs", [0, 5, 18])
+        self._exempt_cache: dict = {}
+
+    def _is_line_exempt(self, line: dict) -> bool:
+        """Return True when a 0% line is explicitly GST-exempt.
+
+        Prefer a line flag. If absent, look up products.is_gst_exempt by UUID.
+        Any lookup problem fails closed.
+        """
+        v = line.get("is_gst_exempt")
+        if v is not None:
+            return bool(v)
+        pid = line.get("product_id")
+        if not pid:
+            return False
+        key = str(pid)
+        if key in self._exempt_cache:
+            return self._exempt_cache[key]
+        exempt = False
+        try:
+            from modules.sql_adapter import as_uuid_or_none, run_query
+            pid_u = as_uuid_or_none(pid)
+            if pid_u:
+                rows = run_query(
+                    "SELECT COALESCE(is_gst_exempt, FALSE) AS ex FROM products WHERE id = %s::uuid",
+                    (pid_u,),
+                ) or []
+                exempt = bool(rows[0].get("ex")) if rows else False
+        except Exception:
+            exempt = False
+        self._exempt_cache[key] = exempt
+        return exempt
 
     @staticmethod
     def _line_total(line: dict) -> float:
@@ -102,7 +137,8 @@ class TaxValidator(BaseValidator):
             if gst is None:
                 missing_gst.append(name)
             elif float(gst) == 0.0:
-                zero_gst.append(name)
+                if not self._is_line_exempt(line):
+                    zero_gst.append(name)
             elif self.valid_slabs and float(gst) not in [float(s) for s in self.valid_slabs]:
                 invalid_slab.append(f"{name}: {gst}%")
 
@@ -142,16 +178,17 @@ class TaxValidator(BaseValidator):
                 details={"missing_gst_field": missing_gst}
             )
 
-        # ── gst_percent = 0 (field present but value is zero) ─────────────────
+        # ── gst_percent = 0 and NOT flagged exempt ───────────────────────────
         if zero_gst and self.strict_gst:
+            severity = "ERROR" if self.block_zero_gst_unless_exempt else "WARNING"
             return ValidationResult(
                 rule="TAX_GST_ZERO",
                 passed=False,
-                severity="WARNING",
+                severity=severity,
                 message=(
-                    f"{len(zero_gst)} line(s) have gst_percent=0: "
+                    f"{len(zero_gst)} line(s) have 0% GST but are not marked GST-exempt: "
                     f"{', '.join(zero_gst)}. "
-                    f"Update product master GST rates."
+                    f"Set a GST slab on the product, or mark it GST-exempt if it genuinely has no GST."
                 ),
                 details={"zero_gst_lines": zero_gst}
             )

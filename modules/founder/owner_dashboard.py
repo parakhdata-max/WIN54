@@ -229,7 +229,7 @@ def render_owner_dashboard():
     # 5. PROCUREMENT
     _section("\U0001f4cb Procurement")
     pos = _q(
-        "SELECT status, COUNT(*) AS cnt, COALESCE(SUM(total_amount),0) AS val "
+        "SELECT status, COUNT(*) AS cnt, COALESCE(SUM(total_value),0) AS val "
         "FROM supplier_orders WHERE COALESCE(is_deleted,FALSE)=FALSE "
         "AND status NOT IN ('CANCELLED','CLOSED','RECEIVED') GROUP BY status ORDER BY cnt DESC")
     if pos:

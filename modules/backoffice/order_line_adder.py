@@ -253,8 +253,19 @@ def render_add_line_panel(order: Dict) -> None:
     _locked = not _order_is_editable(order)
 
     order_id = str(order.get("id") or "")
+    _add_open_key = f"al_add_open_{order_id}"
+    _add_has_work = any(
+        bool(st.session_state.get(k))
+        for k in (
+            f"al_search_{order_id}",
+            f"al_product_{order_id}",
+            f"al_frame_sku_scan_{order_id}",
+            f"al_frame_sku_{order_id}",
+        )
+    )
+    _add_expanded = bool(st.session_state.get(_add_open_key) or _add_has_work)
 
-    with st.expander("➕ Add Line to Order", expanded=False):
+    with st.expander("➕ Add Line to Order", expanded=_add_expanded):
         if _locked:
             st.warning(
                 "⚠️ Order is **CONFIRMED** — adding lines will require re-saving "
@@ -560,8 +571,9 @@ def render_add_line_panel(order: Dict) -> None:
             _disc_pct = 0.0
             _disc_amt = 0.0
             _net_tp   = _tp
+            _tmp_line = {}
             try:
-                from modules.pricing.discount_engine import apply_discounts
+                from modules.pricing.discount_flow import apply_order_discounts
                 _otype_add = str(order.get("order_type","WHOLESALE"))
                 _pid_add   = str(order.get("party_id") or "").strip()
                 if not _pid_add:
@@ -574,18 +586,24 @@ def render_add_line_panel(order: Dict) -> None:
                         if _padd: _pid_add = _padd[0].get("id","")
                 _tmp_line = {
                     "product_id": str(_sel_pid),
+                    "product_name": str(_sel_row.iloc[0].get("product_name", "") if not _sel_row.empty else ""),
+                    "brand": str(_sel_row.iloc[0].get("brand", "") if not _sel_row.empty else ""),
+                    "main_group": str(_sel_row.iloc[0].get("main_group", "") if not _sel_row.empty else ""),
                     "unit_price": float(_up),
                     "billing_qty": int(_qty),
                     "quantity": int(_qty),
+                    "gst_percent": float(_sel_row.iloc[0].get("gst_percent", 0) if not _sel_row.empty else 0),
+                    "lens_params": dict(_lp_dict),
                 }
-                apply_discounts([_tmp_line], party_id=_pid_add, order_type=_otype_add)
+                apply_order_discounts([_tmp_line], party_id=_pid_add, order_type=_otype_add)
                 _disc_pct = float(_tmp_line.get("discount_percent", 0))
                 _disc_amt = float(_tmp_line.get("discount_amount", 0))
-                _net_tp   = round(_tp - _disc_amt, 2)
+                _net_tp   = round(float(_tmp_line.get("billing_total") or _tmp_line.get("total_price") or (_tp - _disc_amt)), 2)
             except Exception:
                 pass
 
             _added = 0
+            _new_lines_for_sync = []
             for _eye in _eyes_to_add:
                 _new_id = str(uuid.uuid4())
                 _ok = _write("""
@@ -615,7 +633,7 @@ def render_add_line_panel(order: Dict) -> None:
                     "add": float(_add) if _add else None,
                     "qty": int(_qty),
                     "up":  float(_up),
-                    "tp":  _tp,
+                    "tp":  _net_tp,
                     "dp":  _disc_pct,
                     "da":  _disc_amt,
                     "bt":  _net_tp,
@@ -625,8 +643,31 @@ def render_add_line_panel(order: Dict) -> None:
                 })
                 if _ok:
                     _added += 1
+                    _line_copy = dict(_tmp_line)
+                    _line_copy.update({
+                        "id": _new_id,
+                        "line_id": _new_id,
+                        "product_id": str(_sel_pid),
+                        "eye_side": _eye,
+                        "quantity": int(_qty),
+                        "billing_qty": int(_qty),
+                        "unit_price": float(_up),
+                        "discount_percent": _disc_pct,
+                        "discount_amount": _disc_amt,
+                        "billing_total": _net_tp,
+                        "total_price": _net_tp,
+                        "lens_params": dict(_lp_dict),
+                    })
+                    _new_lines_for_sync.append(_line_copy)
 
             if _added:
+                try:
+                    order.setdefault("lines", []).extend(_new_lines_for_sync)
+                    from modules.backoffice.backoffice_helpers import refresh_order_pricing_rules
+                    refresh_order_pricing_rules(order, persist=True)
+                except Exception:
+                    pass
+                st.session_state[_add_open_key] = False
                 st.success(f"✅ {_added} line(s) added to order")
                 st.rerun()
 

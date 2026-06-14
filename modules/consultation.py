@@ -15,6 +15,15 @@ Prints:
 import streamlit as st
 import streamlit.components.v1 as components
 from datetime import date
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    from modules.core.name_formatter import format_person_name
+except Exception:
+    def format_person_name(name):
+        return " ".join(str(name or "").strip().split())
 
 
 def _open_print_tab(html: str, filename: str = "clinical_report.html"):
@@ -44,7 +53,9 @@ def _shop(key="shop_name", default="DV Optical"):
         from modules.sql_adapter import run_query
         r = run_query(f"SELECT value FROM system_flags WHERE key='{key}' LIMIT 1") or []
         return r[0].get("value", default) if r else default
-    except: return default
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
+        return default
 
 
 def _fmt(val, d=2):
@@ -53,13 +64,17 @@ def _fmt(val, d=2):
     try:
         f = float(val)
         return f"+{f:.{d}f}" if f > 0 else f"{f:.{d}f}"
-    except: return str(val)
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
+        return str(val)
 
 def _fax(val):
     if val is None or str(val).strip() in ('', 'None', 'nan', '0'):
         return '—'
     try: return str(int(float(val)))
-    except: return str(val)
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
+        return str(val)
 
 
 def render_consultation_close():
@@ -72,17 +87,30 @@ def render_consultation_close():
     if not pid:
         return
 
-    # ── Ensure patient has a unique barcode ID ─────────────────────────────
-    try:
-        from modules.printing.patient_card_printer import (
-            ensure_patient_id, render_patient_card_buttons,
-            render_patient_id_badge, barcode_svg
+    def _is_valid_uuid(v):
+        v = str(v or "").strip()
+        return (
+            len(v) == 36
+            and v.count("-") == 4
+            and not v.upper().startswith(("CONS-", "CS/", "TEMP-"))
         )
-        patient_barcode = ensure_patient_id(pid)
-    except Exception:
-        patient_barcode = pid[:8].upper()
 
-    name = st.session_state.get("retail_patient_name", "")
+    _has_real_patient_id = _is_valid_uuid(pid)
+
+    # ── Ensure patient has a unique barcode ID ─────────────────────────────
+    if _has_real_patient_id:
+        try:
+            from modules.printing.patient_card_printer import (
+                ensure_patient_id, render_patient_card_buttons,
+                render_patient_id_badge, barcode_svg
+            )
+            patient_barcode = ensure_patient_id(pid)
+        except Exception:
+            patient_barcode = str(pid)[:8].upper()
+    else:
+        patient_barcode = ""
+
+    name = format_person_name(st.session_state.get("retail_patient_name", ""))
     # In edit mode _erp_patient_mob is set from the order record — prefer that
     mob  = (
         st.session_state.get("_erp_patient_mob","") or
@@ -94,15 +122,11 @@ def render_consultation_close():
         st.session_state.get("_editing_consult_order_id") or
         st.session_state.get("_erp_order_id")
     )
-    def _is_valid_uuid(v):
-        v = str(v or "").strip()
-        return len(v) == 36 and v.count("-") == 4 and not v.upper().startswith("CONS-")
-
     _raw_edit_oid = (
         st.session_state.get("_editing_consult_order_id","") or
         st.session_state.get("_erp_order_id","")
     )
-    # Validate — never use order_no (CONS-*) as a UUID
+    # Validate — never use order_no (CS/*, CONS-*) as a UUID
     _edit_order_id = _raw_edit_oid if _is_valid_uuid(_raw_edit_oid) else ""
 
     # ── ISSUE 2: Block editing if consultation already converted to billing ──
@@ -153,7 +177,7 @@ def render_consultation_close():
                     if not name: name = str(_nm_row[0].get("patient_name","") or "")
                     if not mob:  mob  = str(_nm_row[0].get("patient_mobile","") or "")
             # Try patient table if still blank
-            if (not name or not mob) and pid and len(str(pid)) > 10:
+            if (not name or not mob) and _has_real_patient_id:
                 _pt_row = _rq_nm(
                     "SELECT master_name, mobile FROM patients WHERE id=%s::uuid LIMIT 1",
                     (str(pid),)
@@ -169,7 +193,8 @@ def render_consultation_close():
     try:
         from modules.settings.shop_master import get_unit_info as _gui
         _si = _gui("retail")   # Retail = Parakh Eye Care
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         _si = {}
     shop  = _si.get("shop_name","DV Optical")
     addr  = ", ".join(filter(None,[
@@ -192,9 +217,62 @@ def render_consultation_close():
     st.markdown("")
 
     # ── Consultation charge ────────────────────────────────────────────────
-    _default_fee = float(_si.get("consult_fee_default","200") or "200")
 
-    # In edit mode — pre-fill fee from existing order in DB
+    # ── Load consultation types from shop master ───────────────────────────
+    # shop_master stores consultation_types as JSON list of {name, fee} dicts
+    # under the key "consultation_types". Falls back to 4 built-in types.
+    _DEFAULT_CONSULT_TYPES = [
+        {"name": "Consultation",                "fee": 200},
+        {"name": "Special Consultation",        "fee": 400},
+        {"name": "Low Vision Consultation",     "fee": 500},
+        {"name": "Contact Lens Consultation",   "fee": 300},
+    ]
+    _consult_types = _DEFAULT_CONSULT_TYPES
+    try:
+        import json as _json_ct
+        _ct_raw = _si.get("consultation_types", "")
+        if _ct_raw:
+            _parsed = _json_ct.loads(_ct_raw) if isinstance(_ct_raw, str) else _ct_raw
+            if isinstance(_parsed, list) and _parsed:
+                _consult_types = _parsed
+    except Exception:
+        pass
+    _ct_names   = [t["name"] for t in _consult_types]
+    _ct_fee_map = {t["name"]: float(t.get("fee", 0)) for t in _consult_types}
+
+    # In edit mode — load saved consult_type from order's extra_data or notes
+    _saved_ct = ""
+    if _in_edit_mode and _edit_order_id:
+        try:
+            from modules.sql_adapter import run_query as _rq_ct
+            _ct_row = _rq_ct(
+                "SELECT COALESCE(extra_data::json->>'consult_type','') AS ct "
+                "FROM orders WHERE id=%s::uuid LIMIT 1",
+                (_edit_order_id,)
+            ) or []
+            _saved_ct = str(_ct_row[0].get("ct","") or "") if _ct_row else ""
+        except Exception:
+            pass
+
+    _ct_default_idx = _ct_names.index(_saved_ct) if _saved_ct in _ct_names else 0
+
+    _ct_col1, _ct_col2 = st.columns([2, 1])
+    with _ct_col1:
+        _consult_type = st.selectbox(
+            "Consultation type",
+            _ct_names,
+            index=_ct_default_idx,
+            key="consult_type_select",
+            help="Type determines default fee. Change fee below if needed.",
+        )
+    with _ct_col2:
+        st.markdown("<div style='padding-top:28px'></div>", unsafe_allow_html=True)
+        st.caption(f"Default fee: ₹{_ct_fee_map.get(_consult_type, 0):.0f}")
+
+    # Auto-update default fee when type changes (unless edit mode pre-filled)
+    _default_fee = _ct_fee_map.get(_consult_type, float(_si.get("consult_fee_default","200") or "200"))
+
+    # In edit mode — pre-fill fee from existing order in DB (overrides type default)
     _fee_widget_key = "consult_fee"
     if _in_edit_mode and _fee_widget_key not in st.session_state:
         try:
@@ -207,18 +285,16 @@ def render_consultation_close():
                 _default_fee = float(_fee_pre_row[0].get("fee", _default_fee) or _default_fee)
         except Exception:
             pass
+    _fee_context = str(_edit_order_id or "NEW")
+    if st.session_state.get("_consult_fee_context") != _fee_context:
+        st.session_state[_fee_widget_key] = float(_default_fee or 0)
+        st.session_state["_consult_fee_context"] = _fee_context
 
-    cc1, cc2, cc3 = st.columns([1, 1, 2])
+    cc1, cc3 = st.columns([1, 2])
     with cc1:
         consult_fee = st.number_input(
             "Consultation fee ₹", min_value=0.0, value=_default_fee, step=10.0,
             key="consult_fee"
-        )
-    with cc2:
-        pay_mode = st.selectbox(
-            "Payment mode",
-            ["Cash", "UPI", "Card", "Free", "Insurance"],
-            key="consult_pay_mode"
         )
     with cc3:
         referral_name = st.text_input(
@@ -226,8 +302,52 @@ def render_consultation_close():
             placeholder="Dr. Sharma, LV Prasad Eye Institute",
             key="consult_referral"
         )
+    pay_mode = "Cash"
 
-    # ── Referral reason — only shown when a doctor is entered ────────────
+    # Payment mode is chosen in the post-save receipt panel.
+    # Before save we only need the fee amount for the consultation order.
+    # _charge_to_billing and _record_payment_now default to False here —
+    # the post-save panel raises the receipt or billing switch explicitly.
+    _charge_to_billing  = False
+    _record_payment_now = False
+
+    # ── Same-day second visit detection ───────────────────────────────────
+    # Check if a consultation order already exists for this patient today.
+    # If so, warn staff and offer an override to create a fresh visit record.
+    _same_day_exists = False
+    _same_day_ono    = ""
+    if pid and len(str(pid)) > 10 and not _in_edit_mode:
+        try:
+            from modules.sql_adapter import run_query as _rq_sd
+            _sd_row = _rq_sd("""
+                SELECT order_no FROM orders
+                WHERE party_id = %s::uuid
+                  AND order_type = 'CONSULTATION'
+                  AND DATE(created_at) = CURRENT_DATE
+                  AND COALESCE(is_deleted, FALSE) = FALSE
+                ORDER BY created_at DESC LIMIT 1
+            """, (str(pid),)) or []
+            if _sd_row:
+                _same_day_exists = True
+                _same_day_ono    = _sd_row[0]["order_no"]
+        except Exception:
+            pass
+
+    _force_new_visit = False
+    if _same_day_exists:
+        st.warning(
+            f"⚠️ A consultation for this patient already exists today: **{_same_day_ono}**. "
+            f"Saving again will update the existing record. "
+            f"Tick below to create a separate new visit instead."
+        )
+        _force_new_visit = st.checkbox(
+            "➕ Create new visit (re-examination / follow-up today)",
+            value=False,
+            key="consult_force_new_visit",
+            help="Use when the patient is seen a second time today with different findings.",
+        )
+
+
     referral_reason = ""
     if referral_name.strip():
         referral_reason = st.text_area(
@@ -302,46 +422,80 @@ def render_consultation_close():
     va_nr = cx.get("va_near_r","—")
     va_nl = cx.get("va_near_l","—")
     lids  = cx.get("sle_lids","")
+    conjunctiva = cx.get("sle_conjunctiva","")
     cornea= cx.get("sle_cornea","")
+    ac    = cx.get("sle_ac","")
+    iris  = cx.get("sle_iris","")
     lens  = cx.get("sle_lens","")
+    vitreous = cx.get("sle_vitreous","")
     fundus= cx.get("sle_fundus","")
-    iop_r = cx.get("iop_right","")
-    iop_l = cx.get("iop_left","")
+    iop_r = cx.get("iop_r") or cx.get("iop_right","")
+    iop_l = cx.get("iop_l") or cx.get("iop_left","")
+    ortho_dist = cx.get("ortho_cover_test_distance","")
+    ortho_near = cx.get("ortho_cover_test_near","")
+    nystagmus = cx.get("ortho_nystagmus","")
+    motility = cx.get("ortho_ocular_motility","")
+    convergence = cx.get("ortho_convergence","")
     remarks = cx.get("ortho_remarks","")
+    doctor_notes = cx.get("doctor_notes","")
+    treatment_plan = cx.get("treatment_plan","")
+    followup_advice = cx.get("followup_advice","")
 
     today = date.today().strftime("%d %b %Y")
 
-    # ── FIX 3: Add to Billing checkbox ────────────────────────────────────
-    # Replaces the old caption hint with a real checkbox.
-    # When ticked → billing product lines panel appears below consultation close.
-    _add_to_billing = st.checkbox(
-        "🛍️  Add product lines to this visit (spectacles / lenses / frames)",
-        value=st.session_state.get("consult_add_billing", False),
-        key="consult_add_billing",
-        help="Tick to punch product lines in the same visit. "
-             "Consultation fee is already collected — only product billing added.",
-    )
-    if _add_to_billing:
-        st.info(
-            "📋 Billing lines will appear below after saving consultation. "
-            "Save the consultation first, then punch product lines.",
-            icon="ℹ️"
+    from modules.utils.submit_guard import guarded_submit, is_locked
+
+    # ── Saved-order marker: once saved for this session, block re-save ────
+    # Key uses patient_id + today's date so it auto-resets for a new patient
+    # or a new calendar day, but blocks double-click / button-spam same visit.
+    _save_key      = f"consult_saved_{pid}_{date.today().isoformat()}"
+    _already_saved = bool(st.session_state.get(_save_key))
+    _saved_ono     = st.session_state.get(_save_key, "")
+
+    # force_new_visit=True: staff explicitly wants a fresh visit record today.
+    # Clear the existing save key so the Save button is not blocked, and
+    # generate a new unique key so this second save gets its own guard slot.
+    if _force_new_visit and _already_saved:
+        import time as _time
+        _save_key      = f"consult_saved_{pid}_{date.today().isoformat()}_{int(_time.time())}"
+        _already_saved = bool(st.session_state.get(_save_key))
+        _saved_ono     = st.session_state.get(_save_key, "")
+
+    # _in_edit_mode and _edit_order_id defined at top of function
+    if _in_edit_mode:
+        _already_saved = False  # always allow save in edit mode
+        # Load _saved_ono for use in print/WA/billing buttons, but do NOT set _save_key.
+        # Setting _save_key here would make _show_postsave=True immediately on page load
+        # before staff has actually clicked Save — causing the "saved without storing" bug.
+        # Instead we use a separate _consult_edit_saved flag set only after a real save.
+        if not _saved_ono and _edit_order_id:
+            try:
+                from modules.sql_adapter import run_query as _rq_eno
+                _eno_row = _rq_eno(
+                    "SELECT order_no FROM orders WHERE id=%s::uuid LIMIT 1",
+                    (_edit_order_id,)
+                ) or []
+                if _eno_row:
+                    _saved_ono = str(_eno_row[0].get("order_no",""))
+                    # Do NOT set _save_key here — that would open the post-save panel
+                    # before any save action. _show_postsave uses _consult_edit_saved instead.
+            except Exception:
+                pass
+
+    # ── Helper: build WhatsApp message (FIX 2) ────────────────────────────
+    def _wa_consultation_msg(consultation_id: str, fee_amount: float) -> str:
+        _store_name  = shop or "Parakh Eye Care"
+        _store_phone = phone or ""
+        return (
+            f"Thanks for Visiting {_store_name} a state of art Optometry Clinic.\n\n"
+            f"Your Consultation ID is *{consultation_id}*.\n\n"
+            f"We have received your consultation of *Rs {fee_amount:.0f}*.\n\n"
+            f"We will be happy if you see our wide range of frames and lenses "
+            f"at our Optical Store and avail great offers and discount.\n\n"
+            f"Store this number in your mobile to get regular updates"
+            + (f": {_store_phone}" if _store_phone else ".")
         )
 
-    # ── Patient ID card print section ────────────────────────────────────
-    st.markdown("**Patient ID Card**")
-    try:
-        render_patient_card_buttons(
-            patient_id=pid, patient_name=name, mobile=mob,
-            rx_r={"sph":rx_r_sph,"cyl":rx_r_cyl,"axis":rx_r_axis,"add":rx_r_add},
-            rx_l={"sph":rx_l_sph,"cyl":rx_l_cyl,"axis":rx_l_axis,"add":rx_l_add},
-            visit_date=today
-        )
-    except Exception as _pce:
-        st.caption(f"Patient card: {_pce}")
-    st.markdown("---")
-
-    # ── helper ────────────────────────────────────────────────────────────
     def _do_print():
         # ALWAYS fetch name+mobile from DB before print — never trust session state
         # This fixes first-print blank name issue (session not yet committed)
@@ -415,8 +569,13 @@ def render_consultation_close():
             rx_r=_p_rx_r,
             rx_l=_p_rx_l,
             va_unaided=(va_ur, va_ul), va_aided=(va_ar, va_al), va_near=(va_nr, va_nl),
-            lids=lids, cornea=cornea, lens=lens, fundus=fundus,
-            iop_r=iop_r, iop_l=iop_l, remarks=remarks,
+            lids=lids, conjunctiva=conjunctiva, cornea=cornea, ac=ac,
+            iris=iris, lens=lens, vitreous=vitreous, fundus=fundus,
+            iop_r=iop_r, iop_l=iop_l,
+            ortho_dist=ortho_dist, ortho_near=ortho_near, nystagmus=nystagmus,
+            motility=motility, convergence=convergence, remarks=remarks,
+            doctor_notes=doctor_notes, treatment_plan=treatment_plan,
+            followup_advice=followup_advice,
             fee=consult_fee, pay_mode=pay_mode,
             patient_barcode=patient_barcode,
         )
@@ -536,49 +695,11 @@ def render_consultation_close():
             fee=consult_fee, pay_mode=pay_mode,
             rx_r=(rx_r_sph, rx_r_cyl, rx_r_axis, rx_r_add),
             rx_l=(rx_l_sph, rx_l_cyl, rx_l_axis, rx_l_add),
-            referral=referral_name.strip()
-        )
-
-    from modules.utils.submit_guard import guarded_submit, is_locked
-
-    # ── Saved-order marker: once saved for this session, block re-save ────
-    # Key uses patient_id + today's date so it auto-resets for a new patient
-    # or a new calendar day, but blocks double-click / button-spam same visit.
-    _save_key      = f"consult_saved_{pid}_{date.today().isoformat()}"
-    _already_saved = bool(st.session_state.get(_save_key))
-    _saved_ono     = st.session_state.get(_save_key, "")
-
-    # _in_edit_mode and _edit_order_id defined at top of function
-    if _in_edit_mode:
-        _already_saved = False  # always allow save in edit mode
-        # Pre-fill saved_ono from existing order so post-save panel shows immediately
-        if not _saved_ono and _edit_order_id:
-            try:
-                from modules.sql_adapter import run_query as _rq_eno
-                _eno_row = _rq_eno(
-                    "SELECT order_no FROM orders WHERE id=%s::uuid LIMIT 1",
-                    (_edit_order_id,)
-                ) or []
-                if _eno_row:
-                    _saved_ono = str(_eno_row[0].get("order_no",""))
-                    # Also set _save_key so post-save panel renders
-                    if _saved_ono:
-                        st.session_state[_save_key] = _saved_ono
-            except Exception:
-                pass
-
-    # ── Helper: build WhatsApp message (FIX 2) ────────────────────────────
-    def _wa_consultation_msg(consultation_id: str, fee_amount: float) -> str:
-        _store_name  = shop or "Parakh Eye Care"
-        _store_phone = phone or ""
-        return (
-            f"Thanks for Visiting {_store_name} a state of art Optometry Clinic.\n\n"
-            f"Your Consultation ID is *{consultation_id}*.\n\n"
-            f"We have received your consultation of *Rs {fee_amount:.0f}*.\n\n"
-            f"We will be happy if you see our wide range of frames and lenses "
-            f"at our Optical Store and avail great offers and discount.\n\n"
-            f"Store this number in your mobile to get regular updates"
-            + (f": {_store_phone}" if _store_phone else ".")
+            referral=referral_name.strip(),
+            force_new_visit=_force_new_visit,
+            consult_type=_consult_type,
+            charge_to_billing=_charge_to_billing,
+            record_payment_now=bool(_record_payment_now and not _charge_to_billing),
         )
 
     b1, b2, b3, b4, b5 = st.columns(5)
@@ -593,22 +714,21 @@ def render_consultation_close():
                     ono = _do_save()
                     if ono:
                         st.session_state[_save_key] = ono
+                        if _in_edit_mode:
+                            st.session_state["_consult_edit_saved"] = True
                         try:
                             from modules.utils.submit_guard import clear_lock
                             clear_lock("consult_save_action")
                         except Exception:
                             pass
                         # Issue 3: set fee lines so retail treats ₹200 as advance
-                        _set_consult_billing_state(ono, consult_fee, pay_mode, pid, name, mob)
-                        # Invalidate visit cache so history tab shows new visit immediately
+                        _set_consult_billing_state(ono, consult_fee, pay_mode, pid, name, mob,
+                                                   record_payment_now=bool(_record_payment_now and not _charge_to_billing))
                         try:
                             from modules.wa_engine import invalidate_visit_cache
                             invalidate_visit_cache(pid)
                         except Exception:
                             pass
-                        # Issue 4: auto-redirect if checkbox ticked
-                        if st.session_state.get("consult_add_billing"):
-                            st.session_state["_open_retail_after_consult"] = True
                         st.rerun()
 
     with b2:
@@ -622,20 +742,28 @@ def render_consultation_close():
                     ono = _do_save()
                     if ono:
                         st.session_state[_save_key] = ono
+                        if _in_edit_mode:
+                            st.session_state["_consult_edit_saved"] = True
                         try:
                             from modules.utils.submit_guard import clear_lock
                             clear_lock("consult_save_action")
                         except Exception:
                             pass
-                        _set_consult_billing_state(ono, consult_fee, pay_mode, pid, name, mob)
-                        if st.session_state.get("consult_add_billing"):
-                            st.session_state["_open_retail_after_consult"] = True
+                        _set_consult_billing_state(ono, consult_fee, pay_mode, pid, name, mob,
+                                                   record_payment_now=bool(_record_payment_now and not _charge_to_billing))
                         _do_print()
                         st.rerun()
 
     with b3:
         if _already_saved:
-            st.success(f"✅ {_saved_ono}")
+            st.markdown(
+                f"<div style='background:#052e16;border:1px solid #22c55e;border-radius:6px;"
+                f"padding:7px 12px;font-size:0.82rem;color:#4ade80'>"
+                f"✅ <b>{_saved_ono}</b> &nbsp;·&nbsp; "
+                f"<span style='color:#86efac'>Record saved — not billed</span>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
             if st.button("🖨️ Print Again", key="consult_print_again",
                          width='stretch'):
                 _do_print()
@@ -656,7 +784,7 @@ def render_consultation_close():
                     name=name, mobile=mob, date=today,
                     shop=shop, addr=addr, phone=phone,
                     rx_r=(rx_r_sph, rx_r_cyl, rx_r_axis, rx_r_add),
-                    rx_l=(rx_l_sph, rx_r_cyl, rx_l_axis, rx_l_add),
+                    rx_l=(rx_l_sph, rx_l_cyl, rx_l_axis, rx_l_add),
                     va_unaided=(va_ur, va_ul), va_aided=(va_ar, va_al),
                     lids=lids, cornea=cornea, lens=lens, fundus=fundus,
                     iop_r=iop_r, iop_l=iop_l,
@@ -671,255 +799,1111 @@ def render_consultation_close():
             _reset_consultation()
             st.rerun()
 
+    # ── Second action row: Receipt print ─────────────────────────────────
+    _ra1, _ra2, _ra3 = st.columns([1, 1, 2])
+    with _ra1:
+        if st.button("🧾 Print Receipt", key="consult_print_receipt",
+                     width='stretch',
+                     help="Print 80mm consultation receipt with fee + RX summary"):
+            _print_consultation_receipt(
+                order_no=_saved_ono or "—",
+                patient_name=name,
+                mobile=mob,
+                consult_type=st.session_state.get("consult_type_select", "Consultation"),
+                fee=consult_fee,
+                pay_mode=pay_mode,
+                visit_date=today,
+                shop=shop, addr=addr, phone=phone,
+                rx_r=(rx_r_sph, rx_r_cyl, rx_r_axis, rx_r_add),
+                rx_l=(rx_l_sph, rx_l_cyl, rx_l_axis, rx_l_add),
+                shop_upi=_si.get("shop_upi_id", ""),
+            )
+
+    # ── Patient ID card print section ────────────────────────────────────
+    st.markdown("**Patient ID Card**")
+    if _has_real_patient_id:
+        try:
+            render_patient_card_buttons(
+                patient_id=pid, patient_name=name, mobile=mob,
+                rx_r={"sph":rx_r_sph,"cyl":rx_r_cyl,"axis":rx_r_axis,"add":rx_r_add},
+                rx_l={"sph":rx_l_sph,"cyl":rx_l_cyl,"axis":rx_l_axis,"add":rx_l_add},
+                visit_date=today
+            )
+        except Exception as _pce:
+            st.caption(f"Patient card: {_pce}")
+    else:
+        st.caption("Patient card will be available after linking this consultation to a patient master.")
+    st.markdown("---")
+
+    # Patient cleanup/merge and medical-history editing now live in
+    # Retail Punching → Patient History, keeping consultation close focused.
+
+    # ── Visit History ──────────────────────────────────────────────────────
+    with st.expander("📋 Last 5 Visits", expanded=False):
+        if _has_real_patient_id:
+            try:
+                from modules.sql_adapter import run_query as _rq_hist
+                _hist = _rq_hist("""
+                    SELECT
+                        pv.visit_date,
+                        pv.id::text              AS visit_id,
+                        o.order_no,
+                        COALESCE(pv.right_sph,0)  AS rsph,
+                        COALESCE(pv.right_cyl,0)  AS rcyl,
+                        COALESCE(pv.right_axis,0) AS raxis,
+                        COALESCE(pv.left_sph,0)   AS lsph,
+                        COALESCE(pv.left_cyl,0)   AS lcyl,
+                        COALESCE(pv.left_axis,0)  AS laxis,
+                        o.status,
+                        COALESCE(o.total_value, 0) AS total_value,
+                        o.order_type
+                    FROM patient_visits pv
+                    LEFT JOIN orders o
+                        ON (o.customer_order_no = pv.id::text
+                            OR (o.party_id = pv.patient_id
+                                AND o.order_type = 'CONSULTATION'
+                                AND o.created_at::date = pv.visit_date))
+                        AND COALESCE(o.is_deleted, FALSE) = FALSE
+                    WHERE pv.patient_id = %s::uuid
+                    ORDER BY pv.visit_date DESC, pv.created_at DESC
+                    LIMIT 5
+                """, (str(pid),)) or []
+                if not _hist:
+                    st.caption("No visit history found for this patient")
+                else:
+                    for _h in _hist:
+                        _rx_str = (
+                            f"R: {float(_h['rsph']):+.2f}/{float(_h['rcyl']):+.2f}"
+                            f"×{int(float(_h['raxis']))}  "
+                            f"L: {float(_h['lsph']):+.2f}/{float(_h['lcyl']):+.2f}"
+                            f"×{int(float(_h['laxis']))}"
+                        )
+                        _ono  = _h.get("order_no") or "—"
+                        _fee  = float(_h.get("total_value") or 0)
+                        _stat = _h.get("status") or ""
+                        _otype = _h.get("order_type") or ""
+                        _badge = (
+                            "🧾 Billed" if _otype in ("RETAIL","WHOLESALE")
+                            else "🩺 Consult" if _otype == "CONSULTATION"
+                            else ""
+                        )
+                        # Try to fetch clinical notes for this visit
+                        _notes_parts = []
+                        _vid = _h.get("visit_id","")
+                        if _vid and len(_vid) > 10:
+                            try:
+                                _cn = _rq_hist("""
+                                    SELECT
+                                        NULLIF(TRIM(COALESCE(doctor_notes,'')), '')     AS dnotes,
+                                        NULLIF(TRIM(COALESCE(treatment_plan,'')), '')   AS tx,
+                                        NULLIF(TRIM(COALESCE(followup_advice,'')), '')  AS fu,
+                                        NULLIF(TRIM(COALESCE(diagnosis,'')), '')        AS dx
+                                    FROM patient_clinicals
+                                    WHERE visit_id = %s::uuid
+                                    LIMIT 1
+                                """, (_vid,)) or []
+                                if _cn:
+                                    _c = _cn[0]
+                                    if _c.get("dx"):     _notes_parts.append(f"Dx: {_c['dx']}")
+                                    if _c.get("dnotes"): _notes_parts.append(f"Notes: {_c['dnotes']}")
+                                    if _c.get("tx"):     _notes_parts.append(f"Tx: {_c['tx']}")
+                                    if _c.get("fu"):     _notes_parts.append(f"F/U: {_c['fu']}")
+                            except Exception:
+                                pass  # patient_clinicals may not exist for old records
+                        _notes_line = "  \n".join(_notes_parts) if _notes_parts else ""
+                        st.markdown(
+                            f"**{_h['visit_date']}** &nbsp; `{_ono}` &nbsp; {_badge} {_stat}"
+                            + (f"  ₹{_fee:.0f}" if _fee else "")
+                            + f"  \n`{_rx_str}`"
+                            + (f"  \n{_notes_line}" if _notes_line else ""),
+                            unsafe_allow_html=False
+                        )
+                        st.markdown("---")
+            except Exception as _he:
+                st.caption(f"History unavailable: {_he}")
+        else:
+            st.caption("No patient selected")
+
+    # ── Patient name / mobile correction ──────────────────────────────────
+    # Kept out of the consultation close screen. Patient cleanup/merge belongs
+    # in Retail Punching -> Patient History so this panel stays focused.
+    if False:
+      with st.expander("✏️ Patient details / corrections", expanded=False):
+        # Load full patient record for pre-filling extra fields
+        _pt_full = {}
+        if _has_real_patient_id:
+            try:
+                from modules.sql_adapter import run_query as _rq_ptfull
+                _ptf_rows = _rq_ptfull("""
+                    SELECT master_name, mobile,
+                           COALESCE(alt_mobile,'')          AS alt_mobile,
+                           COALESCE(email,'')               AS email,
+                           dob, anniversary_date,
+                           COALESCE(occupation,'')          AS occupation,
+                           COALESCE(diabetes,FALSE)         AS diabetes,
+                           COALESCE(hypertension,FALSE)     AS hypertension,
+                           COALESCE(thyroid,FALSE)          AS thyroid,
+                           COALESCE(cardiac_history,FALSE)  AS cardiac_history,
+                           COALESCE(asthma,FALSE)           AS asthma,
+                           COALESCE(drug_allergy,'')        AS drug_allergy,
+                           COALESCE(current_medication,'')  AS current_medication,
+                           COALESCE(surgery_history,'')     AS surgery_history,
+                           COALESCE(family_history,'')      AS family_history,
+                           COALESCE(systemic_notes,'')      AS systemic_notes
+                    FROM patients WHERE id=%s::uuid LIMIT 1
+                """, (str(pid),)) or []
+                if _ptf_rows:
+                    _pt_full = dict(_ptf_rows[0])
+            except Exception:
+                pass  # columns may not exist yet — safe, we add them below
+
+        _pf1, _pf2 = st.columns(2)
+        with _pf1:
+            _corr_name = st.text_input(
+                "Full name *", value=_pt_full.get("master_name", name) or name,
+                key="consult_corr_name",
+                help="Corrects patient master record. All old visits remain linked."
+            )
+            _corr_mob = st.text_input(
+                "Primary mobile *", value=_pt_full.get("mobile", mob) or mob,
+                key="consult_corr_mob"
+            )
+            _corr_alt_mob = st.text_input(
+                "Alternate mobile",
+                value=_pt_full.get("alt_mobile", "") or "",
+                key="consult_corr_alt_mob",
+                placeholder="Second contact number"
+            )
+        with _pf2:
+            _corr_email = st.text_input(
+                "Email",
+                value=_pt_full.get("email", "") or "",
+                key="consult_corr_email",
+                placeholder="patient@example.com"
+            )
+            _corr_occupation = st.text_input(
+                "Occupation",
+                value=_pt_full.get("occupation", "") or "",
+                key="consult_corr_occupation",
+                placeholder="e.g. Software Engineer, Teacher, Retired"
+            )
+
+        _pf3, _pf4 = st.columns(2)
+        with _pf3:
+            # DOB — stored as date, shown as text for easy entry
+            _dob_str = ""
+            if _pt_full.get("dob"):
+                try: _dob_str = str(_pt_full["dob"])[:10]
+                except Exception: pass
+            _corr_dob = st.text_input(
+                "Date of birth (YYYY-MM-DD)",
+                value=_dob_str,
+                key="consult_corr_dob",
+                placeholder="1990-06-15"
+            )
+        with _pf4:
+            _ann_str = ""
+            if _pt_full.get("anniversary_date"):
+                try: _ann_str = str(_pt_full["anniversary_date"])[:10]
+                except Exception: pass
+            _corr_ann = st.text_input(
+                "Anniversary date (YYYY-MM-DD)",
+                value=_ann_str,
+                key="consult_corr_ann",
+                placeholder="2015-02-20"
+            )
+
+        # ── Medical / Systemic History ─────────────────────────────────────
+        st.markdown("**Medical / Systemic History**")
+        _cm1, _cm2, _cm3, _cm4, _cm5 = st.columns(5)
+        with _cm1:
+            _corr_dm  = st.checkbox("Diabetes",
+                value=bool(_pt_full.get("diabetes", False)), key="consult_corr_dm")
+        with _cm2:
+            _corr_htn = st.checkbox("Hypertension",
+                value=bool(_pt_full.get("hypertension", False)), key="consult_corr_htn")
+        with _cm3:
+            _corr_thy = st.checkbox("Thyroid",
+                value=bool(_pt_full.get("thyroid", False)), key="consult_corr_thy")
+        with _cm4:
+            _corr_crd = st.checkbox("Cardiac",
+                value=bool(_pt_full.get("cardiac_history", False)), key="consult_corr_crd")
+        with _cm5:
+            _corr_ast = st.checkbox("Asthma",
+                value=bool(_pt_full.get("asthma", False)), key="consult_corr_ast")
+
+        _ct1, _ct2 = st.columns(2)
+        with _ct1:
+            _corr_allergy = st.text_input(
+                "Drug allergy",
+                value=_pt_full.get("drug_allergy","") or "",
+                key="consult_corr_allergy",
+                placeholder="e.g. Penicillin, Sulfa drugs"
+            )
+            _corr_meds = st.text_area(
+                "Current medication",
+                value=_pt_full.get("current_medication","") or "",
+                key="consult_corr_meds",
+                placeholder="Metformin 500mg, Amlodipine 5mg...",
+                height=75,
+            )
+        with _ct2:
+            _corr_surg = st.text_area(
+                "Surgery history",
+                value=_pt_full.get("surgery_history","") or "",
+                key="consult_corr_surg",
+                placeholder="Cataract surgery 2018 RE...",
+                height=75,
+            )
+            _corr_fam = st.text_input(
+                "Family ocular history",
+                value=_pt_full.get("family_history","") or "",
+                key="consult_corr_fam",
+                placeholder="e.g. Glaucoma in father"
+            )
+        _corr_sysnotes = st.text_area(
+            "Other systemic notes",
+            value=_pt_full.get("systemic_notes","") or "",
+            key="consult_corr_sysnotes",
+            placeholder="Any other relevant medical information...",
+            height=60,
+        )
+
+        if st.button("💾 Save patient details", key="consult_corr_save"):
+            _corr_name_clean = format_person_name(_corr_name)
+            _corr_mob_clean  = _corr_mob.strip()
+            if _corr_name_clean and pid and len(str(pid)) > 10:
+                try:
+                    from modules.sql_adapter import run_write as _rw_corr, run_query as _rq_corr
+                    import json as _json_audit
+
+                    # Ensure extra columns exist (idempotent DDL)
+                    for _col_def in [
+                        "alt_mobile   TEXT",
+                        "email        TEXT",
+                        "dob          DATE",
+                        "anniversary_date DATE",
+                        "occupation   TEXT",
+                        "diabetes          BOOLEAN DEFAULT FALSE",
+                        "hypertension      BOOLEAN DEFAULT FALSE",
+                        "thyroid           BOOLEAN DEFAULT FALSE",
+                        "cardiac_history   BOOLEAN DEFAULT FALSE",
+                        "asthma            BOOLEAN DEFAULT FALSE",
+                        "drug_allergy      TEXT",
+                        "current_medication TEXT",
+                        "surgery_history   TEXT",
+                        "family_history    TEXT",
+                        "systemic_notes    TEXT",
+                    ]:
+                        try:
+                            _rw_corr(
+                                f"ALTER TABLE patients ADD COLUMN IF NOT EXISTS {_col_def}",
+                                ()
+                            )
+                        except Exception:
+                            pass
+
+                    # Fetch old values for audit trail
+                    _old_row = _rq_corr(
+                        "SELECT master_name, mobile FROM patients WHERE id=%s::uuid LIMIT 1",
+                        (str(pid),)
+                    ) or []
+                    _old_name = _old_row[0].get("master_name","") if _old_row else name
+                    _old_mob  = _old_row[0].get("mobile","") if _old_row else mob
+
+                    # Parse dates safely
+                    def _parse_date(s):
+                        if not s or not s.strip(): return None
+                        try:
+                            import datetime as _dt_p
+                            return _dt_p.date.fromisoformat(s.strip())
+                        except Exception:
+                            return None
+
+                    _dob_val = _parse_date(_corr_dob)
+                    _ann_val = _parse_date(_corr_ann)
+
+                    # Apply all corrections in one UPDATE
+                    _rw_corr("""
+                        UPDATE patients SET
+                            master_name        = %s,
+                            mobile             = %s,
+                            alt_mobile         = NULLIF(%s,''),
+                            email              = NULLIF(%s,''),
+                            dob                = %s,
+                            anniversary_date   = %s,
+                            occupation         = NULLIF(%s,''),
+                            diabetes           = %s,
+                            hypertension       = %s,
+                            thyroid            = %s,
+                            cardiac_history    = %s,
+                            asthma             = %s,
+                            drug_allergy       = NULLIF(%s,''),
+                            current_medication = NULLIF(%s,''),
+                            surgery_history    = NULLIF(%s,''),
+                            family_history     = NULLIF(%s,''),
+                            systemic_notes     = NULLIF(%s,'')
+                        WHERE id = %s::uuid
+                    """, (
+                        _corr_name_clean,
+                        _corr_mob_clean,
+                        _corr_alt_mob.strip(),
+                        _corr_email.strip(),
+                        _dob_val,
+                        _ann_val,
+                        _corr_occupation.strip(),
+                        bool(_corr_dm),
+                        bool(_corr_htn),
+                        bool(_corr_thy),
+                        bool(_corr_crd),
+                        bool(_corr_ast),
+                        _corr_allergy.strip(),
+                        _corr_meds.strip(),
+                        _corr_surg.strip(),
+                        _corr_fam.strip(),
+                        _corr_sysnotes.strip(),
+                        str(pid),
+                    ))
+
+                    # Audit log
+                    try:
+                        _rw_corr("""
+                            INSERT INTO system_audit_log
+                                (table_name, record_id, action, old_values, new_values,
+                                 changed_by, changed_at)
+                            VALUES ('patients', %s::uuid, 'PATIENT_DETAILS_UPDATE', %s, %s,
+                                    current_user, NOW())
+                            ON CONFLICT DO NOTHING
+                        """, (
+                            str(pid),
+                            _json_audit.dumps({"master_name": _old_name, "mobile": _old_mob}),
+                            _json_audit.dumps({
+                                "master_name": _corr_name_clean, "mobile": _corr_mob_clean,
+                                "email": _corr_email.strip(), "occupation": _corr_occupation.strip(),
+                            }),
+                        ))
+                    except Exception:
+                        pass
+
+                    st.session_state["retail_patient_name"]   = _corr_name_clean
+                    st.session_state["retail_patient_mobile"] = _corr_mob_clean
+
+                    _changed = []
+                    if _old_name != _corr_name_clean:
+                        _changed.append(f"name: **{_old_name}** → **{_corr_name_clean}**")
+                    if _old_mob != _corr_mob_clean:
+                        _changed.append(f"mobile: {_old_mob} → {_corr_mob_clean}")
+                    _chg_str = " · ".join(_changed) if _changed else "details updated"
+                    st.success(
+                        f"✅ Saved ({_chg_str}) — all existing records remain linked to the same patient ID"
+                    )
+                    st.rerun()
+                except Exception as _corr_err:
+                    st.error(f"Save failed: {_corr_err}")
+            elif not _corr_name_clean:
+                st.warning("Name cannot be blank")
+            else:
+                st.warning("No patient selected — search for a patient first")
+
+    # ── helper ────────────────────────────────────────────────────────────
     # ══════════════════════════════════════════════════════════════════════
     # POST-SAVE PANEL — shown only after consultation is saved
     # FIX 1: Payment collection window
     # FIX 2: WhatsApp message
     # FIX 3: Add to billing lines
     # ══════════════════════════════════════════════════════════════════════
-    # Show post-save panel in edit mode (pre-existing order) OR after fresh save
-    _show_postsave = (_saved_ono and
-        (bool(st.session_state.get(_save_key)) or _in_edit_mode))
+    # Show post-save panel only after a real save action:
+    # - Fresh save: _save_key is set in session after _do_save() succeeds
+    # - Edit mode: an existing consultation may be opened only to collect
+    #   receipt or shift to billing, so show the action panel immediately.
+    #   Unsaved RX/detail edits still require the Save button before they
+    #   affect DB; this panel reads the already-saved consultation row.
+    _show_postsave = (_saved_ono and (
+        bool(st.session_state.get(_save_key)) or
+        _in_edit_mode
+    ))
 
     if _show_postsave:
         st.markdown("---")
 
-        # ── FIX 1: Payment Collection Window ─────────────────────────────
-        # In edit mode — check if fee changed vs what's stored in DB
-        _stored_fee = 0.0
-        if _in_edit_mode and _edit_order_id:
-            try:
-                from modules.sql_adapter import run_query as _rq_fee
-                _fee_row = _rq_fee(
-                    "SELECT COALESCE(total_value,0) AS fee FROM orders WHERE id=%s::uuid LIMIT 1",
-                    (_edit_order_id,)
-                ) or []
-                _stored_fee = float(_fee_row[0].get("fee",0) if _fee_row else 0)
-            except Exception:
-                pass
-            _fee_changed = abs(float(consult_fee) - _stored_fee) > 0.01
-            if _fee_changed:
-                st.warning(
-                    f"⚠️ Fee changed from ₹{_stored_fee:.0f} → ₹{consult_fee:.0f}. "
-                    f"Save to update the order.",
-                    icon="⚠️"
-                )
-
-        st.markdown(
-            "<div style='background:#0d2818;border:1px solid #10b981;"
-            "border-radius:8px;padding:14px 16px;margin-bottom:12px'>"
-            "<div style='color:#10b981;font-weight:700;font-size:0.95rem;margin-bottom:4px'>"
-            "💰 Payment Collection</div>"
-            "<div style='color:#6ee7b7;font-size:0.8rem'>"
-            f"Consultation {_saved_ono} · Collect and close this visit</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
+        # ── Payment action — two big buttons shown after save ──────────────
+        # Check if payment already recorded in DB for this consultation
+        _pay_already_recorded = False
+        _pay_recorded_amount  = 0.0
+        _pay_recorded_mode    = pay_mode
+        _pay_recorded_ref     = ""
         _coll_done_key = f"consult_coll_done_{_saved_ono}"
         _coll_done     = bool(st.session_state.get(_coll_done_key))
+        _ctb_flag      = False   # charge_to_billing flag from saved order
 
-        if _coll_done:
-            # Payment done — show only the success line, no editable fields
-            st.success(
-                f"✅ ₹{st.session_state.get('consult_collect_amount', consult_fee):.0f} "
-                f"collected via {st.session_state.get('consult_collect_mode', pay_mode)}"
+        if _saved_ono:
+            try:
+                from modules.sql_adapter import run_query as _rq_paycheck
+                # Check charge_to_billing flag
+                _ctb_row = _rq_paycheck(
+                    "SELECT COALESCE(extra_data::json->>'charge_to_billing','false') AS ctb "
+                    "FROM orders WHERE order_no=%s LIMIT 1",
+                    (_saved_ono,)
+                ) or []
+                _ctb_flag = str(_ctb_row[0].get("ctb","false")).lower() in ("true","1") if _ctb_row else False
+
+                # Check for existing advance payment
+                _ord_id_check = _rq_paycheck(
+                    "SELECT id::text FROM orders WHERE order_no=%s LIMIT 1",
+                    (_saved_ono,)
+                ) or []
+                if _ord_id_check and not _ctb_flag:
+                    _oid_check = _ord_id_check[0]["id"]
+                    _pay_check = _rq_paycheck("""
+                        SELECT amount, payment_mode, reference_no
+                        FROM payments
+                        WHERE advance_for_order_id = %s::uuid
+                          AND (
+                              payment_type = 'ADVANCE'
+                              OR COALESCE(payment_no,'') LIKE 'CPR-%%'
+                              OR COALESCE(remarks,'') ILIKE '%%consultation fee%%'
+                          )
+                          AND COALESCE(is_deleted, FALSE) = FALSE
+                        ORDER BY created_at DESC LIMIT 1
+                    """, (_oid_check,)) or []
+                    if _pay_check:
+                        _pay_already_recorded = True
+                        _pay_recorded_amount  = float(_pay_check[0].get("amount") or 0)
+                        _pay_recorded_mode    = str(_pay_check[0].get("payment_mode") or pay_mode)
+                        _pay_recorded_ref     = str(_pay_check[0].get("reference_no") or "")
+            except Exception:
+                pass
+
+        # ── Case 1: payment already in DB — show receipt line ─────────────
+        if _pay_already_recorded or _coll_done:
+            _disp_amt  = _pay_recorded_amount if _pay_already_recorded else consult_fee
+            _disp_mode = _pay_recorded_mode   if _pay_already_recorded else pay_mode
+            _disp_ref  = _pay_recorded_ref if _pay_already_recorded else ""
+            _ref_html  = (
+                f" &nbsp;·&nbsp; Ref {_disp_ref}"
+                if _disp_ref else ""
             )
-        else:
-            # Not yet collected — show input fields
-            _pc1, _pc2, _pc3 = st.columns([1, 1, 1.5])
-            with _pc1:
-                _coll_amount = st.number_input(
-                    "Amount received ₹",
-                    min_value=0.0,
-                    value=float(consult_fee),
-                    step=10.0,
-                    key="consult_collect_amount",
+            _prc1, _prc2, _prc3 = st.columns([5, 1.4, 1])
+            with _prc1:
+                st.markdown(
+                    f"<div style='background:#052e16;border:1px solid #22c55e;"
+                    f"border-radius:8px;padding:10px 16px'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                    f"<div>"
+                    f"<span style='color:#4ade80;font-weight:700;font-size:0.9rem'>"
+                    f"🧾 Consultation Fee Received</span>"
+                    f"<div style='color:#86efac;font-size:0.72rem;margin-top:3px'>"
+                    f"{_saved_ono} &nbsp;·&nbsp; {_disp_mode}"
+                    f"{_ref_html}"
+                    f" &nbsp;·&nbsp; <span style='color:#4ade80'>✔ Recorded · not duplicated</span>"
+                    f"</div>"
+                    f"</div>"
+                    f"<div style='color:#4ade80;font-size:1.2rem;font-weight:900'>"
+                    f"₹{_disp_amt:,.0f}"
+                    f"</div>"
+                    f"</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
                 )
-            with _pc2:
-                _coll_mode = st.selectbox(
-                    "Payment mode",
-                    ["Cash", "UPI", "Card", "Free", "Insurance"],
-                    index=["Cash","UPI","Card","Free","Insurance"].index(pay_mode)
-                           if pay_mode in ["Cash","UPI","Card","Free","Insurance"] else 0,
-                    key="consult_collect_mode",
-                )
-            with _pc3:
-                _coll_ref = st.text_input(
-                    "Reference / UPI ID (optional)",
-                    placeholder="UPI txn ID or cheque no",
-                    key="consult_collect_ref",
-                )
-
-            _cp1, _cp2 = st.columns(2)
-            with _cp1:
-                if st.button("✅ Mark Payment Collected",
-                             key="consult_collect_btn",
+            with _prc2:
+                if st.button("🛍️ Full Billing",
+                             key=f"consult_rx_only_billing_{_saved_ono[:8] if _saved_ono else 'x'}",
                              type="primary",
-                             use_container_width=True):
+                             use_container_width=True,
+                             help="Open full billing with patient + RX only. The consultation receipt stays separate."):
                     try:
-                        from modules.sql_adapter import run_write as _rw_pay, run_query as _rq_pay
-                        import uuid as _uuid_pay
-                        _pay_id  = str(_uuid_pay.uuid4())
-                        _pay_no  = f"CPR-{_saved_ono}"
-                        _ord_row = _rq_pay(
+                        from modules.consultation import convert_consultation_to_billing
+                        _rx_only = convert_consultation_to_billing(_saved_ono)
+                        if _rx_only and "error" not in _rx_only:
+                            _rxd_ro = _rx_only.get("rx", {})
+                            st.session_state["_consult_prefill"] = {
+                                "patient_name":     _rx_only.get("patient_name", name),
+                                "patient_mobile":   _rx_only.get("patient_mobile", mob),
+                                "patient_id":       _rx_only.get("patient_id", pid),
+                                "consult_order_id": _rx_only.get("consult_order_id", _saved_ono),
+                                "rx_r": {"sph": _rxd_ro.get("sph_r", 0), "cyl": _rxd_ro.get("cyl_r", 0),
+                                         "axis": _rxd_ro.get("ax_r", 0), "add": _rxd_ro.get("add_r", 0)},
+                                "rx_l": {"sph": _rxd_ro.get("sph_l", 0), "cyl": _rxd_ro.get("cyl_l", 0),
+                                         "axis": _rxd_ro.get("ax_l", 0), "add": _rxd_ro.get("add_l", 0)},
+                                "order_lines": [],
+                                "include_consult_fee": False,
+                            }
+                            st.session_state["_erp_mode"] = "CONSULT_BILLING"
+                            st.session_state["_visit_mode_default"] = 0
+                            st.session_state["_force_full_billing_mode"] = True
+                            st.session_state.pop("_consult_fee_lines", None)
+                            st.session_state.pop("_consult_paid_advance_amount", None)
+                            st.session_state.pop("_consult_paid_advance_mode", None)
+                            st.session_state.pop("_consult_paid_advance_ref", None)
+                            st.session_state.pop("retail_visit_mode", None)
+                            st.session_state.pop("_editing_consult_order_id", None)
+                            st.session_state.pop("_force_consultation_tab", None)
+                            st.session_state["active_module"] = None
+                            st.session_state["_retail_entry_count"] = (
+                                int(st.session_state.get("_retail_entry_count", 0) or 0) + 1
+                            )
+                            st.session_state["_sidebar_page"] = "🛍️  Retail Order"
+                            st.rerun()
+                        elif _rx_only:
+                            st.error(_rx_only.get("error", "Could not open full billing."))
+                    except Exception as _rx_only_ex:
+                        st.error(f"Open billing failed: {_rx_only_ex}")
+            with _prc3:
+                if st.button("🗑️ Cancel",
+                             key=f"consult_cancel_advance_{_saved_ono[:8] if _saved_ono else 'x'}",
+                             use_container_width=True,
+                             help="Soft-delete this advance payment row"):
+                    _cancel_confirm_key = f"consult_cancel_adv_confirm_{_saved_ono}"
+                    st.session_state[_cancel_confirm_key] = True
+                    st.rerun()
+
+            # Confirm cancel dialog
+            _cancel_confirm_key = f"consult_cancel_adv_confirm_{_saved_ono}"
+            if st.session_state.get(_cancel_confirm_key):
+                st.warning("⚠️ Cancel this advance payment? The order remains — only the payment receipt is removed.")
+                _cca1, _cca2 = st.columns(2)
+                with _cca1:
+                    if st.button("✅ Yes, cancel",
+                                 key=f"consult_cancel_adv_yes_{_saved_ono[:8] if _saved_ono else 'x'}",
+                                 type="primary", use_container_width=True):
+                        try:
+                            from modules.sql_adapter import run_write as _rw_ca, run_query as _rq_ca
+                            _ord_ca = _rq_ca(
+                                "SELECT id::text FROM orders WHERE order_no=%s LIMIT 1",
+                                (_saved_ono,)
+                            ) or []
+                            if _ord_ca:
+                                _rw_ca("""
+                                    UPDATE payments SET is_deleted = TRUE
+                                     WHERE advance_for_order_id = %s::uuid
+                                       AND (
+                                           payment_type = 'ADVANCE'
+                                           OR COALESCE(payment_no,'') LIKE 'CPR-%%'
+                                           OR COALESCE(remarks,'') ILIKE '%%consultation fee%%'
+                                       )
+                                       AND COALESCE(is_deleted, FALSE) = FALSE
+                                """, (_ord_ca[0]["id"],))
+                                _rw_ca("""
+                                    WITH paid AS (
+                                        SELECT COALESCE(SUM(amount), 0) AS amt
+                                        FROM payments
+                                        WHERE (order_id = %s::uuid OR advance_for_order_id = %s::uuid)
+                                          AND payment_type IN ('PAYMENT','RECEIPT','ADVANCE')
+                                          AND COALESCE(is_deleted, FALSE) = FALSE
+                                    )
+                                    UPDATE orders o
+                                       SET advance_amount = paid.amt,
+                                           advance_received = paid.amt > 0,
+                                           payment_status = CASE
+                                               WHEN paid.amt <= 0 THEN 'PENDING'
+                                               WHEN COALESCE(o.total_value, 0) > 0
+                                                AND paid.amt >= COALESCE(o.total_value, 0) - 0.50 THEN 'PAID'
+                                               ELSE 'PARTIAL'
+                                           END
+                                      FROM paid
+                                     WHERE o.id = %s::uuid
+                                """, (_ord_ca[0]["id"], _ord_ca[0]["id"], _ord_ca[0]["id"]))
+                            st.session_state.pop(_cancel_confirm_key, None)
+                            st.session_state.pop(_coll_done_key, None)
+                            st.success("✅ Advance payment cancelled")
+                            st.rerun()
+                        except Exception as _ca_ex:
+                            st.error(f"Cancel failed: {_ca_ex}")
+                with _cca2:
+                    if st.button("❌ Keep",
+                                 key=f"consult_cancel_adv_no_{_saved_ono[:8] if _saved_ono else 'x'}",
+                                 use_container_width=True):
+                        st.session_state.pop(_cancel_confirm_key, None)
+                        st.rerun()
+
+        # ── Case 2: no payment yet — show two big action buttons ──────────
+        else:
+            st.markdown(
+                "<div style='font-size:0.78rem;font-weight:700;color:#94a3b8;"
+                "text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px'>"
+                "What would you like to do with the consultation fee?</div>",
+                unsafe_allow_html=True
+            )
+            _btn_col1, _btn_col2 = st.columns(2)
+
+            # ── Big Button A: Record consultation receipt ──────────────────
+            with _btn_col1:
+                st.markdown(
+                    "<div style='background:#052e16;border:2px solid #22c55e;"
+                    "border-radius:10px;padding:14px 16px;margin-bottom:8px'>"
+                    "<div style='font-size:1.05rem;font-weight:700;color:#4ade80'>💰 Record Receipt</div>"
+                    "<div style='font-size:0.72rem;color:#86efac;margin-top:4px'>"
+                    "Collect consultation fee now. Full billing later opens RX-only; "
+                    "this receipt stays separate."
+                    "</div></div>",
+                    unsafe_allow_html=True
+                )
+                _pay_methods = ["CASH", "UPI", "NEFT", "RTGS", "CHEQUE", "CARD", "FREE", "INSURANCE"]
+                _pay_default = str(pay_mode or "CASH").strip().upper()
+                _rec_amount_key = "consult_receipt_amount"
+                _rec_fee_sync_key = "consult_receipt_amount_source_fee"
+                _current_fee_for_receipt = float(consult_fee or 0)
+                if st.session_state.get(_rec_fee_sync_key) != _current_fee_for_receipt:
+                    st.session_state[_rec_amount_key] = _current_fee_for_receipt
+                    st.session_state[_rec_fee_sync_key] = _current_fee_for_receipt
+                _rcc1, _rcc2 = st.columns([1, 1])
+                with _rcc1:
+                    _rec_amount = st.number_input(
+                        "Amount received ₹",
+                        min_value=0.0,
+                        value=_current_fee_for_receipt,
+                        step=1.0,
+                        key=_rec_amount_key,
+                    )
+                with _rcc2:
+                    _rec_mode = st.selectbox(
+                        "Payment mode",
+                        _pay_methods,
+                        index=_pay_methods.index(_pay_default) if _pay_default in _pay_methods else 0,
+                        key="consult_receipt_mode",
+                    )
+                _rec_ref = ""
+                if _rec_mode in ("UPI", "NEFT", "RTGS", "CHEQUE", "CARD"):
+                    _rec_ref = st.text_input(
+                        "UPI / UTR / cheque / card reference *",
+                        key="consult_receipt_ref",
+                        placeholder="Required for non-cash payment",
+                    ).strip()
+                _rec_remarks = st.text_input(
+                    "Remarks",
+                    key="consult_receipt_remarks",
+                    placeholder="Optional note",
+                ).strip()
+                if st.button(
+                    f"💰 Record ₹{_rec_amount:.0f} via {_rec_mode}",
+                    key="consult_record_receipt_btn",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        if float(_rec_amount or 0) <= 0:
+                            st.error("Enter amount received.")
+                            st.stop()
+                        if _rec_mode in ("UPI", "NEFT", "RTGS", "CHEQUE", "CARD") and not _rec_ref:
+                            st.error("Enter UPI / UTR / cheque / card reference number.")
+                            st.stop()
+                        from modules.sql_adapter import run_write as _rw_rec, run_query as _rq_rec
+                        import uuid as _uuid_rec
+                        _rec_method = str(_rec_mode or "Cash").strip().upper()
+                        _ord_rec = _rq_rec(
+                            "SELECT id::text, COALESCE(patient_name, party_name, '') AS pname "
+                            "FROM orders WHERE order_no=%s LIMIT 1",
+                            (_saved_ono,)
+                        ) or []
+                        _receipt_ok = False
+                        if not _ord_rec:
+                            st.error("Consultation order not found in DB. Save the consultation first, then record payment.")
+                            st.stop()
+                        if _ord_rec:
+                            _oid_rec = _ord_rec[0]["id"]
+                            _pname_rec = str(_ord_rec[0].get("pname") or name or "").strip()
+                            _pay_exists = _rq_rec("""
+                                SELECT id FROM payments
+                                WHERE advance_for_order_id = %s::uuid
+                                  AND (
+                                      payment_type = 'ADVANCE'
+                                      OR COALESCE(payment_no,'') LIKE 'CPR-%%'
+                                      OR COALESCE(remarks,'') ILIKE '%%consultation fee%%'
+                                  )
+                                  AND COALESCE(is_deleted,FALSE) = FALSE
+                                LIMIT 1
+                            """, (_oid_rec,)) or []
+                            if _pay_exists:
+                                _receipt_ok = True
+                            else:
+                                _receipt_no = _get_next_payment_number()
+                                _deleted_same_no = _rq_rec("""
+                                    SELECT id::text
+                                    FROM payments
+                                    WHERE payment_no = %s
+                                      AND COALESCE(is_deleted, FALSE) = TRUE
+                                    ORDER BY created_at DESC
+                                    LIMIT 1
+                                """, (_receipt_no,)) or []
+                                if _deleted_same_no:
+                                    _rw_rec("""
+                                        UPDATE payments
+                                           SET party_name = %s,
+                                               payment_date = CURRENT_DATE,
+                                               payment_mode = %s,
+                                               method = %s,
+                                               amount = %s,
+                                               reference_no = %s,
+                                               remarks = %s,
+                                               order_id = %s::uuid,
+                                               advance_for_order_id = %s::uuid,
+                                               payment_type = 'RECEIPT',
+                                               is_advance = FALSE,
+                                               is_deleted = FALSE
+                                         WHERE id = %s::uuid
+                                    """, (
+                                        _pname_rec,
+                                        _rec_method, _rec_method, float(_rec_amount),
+                                        _rec_ref or None,
+                                        _rec_remarks or f"Consultation fee received — {_saved_ono}",
+                                        _oid_rec, _oid_rec,
+                                        _deleted_same_no[0]["id"],
+                                    ))
+                                else:
+                                    _rw_rec("""
+                                        INSERT INTO payments
+                                            (id, payment_no, party_name,
+                                             payment_date, payment_mode, method,
+                                             amount, reference_no, remarks,
+                                             order_id, advance_for_order_id,
+                                             payment_type, is_advance, created_by, created_at)
+                                        VALUES (%s::uuid, %s, %s,
+                                                CURRENT_DATE, %s, %s,
+                                                %s, %s, %s,
+                                                %s::uuid, %s::uuid,
+                                                'RECEIPT', FALSE, %s, NOW())
+                                    """, (
+                                        str(_uuid_rec.uuid4()), _receipt_no,
+                                        _pname_rec,
+                                        _rec_method, _rec_method, float(_rec_amount),
+                                        _rec_ref or None,
+                                        _rec_remarks or f"Consultation fee received — {_saved_ono}",
+                                        _oid_rec, _oid_rec,
+                                        st.session_state.get("user_name", "Consultation"),
+                                    ))
+                                _rw_rec("""
+                                    UPDATE orders
+                                       SET payment_mode = %s,
+                                           advance_amount = COALESCE(advance_amount, 0) + %s,
+                                           advance_received = TRUE,
+                                           payment_status = CASE
+                                               WHEN COALESCE(total_value, 0) > 0
+                                                AND COALESCE(advance_amount, 0) + %s >= COALESCE(total_value, 0) - 0.50
+                                               THEN 'PAID'
+                                               ELSE 'PARTIAL'
+                                           END
+                                     WHERE id = %s::uuid
+                                """, (
+                                    _rec_method, float(_rec_amount), float(_rec_amount), _oid_rec,
+                                ))
+                                _verify_insert = _rq_rec("""
+                                    SELECT id
+                                    FROM payments
+                                    WHERE payment_no = %s
+                                      AND COALESCE(is_deleted, FALSE) = FALSE
+                                    LIMIT 1
+                                """, (_receipt_no,)) or []
+                                _receipt_ok = bool(_verify_insert)
+                        if _receipt_ok:
+                            st.session_state[_coll_done_key] = True
+                            st.rerun()
+                        st.error("Payment was not recorded. Please retry and check the technical alert if it repeats.")
+                    except Exception as _re:
+                        st.error(f"Record failed: {_re}")
+
+            # ── Big Button B: Add to spectacle order ───────────────────────
+            with _btn_col2:
+                st.markdown(
+                    "<div style='background:#0d0a1e;border:2px solid #6366f1;"
+                    "border-radius:10px;padding:14px 16px;margin-bottom:8px'>"
+                    "<div style='font-size:1.05rem;font-weight:700;color:#818cf8'>🛍️ Add to Order</div>"
+                    "<div style='font-size:0.72rem;color:#a5b4fc;margin-top:4px'>"
+                    "Patient is buying spectacles. Fee added as line on retail order. "
+                    "One combined bill — no separate consultation receipt."
+                    "</div></div>",
+                    unsafe_allow_html=True
+                )
+                st.markdown("<div style='height:42px'></div>", unsafe_allow_html=True)
+                if st.button(
+                    "🛍️ Add fee to billing",
+                    key="consult_add_fee_to_billing_btn",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    _paid_for_billing = 0.0
+                    _paid_mode_for_billing = pay_mode
+                    _paid_ref_for_billing = ""
+                    _consult_uuid_for_billing = ""
+                    # Mark order as charge_to_billing so bridge knows fee not paid
+                    try:
+                        from modules.sql_adapter import run_write as _rw_ctb, run_query as _rq_ctb
+                        import json as _json_ctb
+                        _ctb_ord = _rq_ctb(
                             "SELECT id::text FROM orders WHERE order_no=%s LIMIT 1",
                             (_saved_ono,)
                         ) or []
-                        _ord_id  = _ord_row[0]["id"] if _ord_row else None
-                        if _ord_id:
-                            _rw_pay("""
-                                INSERT INTO payments
-                                    (id, payment_no, payment_date, payment_mode,
-                                     amount, reference_no, remarks,
-                                     order_id, advance_for_order_id,
-                                     payment_type, created_at)
-                                VALUES
-                                    (%s::uuid, %s, CURRENT_DATE, %s,
-                                     %s, %s, %s,
-                                     %s::uuid, %s::uuid,
-                                     'ADVANCE', NOW())
-                                ON CONFLICT DO NOTHING
-                            """, (
-                                _pay_id, _pay_no, _coll_mode,
-                                float(_coll_amount),
-                                _coll_ref or None,
-                                f"Consultation fee — {name}",
-                                _ord_id, _ord_id,
-                            ))
-                        st.session_state[_coll_done_key] = True
+                        _consult_uuid_for_billing = _ctb_ord[0]["id"] if _ctb_ord else ""
+                        _ctb_paid_rows = []
+                        if _consult_uuid_for_billing:
+                            _ctb_paid_rows = _rq_ctb("""
+                                SELECT COALESCE(SUM(amount), 0) AS paid,
+                                       MAX(COALESCE(NULLIF(payment_mode,''), method, '')) AS mode,
+                                       MAX(COALESCE(reference_no,'')) AS ref_no
+                                FROM payments
+                                WHERE advance_for_order_id = %s::uuid
+                                  AND payment_type = 'ADVANCE'
+                                  AND COALESCE(is_deleted, FALSE) = FALSE
+                            """, (_consult_uuid_for_billing,)) or []
+                            if _ctb_paid_rows:
+                                _paid_for_billing = float(_ctb_paid_rows[0].get("paid") or 0)
+                                _paid_mode_for_billing = str(_ctb_paid_rows[0].get("mode") or pay_mode)
+                                _paid_ref_for_billing = str(_ctb_paid_rows[0].get("ref_no") or "")
+                            if _paid_for_billing > 0:
+                                _rw_ctb("""
+                                    UPDATE payments
+                                       SET payment_type = 'ADVANCE',
+                                           is_advance = TRUE,
+                                           remarks = 'Consultation fee carried to retail billing — ' || %s
+                                     WHERE advance_for_order_id = %s::uuid
+                                       AND payment_type = 'ADVANCE'
+                                       AND COALESCE(is_deleted, FALSE) = FALSE
+                                """, (_saved_ono, _consult_uuid_for_billing))
+                        _rw_ctb("""
+                            UPDATE orders
+                               SET extra_data = COALESCE(extra_data,'{}'::jsonb)
+                                             || %s::jsonb
+                             WHERE order_no = %s
+                        """, (_json_ctb.dumps({"charge_to_billing": True}), _saved_ono))
+                    except Exception:
+                        pass
+                    # Trigger billing conversion
+                    from modules.consultation import convert_consultation_to_billing
+                    import uuid as _uuid_sw, datetime as _dt_sw
+                    _result_sw = convert_consultation_to_billing(_saved_ono)
+                    if _result_sw and "error" not in _result_sw:
+                        _rxd_sw  = _result_sw.get("rx", {})
+                        _cfee_sw = float(_result_sw.get("consult_fee") or consult_fee or 0)
+                        _cpid_sw = _result_sw.get("prod_id","")
+                        _cpnm_sw = _result_sw.get("prod_name","Consultation Fee") or "Consultation Fee"
+                        _flines_sw = []
+                        if _cfee_sw > 0 and _cpid_sw:
+                            _flines_sw = [{
+                                "line_id": str(_uuid_sw.uuid4()),
+                                "provisional_order_id": None,
+                                "product_id": _cpid_sw,
+                                "product_name": _cpnm_sw,
+                                "brand": "Service", "main_group": "Services",
+                                "batch_no": "", "eye_side": "SERVICE",
+                                "sph": None, "cyl": None, "axis": None, "add_power": None,
+                                "lens_params": {}, "boxing_params": {},
+                                "requested_qty": 1, "billing_qty": 1,
+                                "order_qty": 0, "display_qty": "1 SERVICE",
+                                "batch_allocation": [],
+                                "unit_price": _cfee_sw, "total_price": _cfee_sw,
+                                "gst_percent": 0.0, "gst_amount": 0.0,
+                                "is_gst_exempt": True,
+                                "is_service_line": True, "status": "Complete",
+                                "created_at": _dt_sw.datetime.now().isoformat(),
+                            }]
+                        st.session_state["_consult_prefill"] = {
+                            "patient_name":    _result_sw.get("patient_name", name),
+                            "patient_mobile":  _result_sw.get("patient_mobile", mob),
+                            "patient_id":      _result_sw.get("patient_id", pid),
+                            "consult_order_id":_result_sw.get("consult_order_id", _saved_ono),
+                            "rx_r": {"sph":_rxd_sw.get("sph_r",0),"cyl":_rxd_sw.get("cyl_r",0),
+                                     "axis":_rxd_sw.get("ax_r",0),"add":_rxd_sw.get("add_r",0)},
+                            "rx_l": {"sph":_rxd_sw.get("sph_l",0),"cyl":_rxd_sw.get("cyl_l",0),
+                                     "axis":_rxd_sw.get("ax_l",0),"add":_rxd_sw.get("add_l",0)},
+                            "order_lines":    _flines_sw,
+                            "include_consult_fee": True,
+                            "consult_fee":    _cfee_sw,
+                            "consult_paid":   False,
+                            "consult_paid_amount": _paid_for_billing,
+                            "payment_mode":   _paid_mode_for_billing or pay_mode,
+                            "payment_ref":    _paid_ref_for_billing,
+                        }
+                        st.session_state.pop("_order_edit_prefill", None)
+                        st.session_state["_erp_mode"] = "CONSULT_BILLING"
+                        _erp_sw = ""
+                        try:
+                            from modules.sql_adapter import run_query as _rq_sw
+                            _sw_row = _rq_sw("SELECT id::text FROM orders WHERE order_no=%s LIMIT 1",
+                                             (_saved_ono,)) or []
+                            if _sw_row: _erp_sw = _sw_row[0]["id"]
+                        except Exception: pass
+                        st.session_state["_erp_order_id"]              = _erp_sw
+                        st.session_state["_open_retail_after_consult"] = False
+                        st.session_state.pop("_consult_fee_lines_consumed", None)
+                        st.session_state["_visit_mode_default"]        = 0
+                        st.session_state["_force_full_billing_mode"]   = True
+                        if _paid_for_billing > 0:
+                            st.session_state["_consult_paid_advance_amount"] = _paid_for_billing
+                            st.session_state["_consult_paid_advance_mode"] = _paid_mode_for_billing or pay_mode
+                            st.session_state["_consult_paid_advance_ref"] = _paid_ref_for_billing
+                        else:
+                            st.session_state.pop("_consult_paid_advance_amount", None)
+                            st.session_state.pop("_consult_paid_advance_mode", None)
+                            st.session_state.pop("_consult_paid_advance_ref", None)
+                        st.session_state.pop("retail_visit_mode", None)
+                        st.session_state.pop("_editing_consult_order_id", None)
+                        st.session_state.pop("_force_consultation_tab", None)
+                        st.session_state["active_module"] = None
+                        st.session_state["_retail_entry_count"] = (
+                            int(st.session_state.get("_retail_entry_count",0) or 0) + 1
+                        )
+                        st.session_state["_sidebar_page"] = "🛍️  Retail Order"
                         st.rerun()
-                    except Exception as _pe:
-                        st.error(f"Payment record failed: {_pe}. Mark manually.")
-                        st.session_state[_coll_done_key] = True
-                        st.rerun()
+                    else:
+                        st.error(_result_sw.get("error","Conversion failed"))
 
-        # ── FIX 2: WhatsApp Message — always shown, own row ──────────────
-        st.markdown("")
-        _mob_key      = "consult_wa_mobile_display"
-        _mob_edit_key = f"consult_wa_mob_edited_{_saved_ono}"
+        # ── Payment Audit — inline DB check ──────────────────────────────
+        with st.expander("🔍 Payment audit — check DB rows", expanded=False):
+            if _saved_ono:
+                try:
+                    from modules.sql_adapter import run_query as _rq_audit
+                    # Get order UUID
+                    _oa_ord = _rq_audit(
+                        "SELECT id::text, order_no, total_value, order_type FROM orders WHERE order_no=%s LIMIT 1",
+                        (_saved_ono,)
+                    ) or []
+                    if not _oa_ord:
+                        st.caption(f"Order {_saved_ono} not found in DB")
+                    else:
+                        _oa_oid = _oa_ord[0]["id"]
+                        st.caption(f"Order UUID: `{_oa_oid}`  ·  Type: {_oa_ord[0].get('order_type')}  ·  Value: ₹{float(_oa_ord[0].get('total_value') or 0):.0f}")
+                        # All payment rows for this order
+                        _oa_pays = _rq_audit("""
+                            SELECT
+                                payment_no, payment_date, payment_mode,
+                                amount, payment_type,
+                                COALESCE(is_deleted,FALSE) AS deleted,
+                                created_at::text AS created_at
+                            FROM payments
+                            WHERE advance_for_order_id = %s::uuid
+                               OR order_id = %s::uuid
+                            ORDER BY created_at
+                        """, (_oa_oid, _oa_oid)) or []
 
-        # Seed ONLY if: key missing, OR empty, OR not yet edited by user
-        if not st.session_state.get(_mob_edit_key):
-            _best_mob = mob or ""
+                        if not _oa_pays:
+                            st.warning("⚠️ No payment rows found for this order in DB")
+                        else:
+                            _active = [p for p in _oa_pays if not p.get("deleted")]
+                            _deleted = [p for p in _oa_pays if p.get("deleted")]
+                            st.success(f"✅ {len(_active)} active payment row(s)  ·  {len(_deleted)} soft-deleted")
+                            for _p in _oa_pays:
+                                _del_mark = " ~~DELETED~~" if _p.get("deleted") else ""
+                                st.markdown(
+                                    f"- `{_p['payment_no']}` · ₹{float(_p['amount'] or 0):.0f} · "
+                                    f"{_p['payment_mode']} · {_p['payment_type']} · {str(_p['created_at'])[:16]}"
+                                    + _del_mark
+                                )
+                except Exception as _ae:
+                    st.error(f"Audit query failed: {_ae}")
+            else:
+                st.caption("Save consultation first to audit payments")
+
+        # ── WhatsApp — reads from DB, no sticky text_input widget ────────
+        # The text_input below was causing phone number to "stick" across patients
+        # because Streamlit preserves widget state by key.
+        # Solution: resolve mobile from DB only, show a direct wa.me link.
+        # Staff can correct the number in "Patient Details" expander if needed.
+        _wa_db_mob = ""
+        if _saved_ono:
             try:
-                from modules.wa_engine import resolve_mobile
-                _best_mob = resolve_mobile(patient_id=pid, fallback=mob) or mob or ""
+                from modules.sql_adapter import run_query as _rq_wa_db
+                _wa_row = _rq_wa_db(
+                    "SELECT COALESCE(patient_mobile,'') AS mobile "
+                    "FROM orders WHERE order_no=%s LIMIT 1",
+                    (_saved_ono,)
+                ) or []
+                _wa_db_mob = str(_wa_row[0].get("mobile","") or "").strip() if _wa_row else ""
+                # Fallback to patient table if blank on order
+                if not _wa_db_mob and _has_real_patient_id:
+                    _wa_pt = _rq_wa_db(
+                        "SELECT COALESCE(mobile,'') AS mobile FROM patients WHERE id=%s::uuid LIMIT 1",
+                        (str(pid),)
+                    ) or []
+                    _wa_db_mob = str(_wa_pt[0].get("mobile","") or "").strip() if _wa_pt else ""
             except Exception:
-                pass
-            if _mob_key not in st.session_state or not st.session_state.get(_mob_key):
-                st.session_state[_mob_key] = _best_mob
+                _wa_db_mob = str(mob or "").strip()
 
-        _wa_c1, _wa_c2 = st.columns([1.5, 1])
-        with _wa_c1:
-            _prev_mob = st.session_state.get(_mob_key, "")
-            _wa_mob_display = st.text_input(
-                "Mobile",
-                key=_mob_key,
-                help="Edit if incorrect before sending WhatsApp",
+        _wa_msg = _wa_consultation_msg(_saved_ono, consult_fee)
+        try:
+            from modules.wa_contact_tools import render_mobile_field
+            from modules.wa_hub import wa_link
+            _wa_send_mob = render_mobile_field(
+                f"consult_rx_{_saved_ono or 'draft'}",
+                name=name,
+                mobile=_wa_db_mob or mob,
+                patient_id=str(pid or "") if _has_real_patient_id else "",
+                order_id=str(_edit_order_id or st.session_state.get("_erp_order_id", "") or ""),
+                label="WhatsApp mobile",
             )
-            if _wa_mob_display != _prev_mob:
-                st.session_state[_mob_edit_key] = True
+            _wa_url = wa_link(_wa_send_mob, _wa_msg)
+        except Exception:
+            import urllib.parse as _uparse
+            _wa_clean = "".join(x for x in (_wa_db_mob or mob) if x.isdigit())
+            if _wa_clean.startswith("91") and len(_wa_clean) == 12:   _wa_clean = _wa_clean[2:]
+            elif _wa_clean.startswith("0") and len(_wa_clean) == 11:  _wa_clean = _wa_clean[1:]
+            elif _wa_clean.startswith("091") and len(_wa_clean) == 13: _wa_clean = _wa_clean[3:]
+            _wa_e164 = ("91" + _wa_clean) if (len(_wa_clean) == 10 and _wa_clean[0] in "6789") else ""
+            _wa_url = f"https://wa.me/{_wa_e164}?text={_uparse.quote(_wa_msg)}" if _wa_e164 else ""
 
-        with _wa_c2:
-            # Fix 5: robust Indian mobile sanitization
-            _wa_mob = "".join(x for x in (_wa_mob_display or "") if x.isdigit())
-            if _wa_mob.startswith("91") and len(_wa_mob) == 12:
-                _wa_mob = _wa_mob[2:]
-            elif _wa_mob.startswith("0") and len(_wa_mob) == 11:
-                _wa_mob = _wa_mob[1:]
-            elif _wa_mob.startswith("091") and len(_wa_mob) == 13:
-                _wa_mob = _wa_mob[3:]
-            # Only valid 10-digit Indian mobile (starts 6/7/8/9)
-            _wa_mob = ("91" + _wa_mob) if (len(_wa_mob) == 10 and _wa_mob[0] in "6789") else ""
+        if _wa_url:
+            st.link_button("📲 Send WhatsApp RX", _wa_url, use_container_width=False)
+        else:
+            st.caption("📲 Enter and save a valid mobile number to enable WhatsApp.")
 
-            if _wa_mob:
-                import urllib.parse as _uparse
-                _wa_msg = _wa_consultation_msg(_saved_ono, consult_fee)
-                _wa_url = f"https://wa.me/{_wa_mob}?text={_uparse.quote(_wa_msg)}"
-                st.markdown("")  # vertical alignment spacer
-                st.link_button("📲 Send WhatsApp", _wa_url, use_container_width=True)
-            else:
-                st.caption("No valid mobile — WhatsApp unavailable")
-
-        # ── FIX 4: Add to Billing — auto-redirect, no extra button ───────
-        if _add_to_billing:
-            st.markdown("---")
-            st.info(
-                "🛍️ **Add to Billing** is ticked. "
-                "Consultation fee ₹{:.0f} will be treated as advance. "
-                "Opening Retail Order now...".format(consult_fee)
-            )
-            # Auto-redirect: set all state and navigate immediately
-            _conv_key = f"consult_converted_{_saved_ono}"
-            if not st.session_state.get(_conv_key):
-                st.session_state[_conv_key] = True
-                _redir_key = f"consult_redir_{_saved_ono}"
-                # Fix 4: guard double-redirect on rerun
-                if not st.session_state.get(_redir_key):
-                    st.session_state[_redir_key] = True
-                    try:
-                        from modules.consultation import convert_consultation_to_billing
-                        _result = convert_consultation_to_billing(_saved_ono)
-                        if _result and "error" not in _result:
-                                st.session_state["_order_edit_prefill"]          = _result
-                                st.session_state["_erp_mode"]                    = "CONSULT_BILLING"
-                                # Store UUID in _erp_order_id (not order_no) to avoid
-                                # "invalid input syntax for type uuid" errors in edit flow
-                                _erp_uuid_lookup = ""
-                                try:
-                                    from modules.sql_adapter import run_query as _rq_eid
-                                    _eid_rows = _rq_eid(
-                                        "SELECT id::text FROM orders WHERE order_no=%s LIMIT 1",
-                                        (_saved_ono,)
-                                    ) or []
-                                    if _eid_rows: _erp_uuid_lookup = _eid_rows[0]["id"]
-                                except Exception: pass
-                                # Never store order_no as _erp_order_id — it breaks UUID casts
-                                st.session_state["_erp_order_id"] = _erp_uuid_lookup or ""
-                                st.session_state["_open_retail_after_consult"]   = False
-                                st.session_state["_consult_fee_lines_consumed"]  = True
-                                # Force full billing mode — clear all consultation flags
-                                st.session_state["_visit_mode_default"]          = 0
-                                st.session_state.pop("retail_visit_mode", None)
-                                st.session_state.pop("_editing_consult_order_id", None)
-                                st.session_state.pop("_force_consultation_tab", None)
-                                st.session_state["_sidebar_page"]                = "🛍️  Retail Order"
-                                st.rerun()
-                        elif _result and "error" in _result:
-                            st.error(_result["error"])
-                    except Exception as _be:
-                        st.error(f"Billing open failed: {_be}")
-            else:
-                st.success("✅ Billing opened — switch to Retail Order tab")
+        # ══════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════
+        # ── Close visit ───────────────────────────────────────────────────
+        st.markdown("---")
+        _cv1, _cv2 = st.columns(2)
+        with _cv1:
+            if st.button("🧾 Print Consultation Receipt",
+                         key="consult_close_print_receipt",
+                         use_container_width=True):
+                _print_consultation_receipt(
+                    order_no=_saved_ono or "—",
+                    patient_name=name, mobile=mob,
+                    consult_type=st.session_state.get("consult_type_select","Consultation"),
+                    fee=consult_fee, pay_mode=pay_mode, visit_date=today,
+                    shop=shop, addr=addr, phone=phone,
+                    rx_r=(rx_r_sph, rx_r_cyl, rx_r_axis, rx_r_add),
+                    rx_l=(rx_l_sph, rx_l_cyl, rx_l_axis, rx_l_add),
+                    shop_upi=_si.get("shop_upi_id", ""),
+                )
+            if _wa_url:
+                st.link_button("📲 WhatsApp RX", _wa_url, use_container_width=True)
+        with _cv2:
+            if st.button("✅ Close Visit & Next Patient",
+                         key="consult_close_visit_only",
+                         use_container_width=True,
+                         type="primary"):
+                _reset_consultation()
+                st.rerun()
 
 
 def _set_consult_billing_state(
     order_no: str, fee: float, pay_mode: str,
-    pid: str, name: str, mob: str
+    pid: str, name: str, mob: str,
+    record_payment_now: bool = False,
 ) -> None:
     """
-    FIX 3 + FIX 5: After consultation save, bridge the billing system.
+    After consultation save, bridge the billing system.
 
-    Sets two session_state keys retail_punching reads:
-      _consult_fee_lines        — fee line so retail shows ₹200 as advance
-      _retail_consult_source_id — links the consultation order
-
-    When patient converts to full billing:
-      - ₹200 consultation fee is pre-loaded as an advance
-      - If receipt already generated → treated as advance against new order
-      - If not → added to billing lines as SERVICE item
+    record_payment_now=True  → fee was collected now → set _consult_paid_advance_amount
+                               so if staff later adds billing, retail knows it's pre-paid.
+    record_payment_now=False → fee not yet collected → do NOT set advance.
+                               Retail billing panel shows no phantom "₹400 already paid".
     """
     import streamlit as _st
-    _st.session_state["_consult_fee_lines"] = [{
-        "product_name":    "Consultation Fee",
-        "quantity":        1,
-        "unit_price":      float(fee),
-        "total_price":     float(fee),
-        "eye_side":        "SERVICE",
-        "is_service_line": True,
-        "payment_mode":    pay_mode,
-    }]
+    _fee = float(fee or 0)
+    if _fee > 0 and record_payment_now:
+        # Fee collected at consultation — mark as advance for bridge awareness.
+        _st.session_state["_consult_paid_advance_amount"] = _fee
+        _st.session_state["_consult_paid_advance_mode"] = pay_mode or "CASH"
+        _st.session_state.setdefault("_consult_paid_advance_ref", "")
+    else:
+        # Fee not yet collected (pending or deferred) — no advance in session.
+        _st.session_state.pop("_consult_paid_advance_amount", None)
+        _st.session_state.pop("_consult_paid_advance_mode", None)
+        _st.session_state.pop("_consult_paid_advance_ref", None)
+    # A plain consultation save should never carry a previous patient's service line.
+    # The billing conversion path creates fresh _consult_fee_lines from _consult_prefill.
+    _st.session_state.pop("_consult_fee_lines", None)
+    _st.session_state.pop("_consult_fee_consumed", None)
+    _st.session_state.pop("_consult_fee_removed", None)
     _st.session_state["_retail_consult_source_id"] = order_no
     # Also set the prefill so retail knows patient context
     _st.session_state["_consult_prefill"] = {
@@ -933,7 +1917,136 @@ def _set_consult_billing_state(
     }
 
 
-def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
+def _get_next_cs_number() -> str:
+    """
+    Allocate next consultation number via the real registry API.
+
+    Uses alloc_doc_number("CONSULTATION") which:
+      - opens its own short transaction (no cursor needed from caller)
+      - row-locks order_number_registry FOR UPDATE → gap-free, concurrent-safe
+      - formats using SERIES_CONFIG["CONSULTATION"]["prefix"] = "CS"
+      - produces CS/2627/0001, CS/2627/0002, ...
+
+    Fallback (if registry import fails):
+      MAX()+1 scan of existing CS/* numbers in orders table.
+
+    Ultimate fallback (if DB unavailable):
+      Old CONS-YYYYMMDD-XXXXXX format — never crashes.
+    """
+    try:
+        from modules.db.order_number_registry import alloc_doc_number
+        return alloc_doc_number("CONSULTATION")
+    except Exception as _reg_err:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            f"[CONSULTATION] alloc_doc_number failed, using MAX+1 fallback: {_reg_err}"
+        )
+        # MAX+1 fallback using existing CS/* numbers
+        try:
+            from modules.sql_adapter import run_query as _rq_fb
+            import datetime as _dt_fb
+            _today  = _dt_fb.date.today()
+            _fy_s   = _today.year if _today.month >= 4 else _today.year - 1
+            _fy_str = f"{str(_fy_s)[2:]}{str(_fy_s + 1)[2:]}"
+            _prefix = f"CS/{_fy_str}/"
+            _existing = _rq_fb("""
+                SELECT order_no FROM orders
+                WHERE order_no LIKE %s
+                  AND order_type = 'CONSULTATION'
+                  AND COALESCE(is_deleted, FALSE) = FALSE
+                ORDER BY order_no DESC LIMIT 1
+            """, (f"{_prefix}%",)) or []
+            _last_seq = 0
+            if _existing:
+                try: _last_seq = int(_existing[0]["order_no"].split("/")[-1])
+                except Exception: pass
+            return f"{_prefix}{_last_seq + 1:04d}"
+        except Exception:
+            from datetime import date as _d
+            import uuid as _u
+            return f"CONS-{_d.today().strftime('%Y%m%d')}-{str(_u.uuid4())[:6].upper()}"
+
+
+def _get_next_payment_number() -> str:
+    try:
+        from modules.db.order_number_registry import alloc_doc_number
+        return alloc_doc_number("PAYMENT")
+    except Exception as _reg_err:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            f"[CONSULTATION] payment number registry failed, using fallback: {_reg_err}"
+        )
+        from datetime import date as _d
+        import uuid as _u
+        return f"PAY/{_d.today().strftime('%y%m%d')}/{str(_u.uuid4())[:6].upper()}"
+
+
+
+def _ensure_consultation_advance(order_id, order_no, fee, pay_mode, name, run_query, run_write):
+    """
+    Self-heal: insert an advance payment row for a consultation order if one
+    does not already exist. Called both from the same-day guard (so returning
+    an existing order always ends up with a payment) and can be called directly
+    from the post-save panel.
+
+    Args:
+        order_id  : UUID string of the orders row
+        order_no  : CONS-* display number (used in payment_no)
+        fee       : float — consultation fee
+        pay_mode  : str
+        name      : patient name for remarks
+        run_query : bound run_query function
+        run_write : bound run_write function
+    """
+    if float(fee or 0) <= 0:
+        return  # no fee — nothing to do
+    try:
+        import uuid as _uuid_heal
+        _pay_mode_norm = str(pay_mode or "Cash").strip().upper()
+        _pay_exists = run_query("""
+            SELECT id FROM payments
+            WHERE advance_for_order_id = %s::uuid
+              AND (
+                  payment_type = 'ADVANCE'
+                  OR COALESCE(payment_no,'') LIKE 'CPR-%%'
+                  OR COALESCE(remarks,'') ILIKE '%%consultation fee%%'
+              )
+              AND COALESCE(is_deleted, FALSE) = FALSE
+            LIMIT 1
+        """, (order_id,)) or []
+        if not _pay_exists:
+            _pay_id = str(_uuid_heal.uuid4())
+            _payment_no = _get_next_payment_number()
+            run_write("""
+                INSERT INTO payments (
+                    id, payment_no, party_name,
+                    payment_date, payment_mode,
+                    amount, remarks,
+                    order_id, advance_for_order_id,
+                    payment_type, is_advance, created_by, created_at
+                ) VALUES (
+                    %s::uuid, %s, %s,
+                    CURRENT_DATE, %s,
+                    %s, %s,
+                    %s::uuid, %s::uuid,
+                    'RECEIPT', FALSE, %s, NOW()
+                )
+                ON CONFLICT DO NOTHING
+            """, (
+                _pay_id, _payment_no, name,
+                _pay_mode_norm,
+                float(fee), f"Consultation fee received — {order_no}",
+                order_id, order_id,
+                "Consultation",
+            ))
+    except Exception as _heal_err:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            f"[CONSULTATION] _ensure_consultation_advance failed: {_heal_err}"
+        )
+
+
+def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral="", force_new_visit=False, consult_type="Consultation", charge_to_billing=False, record_payment_now=False):
     """
     Save consultation as order AND create a patient_visit record with Rx.
 
@@ -948,16 +2061,20 @@ def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
         import uuid
 
         order_id = str(uuid.uuid4())
-        order_no = f"CONS-{date.today().strftime('%Y%m%d')}-{order_id[:6].upper()}"
+        order_no = _get_next_cs_number()   # e.g. CS/2627/0001
         visit_id = str(uuid.uuid4())
 
         # ── Unpack Rx tuples ─────────────────────────────────────────────
         def _safe_float(v):
             try: return float(v) if v not in (None, "", "None") else None
-            except: return None
+            except Exception as _e:
+                logger.warning("Suppressed error: %s", _e)
+                return None
         def _safe_int(v):
             try: return int(float(v)) if v not in (None, "", "None", "0") else None
-            except: return None
+            except Exception as _e:
+                logger.warning("Suppressed error: %s", _e)
+                return None
 
         r_sph, r_cyl, r_axis, r_add = rx_r
         l_sph, l_cyl, l_axis, l_add = rx_l
@@ -1000,6 +2117,7 @@ def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
                     name = str(_pname_row[0].get("master_name","") or "")
             except Exception:
                 pass
+        name = format_person_name(name)
 
         # ── 0. Fetch patient's real Case ID (record_no) from patients table ──
         # record_no in patient_visits MUST match patients.record_no — it's the
@@ -1016,19 +2134,22 @@ def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
                 pass
 
         # ── 1. Create OR UPDATE patient_visit with today's Rx ───────────────
-        # Uses UPSERT pattern: if a visit already exists for this patient today,
-        # UPDATE it. Never creates duplicate visits on re-save.
+        # Normal path: if a visit already exists today, UPDATE it (no duplicates).
+        # force_new_visit=True: skip the lookup entirely — always INSERT a fresh row.
+        # This is used for re-examination / follow-up on the same calendar day.
         visit_saved = False
         if _pid_is_valid:
             try:
-                # Check if a visit already exists for this patient today
-                _existing_visit = run_query("""
-                    SELECT id::text AS vid FROM patient_visits
-                    WHERE patient_id = %s::uuid
-                      AND visit_date = CURRENT_DATE
-                      AND visit_name = 'Consultation'
-                    ORDER BY created_at DESC LIMIT 1
-                """, (pid,)) or []
+                # Only look for an existing visit when NOT forcing a new one
+                _existing_visit = []
+                if not force_new_visit:
+                    _existing_visit = run_query("""
+                        SELECT id::text AS vid FROM patient_visits
+                        WHERE patient_id = %s::uuid
+                          AND visit_date = CURRENT_DATE
+                          AND visit_name = 'Consultation'
+                        ORDER BY created_at DESC LIMIT 1
+                    """, (pid,)) or []
 
                 if _existing_visit:
                     # UPDATE existing visit instead of inserting new
@@ -1044,7 +2165,7 @@ def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
                         visit_id,
                     ))
                 else:
-                    # INSERT new visit
+                    # INSERT new visit row (also the only path when force_new_visit=True)
                     run_write("""
                         INSERT INTO patient_visits (
                             id, patient_id, record_no, visit_date, visit_name,
@@ -1074,15 +2195,13 @@ def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
         else:
             visit_id = ""       # temp/anonymous patient — no visit record
 
-        # ── 2. Get next display order number ─────────────────────────────
-        try:
-            _seq = run_query("SELECT nextval('orders_display_seq') AS n") or []
-            _disp_no = int(_seq[0]["n"]) if _seq else None
-        except Exception:
-            _disp_no = None
-
-        _disp_col = ", display_order_no" if _disp_no else ""
-        _disp_val = f", {_disp_no}" if _disp_no else ""
+        # ── 2. display_order_no intentionally skipped for CONSULTATION ───
+        # Consultation orders must NOT consume orders_display_seq — that sequence
+        # is for retail/wholesale order numbering. Gaps caused by consultation saves
+        # create confusing jumps in the order register.
+        # Consultation is identified by its CONS-* order_no and order_type='CONSULTATION'.
+        _disp_col = ""
+        _disp_val = ""
 
         # ── 3. Save order ─────────────────────────────────────────────────
         # Use NULL for party_id / customer_order_no if values are missing/invalid
@@ -1099,10 +2218,11 @@ def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
             _extra_params.append(visit_id)
 
         # ── Guard: check if consultation already saved for this patient today ──
-        # Prevents duplicates on double-click or rerun race condition
-        if _pid_is_valid:
+        # Prevents duplicates on double-click or rerun race condition.
+        # Bypassed when force_new_visit=True (staff explicitly wants a second visit).
+        if _pid_is_valid and not force_new_visit:
             _existing = run_query("""
-                SELECT order_no FROM orders
+                SELECT order_no, id::text AS oid FROM orders
                 WHERE party_id = %s::uuid
                   AND order_type = 'CONSULTATION'
                   AND DATE(created_at) = CURRENT_DATE
@@ -1110,7 +2230,8 @@ def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
             """, (pid,)) or []
             if _existing:
                 _existing_ono = _existing[0]["order_no"]
-                # If name or fee was blank on the existing record — patch it now
+                _existing_oid = _existing[0]["oid"]
+                # Patch blank name/fee if needed
                 if name or float(fee) > 0:
                     run_write("""
                         UPDATE orders
@@ -1122,116 +2243,64 @@ def _save_consultation(pid, name, mob, fee, pay_mode, rx_r, rx_l, referral=""):
                          WHERE order_no = %s
                            AND order_type = 'CONSULTATION'
                     """, (name, name, mob, float(fee), pay_mode, _existing_ono))
+                # Only record consultation receipt when explicitly collected.
+                if record_payment_now and not charge_to_billing:
+                    _ensure_consultation_advance(_existing_oid, _existing_ono, fee, pay_mode, name, run_query, run_write)
                 return _existing_ono  # already saved — return existing
+
+        # Build extra_data JSON: stores consult_type and charge_to_billing flag
+        import json as _json_save
+        _extra_data = _json_save.dumps({
+            "consult_type":      consult_type or "Consultation",
+            "charge_to_billing": bool(charge_to_billing),
+        })
 
         run_write(f"""
             INSERT INTO orders (
                 id, order_no, order_type, order_source, status,
                 party_name, patient_name, patient_mobile,
                 total_items, total_value, payment_mode,
+                extra_data,
                 created_at{_party_col}{_visit_col}{_disp_col}
             ) VALUES (
                 %s::uuid, %s, 'CONSULTATION', 'RETAIL', 'CLOSED',
                 %s, %s, %s,
                 0, %s, %s,
+                %s::jsonb,
                 NOW(){_party_val}{_visit_val}{_disp_val}
             )
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT DO NOTHING
         """, (
             order_id, order_no,
             name, name, mob,
             float(fee), pay_mode,
+            _extra_data,
             *_extra_params,
         ))
 
-        # ── 4. Save consultation fee as a SERVICE order_line ──────────────
-        # This makes the fee visible in billing/challan/invoice exactly like
-        # a product line — eye_side=SERVICE, gst_percent=0, no allocation needed.
-        if float(fee) > 0:
-            try:
-                # Find or create the "Consultation Fee" service product
-                _fp = run_query("""
-                    SELECT id::text FROM products
-                    WHERE LOWER(product_name) LIKE '%consultation%'
-                      AND COALESCE(is_active,true)=true
-                    ORDER BY created_at LIMIT 1
-                """) or []
-                if _fp:
-                    _fee_prod_id = _fp[0]["id"]
-                else:
-                    _fee_prod_id = str(uuid.uuid4())
-                    run_write("""
-                        INSERT INTO products
-                            (id, product_name, main_group, category,
-                             unit, gst_percent, is_active, created_at)
-                        VALUES (%s::uuid, 'Consultation Fee', 'Services', 'Services',
-                                'SERVICE', 0, true, NOW())
-                        ON CONFLICT DO NOTHING
-                    """, (_fee_prod_id,))
+        # ── 4. order_lines intentionally omitted for CONSULTATION orders ──
+        # Consultation is a clinical record, not a product sale.
+        # Fee amount is stored in orders.total_value and payments table only.
+        # When staff converts to billing via the explicit button, convert_consultation_to_billing()
+        # passes the fee as advance — no order_line duplication.
 
-                _line_id = str(uuid.uuid4())
-                run_write("""
-                    INSERT INTO order_lines (
-                        id, order_id, product_id,
-                        eye_side, quantity,
-                        unit_price, total_price,
-                        billing_qty, billing_total, allocated_qty,
-                        gst_percent, gst_amount,
-                        status, is_service_line,
-                        created_at
-                    ) VALUES (
-                        %s::uuid, %s::uuid, %s::uuid,
-                        'SERVICE', 1,
-                        %s, %s,
-                        1, %s, 1,
-                        0, 0,
-                        'READY', TRUE,
-                        NOW()
-                    )
-                    ON CONFLICT (id) DO NOTHING
-                """, (
-                    _line_id, order_id, _fee_prod_id,
-                    float(fee), float(fee), float(fee),   # unit_price, total_price, billing_total
-                ))
-            except Exception as _le:
-                import logging as _log
-                _log.getLogger(__name__).warning(
-                    f"[CONSULTATION] fee order_line insert failed: {_le}"
-                )
-                # Non-critical — order still saves, fee visible in total_value
-
-        # ── Auto-insert advance payment for consultation fee ────────────
-        # Creates payment record immediately on save — staff doesn't need
-        # to click a separate button. Idempotent: skips if already exists.
-        if float(fee) > 0:
-            try:
-                _pay_id  = str(uuid.uuid4())
-                _pay_no  = f"CPR-{order_no}"
-                run_write("""
-                    INSERT INTO payments (
-                        id, payment_no, payment_date, payment_mode,
-                        amount, reference_no, remarks,
-                        order_id, advance_for_order_id,
-                        payment_type, created_at
-                    ) VALUES (
-                        %s::uuid, %s, CURRENT_DATE, %s,
-                        %s, %s, %s,
-                        %s::uuid, %s::uuid,
-                        'ADVANCE', NOW()
-                    )
-                    ON CONFLICT DO NOTHING
-                """, (
-                    _pay_id, _pay_no, pay_mode,
-                    float(fee), f"CONS-{order_id[:8].upper()}",
-                    f"Consultation fee — {name}",
-                    order_id, order_id,
-                ))
-            except Exception as _pe:
-                import logging as _log
-                _log.getLogger(__name__).warning(
-                    f"[CONSULTATION] auto-advance payment failed: {_pe}"
-                )
-                # Non-critical — order saved, payment can be recorded manually
+        # ── Auto-insert advance payment via shared helper ─────────────────
+        # Skipped when charge_to_billing=True — fee will appear on the retail
+        # order instead. Recording it here AND there would be a double-charge.
+        if record_payment_now and not charge_to_billing:
+            _ensure_consultation_advance(order_id, order_no, fee, pay_mode, name, run_query, run_write)
+        elif not charge_to_billing:
+            import logging as _log_pending
+            _log_pending.getLogger(__name__).info(
+                f"[CONSULTATION] {order_no}: payment not recorded on save; awaiting collection."
+            )
+        else:
+            # Store a note so the post-save panel explains why no receipt yet
+            import logging as _log_ctb
+            _log_ctb.getLogger(__name__).info(
+                f"[CONSULTATION] {order_no}: charge_to_billing=True — "
+                f"fee ₹{fee:.0f} deferred to retail order, no advance payment recorded."
+            )
 
         return order_no
 
@@ -1249,13 +2318,26 @@ def _reset_consultation():
         "retail_left_sph", "retail_left_cyl", "retail_left_axis", "retail_left_add",
         "retail_clinical_exam", "clinical_exam_saved",
         "consult_wa_mobile_display",   # clear so next patient's mobile seeds fresh
+        # ── Edit-mode keys — these carry sticky data from order_edit_view ──
+        # Must be cleared so a new patient load doesn't inherit previous patient's phone
+        "_erp_patient_mob", "_erp_patient_name", "_erp_patient_id",
+        "_erp_order_id", "_erp_visit_id", "_erp_mode", "_erp_rx_r", "_erp_rx_l",
+        "_editing_consult_order_id",
+        "_force_consultation_tab",
+        # Edit-mode save tracking
+        "_consult_edit_saved",
+        # Consultation type / payment mode widget state
+        "consult_type_select", "consult_charge_to_billing",
+        "consult_force_new_visit", "consult_payment_mode",
     ]
     for k in keys:
         if k in st.session_state:
             del st.session_state[k]
     # Clear all consult_saved_* and consult_wa_mob_edited_* markers
     for k in list(st.session_state.keys()):
-        if k.startswith("consult_saved_") or k.startswith("consult_wa_mob_edited_"):
+        if (k.startswith("consult_saved_") or
+                k.startswith("consult_wa_mob_edited_") or
+                k.startswith("consult_converted_")):
             del st.session_state[k]
     # Release any lingering save lock
     try:
@@ -1263,6 +2345,152 @@ def _reset_consultation():
         clear_lock("consult_save_action")
     except Exception:
         pass
+
+
+def _print_consultation_receipt(
+    order_no: str, patient_name: str, mobile: str, consult_type: str,
+    fee: float, pay_mode: str, visit_date: str,
+    shop: str, addr: str, phone: str,
+    rx_r: tuple = None, rx_l: tuple = None,
+    shop_upi: str = "",
+):
+    """
+    Print a standalone consultation receipt (80mm thermal format).
+    Shows: shop header, patient, consultation type, fee, payment mode, RX summary.
+    Opens in browser print dialog.
+    """
+    def _fv(v):
+        if v is None or str(v).strip() in ("", "None", "nan", "0.0", "0"):
+            return "—"
+        try:
+            f = float(v)
+            return f"{f:+.2f}" if f != 0 else "Plano"
+        except Exception:
+            return str(v).strip() or "—"
+
+    def _fa(v):
+        if not v or str(v).strip() in ("", "None", "nan", "0"):
+            return "—"
+        try: return str(int(float(v))) + "°"
+        except Exception: return str(v)
+
+    _rx_block = ""
+    if rx_r or rx_l:
+        _rr = rx_r or ("", "", "", "")
+        _rl = rx_l or ("", "", "", "")
+        _rx_block = f"""
+        <div class=sect>Prescription</div>
+        <table>
+          <tr><th>Eye</th><th>SPH</th><th>CYL</th><th>AX</th><th>ADD</th></tr>
+          <tr>
+            <td>R</td>
+            <td>{_fv(_rr[0])}</td><td>{_fv(_rr[1])}</td>
+            <td>{_fa(_rr[2])}</td><td>{_fv(_rr[3]) if len(_rr)>3 else '—'}</td>
+          </tr>
+          <tr>
+            <td>L</td>
+            <td>{_fv(_rl[0])}</td><td>{_fv(_rl[1])}</td>
+            <td>{_fa(_rl[2])}</td><td>{_fv(_rl[3]) if len(_rl)>3 else '—'}</td>
+          </tr>
+        </table>"""
+
+    _upi_html = ""
+    shop_upi = str(shop_upi or "").strip()
+    if shop_upi:
+        try:
+            import urllib.parse as _url_qr
+            import qrcode as _qr_mod, io as _io_qr, base64 as _b64_qr
+            _upi_str = "upi://pay?" + _url_qr.urlencode({
+                "pa": shop_upi,
+                "pn": shop or "DV Optical",
+                "am": f"{float(fee or 0):.2f}",
+                "tn": order_no,
+                "cu": "INR",
+            })
+            _qr = _qr_mod.QRCode(
+                version=None,
+                error_correction=_qr_mod.constants.ERROR_CORRECT_M,
+                box_size=3,
+                border=2,
+            )
+            _qr.add_data(_upi_str)
+            _qr.make(fit=True)
+            _img = _qr.make_image(fill_color="black", back_color="white")
+            _buf = _io_qr.BytesIO()
+            _img.save(_buf, format="PNG")
+            _b64 = _b64_qr.b64encode(_buf.getvalue()).decode()
+            _upi_html = (
+                "<div class='qrbox'>"
+                "<div class='qr' style=\"background-image:url(data:image/png;base64,{})\"></div>"
+                "<div class='qrt'>Scan to Pay</div>"
+                "<div class='upid'>{}</div>"
+                "</div>"
+            ).format(_b64, shop_upi)
+        except Exception:
+            _upi_html = f"<div class='qrbox'><b>UPI:</b><br>{shop_upi}</div>"
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:Arial,sans-serif;font-size:11px;color:#111;background:#fff;padding:4mm}}
+.sn{{font-size:14px;font-weight:900;text-align:center;margin-bottom:2px}}
+.sa{{font-size:9px;color:#444;text-align:center;margin-bottom:6px}}
+.divider{{border-top:1px dashed #aaa;margin:5px 0}}
+.sect{{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+       color:#555;margin:5px 0 3px}}
+.pno{{font-family:monospace;background:#0f172a;color:#34d399;padding:2px 8px;
+      border-radius:4px;display:block;text-align:center;margin:5px 0;font-size:11px}}
+table{{width:100%;border-collapse:collapse;font-size:10px}}
+th{{background:#f1f5f9;padding:3px 4px;font-size:9px;text-align:center}}
+td{{padding:3px 4px;border-bottom:1px solid #e2e8f0;text-align:center}}
+td:first-child{{text-align:left;font-weight:700}}
+.row{{display:flex;justify-content:space-between;font-size:11px;padding:2px 0}}
+.row b{{font-size:12px}}
+.total{{border-top:2px solid #111;margin-top:4px;padding-top:4px;
+        font-weight:900;font-size:13px;display:flex;justify-content:space-between}}
+.qrbox{{border:1px solid #ddd;margin:6px auto 2px;padding:4px;text-align:center;width:38mm}}
+.qr{{width:26mm;height:26mm;margin:0 auto;background-size:contain;background-repeat:no-repeat;
+     -webkit-print-color-adjust:exact;print-color-adjust:exact;color-adjust:exact}}
+.qrt{{font-size:8px;color:#555;margin-top:2px;font-weight:700}}
+.upid{{font-size:8px;font-family:monospace;color:#111;word-break:break-all}}
+.ft{{font-size:8px;color:#94a3b8;text-align:center;margin-top:6px;
+     border-top:1px dashed #ddd;padding-top:4px}}
+@media print{{
+  @page{{size:80mm auto;margin:3mm}}
+  body{{padding:0}}
+}}
+</style></head><body>
+
+<div class="sn">{shop}</div>
+<div class="sa">{addr}{(' · ' + phone) if phone else ''}</div>
+<div class="divider"></div>
+
+<div class="sect">Consultation Receipt</div>
+<span class="pno">{order_no}</span>
+
+<div class="row"><span>Date</span><span>{visit_date}</span></div>
+<div class="row"><span>Patient</span><b>{patient_name}</b></div>
+{'<div class="row"><span>Mobile</span><span>' + mobile + '</span></div>' if mobile else ''}
+<div class="divider"></div>
+
+<div class="sect">Charge</div>
+<div class="row"><span>{consult_type}</span><span>₹{fee:.0f}</span></div>
+<div class="row"><span>Mode</span><span>{pay_mode}</span></div>
+<div class="total"><span>Total Received</span><span>₹{fee:.0f}</span></div>
+{_upi_html}
+
+{_rx_block}
+
+<div class="divider"></div>
+<div class="ft">
+  This prescription is valid for one year from date of examination.<br>
+  {shop} · {addr}
+</div>
+
+<script>window.onload = function() {{ window.print(); }}</script>
+</body></html>"""
+
+    _open_print_tab(html, filename="consultation_receipt.html")
 
 
 def _rx_row(eye, sph, cyl, axis, add, color):
@@ -1289,42 +2517,88 @@ def _print_clinical_report(**kw):
     try:
         from modules.printing.patient_card_printer import barcode_svg as _bsvg
         _bc_svg = _bsvg(patient_barcode, 180, 40) if patient_barcode else ''
-    except:
+    except Exception as _e:
+        logger.warning("Suppressed error: %s", _e)
         _bc_svg = ''
     _bc_section = (
         f"<div style='margin-top:10px;text-align:center'>{_bc_svg}"
-        f"<div style='font-family:monospace;font-size:9px;color:#64748b'>{patient_barcode}</div></div>"
+        f"<div style='font-family:monospace;font-size:9px;color:#111'>{patient_barcode}</div></div>"
     ) if _bc_svg else ''
     footer_txt = kw.get('footer','This prescription is valid for one year from the date of examination.')
+
+    def _val(v):
+        return str(v).strip() if v not in (None, "", "—") else "—"
+
+    def _finding_line(label, value):
+        return f"<div class='finding-line'><b>{label}:</b> <span>{_val(value)}</span></div>"
+
+    def _rx_va(distance, near):
+        d = _val(distance)
+        n = _val(near)
+        if d == "—" and n == "—":
+            return "—"
+        return f"{d}, {n}"
+
+    slit_lamp_html = "".join([
+        _finding_line("Lids", kw.get("lids")),
+        _finding_line("Conjunctiva", kw.get("conjunctiva")),
+        _finding_line("Cornea", kw.get("cornea")),
+        _finding_line("AC", kw.get("ac")),
+        _finding_line("Iris", kw.get("iris")),
+        _finding_line("Lens", kw.get("lens")),
+        _finding_line("Vitreous", kw.get("vitreous")),
+    ])
+    retina_html = "".join([
+        _finding_line("Retina / Fundus", kw.get("fundus")),
+        _finding_line("IOP Right", kw.get("iop_r")),
+        _finding_line("IOP Left", kw.get("iop_l")),
+    ])
+    orthoptic_html = "".join([
+        _finding_line("Cover Test Distance", kw.get("ortho_dist")),
+        _finding_line("Cover Test Near", kw.get("ortho_near")),
+        _finding_line("Nystagmus", kw.get("nystagmus")),
+        _finding_line("Ocular Motility", kw.get("motility")),
+        _finding_line("Convergence", kw.get("convergence")),
+        _finding_line("Remarks", kw.get("remarks")),
+    ])
+    rx_notes_html = "".join([
+        _finding_line("Doctor Notes", kw.get("doctor_notes")),
+        _finding_line("Treatment", kw.get("treatment_plan")),
+        _finding_line("Follow-up", kw.get("followup_advice")),
+    ])
 
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
     <style>
     *{{margin:0;padding:0;box-sizing:border-box}}
-    body{{font-family:Arial,sans-serif;padding:12mm;font-size:11px;color:#111}}
-    .hdr{{background:#1e3a5f;color:#fff;padding:10px 14px;margin-bottom:12px;
-          display:flex;justify-content:space-between;align-items:flex-start}}
+    body{{font-family:Arial,sans-serif;padding:10mm;font-size:10.5px;color:#111;background:#fff}}
+    .hdr{{background:#fff;color:#111;padding:0 0 8px;margin-bottom:8px;
+          border-bottom:1.5px solid #111;display:flex;justify-content:space-between;align-items:flex-start}}
     .shop-name{{font-size:18px;font-weight:900}}
-    .shop-sub{{font-size:10px;opacity:.85;margin-top:2px}}
+    .shop-sub{{font-size:9.5px;margin-top:2px;color:#111}}
     .doc-type{{font-size:14px;font-weight:700;text-align:right}}
     .patient-row{{display:flex;justify-content:space-between;
-                  background:#f8fafc;padding:8px 10px;border-radius:4px;margin-bottom:10px}}
+                  background:#fff;padding:6px 0;border-bottom:0.5px solid #111;margin-bottom:8px;color:#111}}
     table{{width:100%;border-collapse:collapse;margin:6px 0}}
-    th{{background:#1e3a5f;color:#fff;padding:5px 8px;font-size:10px;text-align:center}}
+    th{{background:#fff;color:#111;padding:5px 8px;font-size:10px;text-align:center;border:0.5px solid #111}}
     th:first-child{{text-align:left}}
-    td{{border:0.5px solid #e2e8f0;font-size:11px}}
-    .section{{font-size:11px;font-weight:700;color:#1e3a5f;margin:10px 0 4px;
-              border-bottom:1px solid #e2e8f0;padding-bottom:2px}}
-    .finding-row{{display:flex;gap:20px;flex-wrap:wrap;font-size:10px;margin:4px 0}}
-    .finding-item{{color:#64748b}}
+    td{{border:0.5px solid #111;font-size:10.5px;color:#111}}
+    .section{{font-size:11px;font-weight:700;color:#111;margin:9px 0 4px;
+              border-bottom:0.5px solid #111;padding-bottom:2px}}
+    .findings-grid{{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:5px}}
+    .finding-box{{border:0.5px solid #111;min-height:82px;padding:6px 8px;break-inside:avoid}}
+    .finding-box.tall{{min-height:118px}}
+    .finding-title{{font-size:10.5px;font-weight:700;margin-bottom:4px;text-transform:uppercase}}
+    .finding-line{{font-size:9.8px;line-height:1.35;margin-bottom:2px;color:#111}}
+    .finding-line span{{color:#111}}
     .finding-item b{{color:#111}}
-    .fee-box{{background:#f0fdf4;border:1px solid #86efac;border-radius:4px;
-              padding:6px 10px;margin-top:10px;font-size:11px}}
-    .sig-row{{display:flex;justify-content:space-between;margin-top:16px}}
+    .fee-box{{background:#fff;border:0.5px solid #111;border-radius:0;
+              padding:6px 10px;margin-top:8px;font-size:10.5px;color:#111}}
+    .sig-row{{display:flex;justify-content:space-between;margin-top:14px}}
     .sig-line{{border-top:0.5px solid #111;width:140px;text-align:center;
-               padding-top:4px;font-size:9px;color:#64748b}}
-    .footer{{border-top:1px dashed #cbd5e1;margin-top:12px;padding-top:6px;
-             font-size:9px;color:#94a3b8;text-align:center}}
-    @media print{{@page{{size:A5;margin:6mm}}body{{padding:0}}}}
+               padding-top:4px;font-size:9px;color:#111}}
+    .footer{{border-top:0.5px dashed #111;margin-top:10px;padding-top:5px;
+             font-size:9px;color:#111;text-align:center}}
+    @media print{{@page{{size:A4;margin:10mm}}body{{padding:0;-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
     </style></head><body>
 
     <div class="hdr">
@@ -1334,14 +2608,14 @@ def _print_clinical_report(**kw):
       </div>
       <div>
         <div class="doc-type">CLINICAL PRESCRIPTION</div>
-        <div style="font-size:10px;opacity:.8;text-align:right">{dt}</div>
+        <div style="font-size:10px;text-align:right;color:#111">{dt}</div>
       </div>
     </div>
 
     <div class="patient-row">
-      <div><b>{name}</b> &nbsp; <span style="color:#64748b;font-size:10px">{mob}</span></div>
+      <div><b>{name}</b> &nbsp; <span style="color:#111;font-size:10px">{mob}</span></div>
       <div style="text-align:right">
-        <div style="font-size:10px;color:#64748b">Date: {dt}</div>
+        <div style="font-size:10px;color:#111">Date: {dt}</div>
         {_bc_section}
       </div>
     </div>
@@ -1358,32 +2632,42 @@ def _print_clinical_report(**kw):
 
     <div class="section">Visual Acuity</div>
     <table>
-      <tr><th style="text-align:left">Eye</th><th>Unaided</th><th>Best Corrected</th><th>Near</th></tr>
+      <tr><th style="text-align:left">Eye</th><th>Unaided</th><th>Best Corrected</th><th>Near</th><th>Rx</th></tr>
       <tr style="background:#eff6ff">
         <td style="padding:4px 8px;font-weight:700">Right</td>
         <td style="padding:4px 8px;text-align:center">{va_ur or '—'}</td>
         <td style="padding:4px 8px;text-align:center">{va_ar or '—'}</td>
         <td style="padding:4px 8px;text-align:center">{va_nr or '—'}</td>
+        <td style="padding:4px 8px;text-align:center">{_rx_va(va_ar, va_nr)}</td>
       </tr>
       <tr style="background:#f0fdf4">
         <td style="padding:4px 8px;font-weight:700">Left</td>
         <td style="padding:4px 8px;text-align:center">{va_ul or '—'}</td>
         <td style="padding:4px 8px;text-align:center">{va_al or '—'}</td>
         <td style="padding:4px 8px;text-align:center">{va_nl or '—'}</td>
+        <td style="padding:4px 8px;text-align:center">{_rx_va(va_al, va_nl)}</td>
       </tr>
     </table>
 
-    {'<div class="section">Clinical Findings</div><div class="finding-row">'
-     + (''.join([
-         f'<div class="finding-item"><b>Lids:</b> {kw["lids"]}</div>' if kw.get('lids') else '',
-         f'<div class="finding-item"><b>Cornea:</b> {kw["cornea"]}</div>' if kw.get('cornea') else '',
-         f'<div class="finding-item"><b>Lens:</b> {kw["lens"]}</div>' if kw.get('lens') else '',
-         f'<div class="finding-item"><b>IOP R:</b> {kw["iop_r"]} &nbsp; <b>IOP L:</b> {kw["iop_l"]}</div>' if kw.get('iop_r') else '',
-     ]))
-     + '</div>'
-     + (f'<div style="font-size:10px;margin-top:4px"><b>Fundus:</b> {kw["fundus"]}</div>' if kw.get('fundus') else '')
-     + (f'<div style="font-size:10px;margin-top:4px"><b>Remarks:</b> {kw["remarks"]}</div>' if kw.get('remarks') else '')
-     if any([kw.get('lids'),kw.get('cornea'),kw.get('lens'),kw.get('fundus'),kw.get('remarks')]) else ''}
+    <div class="section">Clinical Findings</div>
+    <div class="findings-grid">
+      <div class="finding-box tall">
+        <div class="finding-title">Slit Lamp Examination</div>
+        {slit_lamp_html}
+      </div>
+      <div class="finding-box tall">
+        <div class="finding-title">Retina</div>
+        {retina_html}
+      </div>
+      <div class="finding-box">
+        <div class="finding-title">Orthoptic</div>
+        {orthoptic_html}
+      </div>
+      <div class="finding-box">
+        <div class="finding-title">Rx</div>
+        {rx_notes_html}
+      </div>
+    </div>
 
     <div class="fee-box">
       Consultation fee: <b>₹{fee:.0f}</b> &nbsp; Mode: {pay}
@@ -1430,13 +2714,17 @@ def _print_referral_letter(**kw):
         try:
             f = float(v)
             return f"+{f:.2f}" if f > 0 else f"{f:.2f}"
-        except: return str(v).strip() or None
+        except Exception as _e:
+            logger.warning("Suppressed error: %s", _e)
+            return str(v).strip() or None
 
     def _fmtax(v):
         if not v or str(v).strip() in ('', 'None', 'nan', '0', '---'):
             return None
         try:  return str(int(float(v)))
-        except: return str(v).strip() or None
+        except Exception as _e:
+            logger.warning("Suppressed error: %s", _e)
+            return str(v).strip() or None
 
     # ── RX table rows ──────────────────────────────────────────────────────
     def _rxrow(eye, sph, cyl, axis, add, bg):
@@ -1596,7 +2884,7 @@ def convert_consultation_to_billing(consult_order_id: str) -> dict:
         # ── Resolve UUID — accept either id or order_no ───────────────────
         _is_uuid = len(consult_order_id) == 36 and consult_order_id.count("-") == 4
         if not _is_uuid:
-            # It's an order_no string like CONS-20260328-D6049A — look up the UUID
+            # It's an order_no string — either legacy CONS-YYYYMMDD-XXXXXX or new CS/2627/0001
             _id_row = run_query(
                 "SELECT id::text FROM orders WHERE order_no=%s AND order_type='CONSULTATION' LIMIT 1",
                 (consult_order_id,)
@@ -1782,25 +3070,40 @@ def convert_consultation_to_billing(consult_order_id: str) -> dict:
                 try:
                     run_write("""
                         INSERT INTO products
-                            (id, product_name, main_group, gst_percent, is_active, created_at)
-                        VALUES (%s::uuid, 'Consultation Fee', 'Services', 0, true, NOW())
+                            (id, product_name, main_group, gst_percent, is_gst_exempt, is_active, created_at)
+                        VALUES (%s::uuid, 'Consultation Fee', 'Services', 0, true, true, NOW())
                         ON CONFLICT DO NOTHING
                     """, (prod_id,))
                 except Exception:
                     pass  # already exists
 
         # NOTE: is_converted is set in retail_punching.py AFTER retail order save.
+        paid_rows = run_query("""
+            SELECT COALESCE(SUM(amount), 0) AS paid,
+                   MAX(COALESCE(payment_mode, method, '')) AS mode,
+                   MAX(COALESCE(reference_no,'')) AS ref_no
+            FROM payments
+            WHERE advance_for_order_id = %s::uuid
+              AND payment_type = 'ADVANCE'
+              AND COALESCE(is_deleted, FALSE) = FALSE
+        """, (consult_order_id,)) or []
+        paid_amount = float(paid_rows[0].get("paid") or 0) if paid_rows else 0.0
+        paid_mode = str(paid_rows[0].get("mode") or c["payment_mode"] or "") if paid_rows else str(c["payment_mode"] or "")
+        paid_ref = str(paid_rows[0].get("ref_no") or "") if paid_rows else ""
 
         return {
             "success": True,
             "patient_name":   c["patient_name"],
             "patient_mobile": c.get("patient_mobile",""),
             "patient_id":     resolved_patient_id,
-            "payment_mode":   c["payment_mode"],
+            "payment_mode":   paid_mode,
             "cons_order_no":  c["order_no"],
             "consult_order_id": consult_order_id,  # returned so retail_punching can mark CONVERTED after save
             "cons_date":      cons_date,
             "consult_fee":    fee,
+            "consult_paid":   paid_amount >= max(fee - 0.01, 0),
+            "consult_paid_amount": paid_amount,
+            "consult_paid_ref": paid_ref,
             "prod_id":        prod_id,
             "prod_name":      prod_name if fee > 0 else "",
             "rx": rxd,

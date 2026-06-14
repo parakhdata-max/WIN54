@@ -53,9 +53,8 @@ def _q(sql: str, params: dict):
 
 def _exec(sql: str, params: dict) -> bool:
     try:
-        from modules.sql_adapter import execute_query
-        execute_query(sql, params)
-        return True
+        from modules.sql_adapter import run_write
+        return run_write(sql, params)
     except Exception:
         return False
 
@@ -112,7 +111,6 @@ def log_event(
         "etype": str(event_type),
         "src":   source,
         "rmk":   remarks or "",
-        "meta":  json.dumps(metadata),
     })
 
 

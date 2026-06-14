@@ -18,10 +18,13 @@ import os
 import tempfile
 import traceback
 import json
+import logging
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Lazy imports ─────────────────────────────────────────────────────────────
@@ -776,6 +779,23 @@ def _tab_upload():
                 key=uploaded.name,
             )
 
+    contract_ok = True
+    if display_type not in ("UNKNOWN", None):
+        try:
+            from modules.loaders.loader_contract import (
+                build_loader_contract_report,
+                render_loader_contract_panel,
+            )
+            contract_report = build_loader_contract_report(display_type, df)
+            contract_ok = render_loader_contract_panel(
+                st,
+                contract_report,
+                require_ack=(actual_mode != "DRY"),
+                key=f"loader_contract_{display_type}_{uploaded.name}_{actual_mode}",
+            )
+        except Exception as _contract_ex:
+            st.warning(f"Loader contract check unavailable: {_contract_ex}")
+
     # ── STEP 4: ACCEPT ──────────────────────────────────────────────────────
     _render_steps(4)
     st.markdown('<div class="section-head">✅ Confirm & Proceed</div>', unsafe_allow_html=True)
@@ -802,6 +822,7 @@ def _tab_upload():
         ready = st.checkbox("✅ I confirm PRICE UPDATE only — stock quantities will **NOT** change") and ready
     if actual_mode == "LIVE" and diff and diff.new_columns:
         ready = st.checkbox("✅ I acknowledge schema changes — unknown columns will be ignored") and ready
+    ready = ready and contract_ok
 
     if actual_mode == "LIVE":
         st.markdown('<div class="opening-warning">🔴 <strong>LIVE MODE</strong> — Production DB write. Do NOT re-import same file after success.</div>', unsafe_allow_html=True)
@@ -824,7 +845,7 @@ def _tab_upload():
         _render_steps(5)
         with st.spinner(f"Running {actual_mode} [{actual_stock_mode}]..."):
             try:
-                print(f"DEBUG CALLING: {run_loader.__module__}.{run_loader.__name__}")
+                logger.debug("Calling loader: %s.%s", run_loader.__module__, run_loader.__name__)
                 result = run_loader(tmp_path, mode=actual_mode,
                                     stock_mode=actual_stock_mode, force_type=actual_type_arg,
                                     user=(st.session_state.get("user") or {}).get("username", "admin") if isinstance(st.session_state.get("user"), dict) else str(st.session_state.get("user", "admin")),
@@ -2076,6 +2097,443 @@ def _tab_download():
 # TAB: MAIN GROUPS — GST% + HSN master
 # ════════════════════════════════════════════════════════════
 
+def _tab_cl_barcode_update():
+    """Update missing contact lens scan/barcode values on inventory_stock rows."""
+    from modules.sql_adapter import run_query, run_write
+
+    st.markdown("### 🧿 Contact Lens Scan Code Update")
+    st.caption(
+        "Find contact lens stock by brand/product/power and save the scanner barcode "
+        "into `inventory_stock.barcode`. Existing duplicate barcodes are blocked."
+    )
+
+    try:
+        brands = run_query("""
+            SELECT DISTINCT COALESCE(p.brand, '') AS brand
+            FROM inventory_stock s
+            JOIN products p ON p.id = s.product_id
+            WHERE UPPER(COALESCE(p.main_group,'')) LIKE '%%CONTACT%%'
+              AND COALESCE(s.is_active, TRUE) = TRUE
+            ORDER BY brand
+        """) or []
+    except Exception as exc:
+        st.error(f"Could not load contact lens stock: {exc}")
+        return
+
+    brand_opts = [r["brand"] for r in brands if str(r.get("brand") or "").strip()]
+    f1, f2, f3 = st.columns([2, 3, 2])
+    brand = f1.selectbox("Brand", ["All"] + brand_opts, key="clbc_brand")
+    product_params = {}
+    product_where = [
+        "UPPER(COALESCE(p.main_group,'')) LIKE '%%CONTACT%%'",
+        "COALESCE(s.is_active, TRUE) = TRUE",
+    ]
+    if brand != "All":
+        product_where.append("COALESCE(p.brand,'') = %(brand)s")
+        product_params["brand"] = brand
+    product_rows = run_query(f"""
+        SELECT DISTINCT COALESCE(p.product_name, '') AS product_name
+        FROM inventory_stock s
+        JOIN products p ON p.id = s.product_id
+        WHERE {' AND '.join(product_where)}
+        ORDER BY product_name
+    """, product_params) or []
+    product_opts = [
+        r["product_name"] for r in product_rows
+        if str(r.get("product_name") or "").strip()
+    ]
+    product_name = f2.selectbox(
+        "Product",
+        ["All"] + product_opts,
+        key="clbc_product",
+    )
+    only_missing = f3.checkbox("Only missing barcode", value=True, key="clbc_missing")
+    product_refine = st.text_input(
+        "Refine product contains",
+        key="clbc_product_refine",
+        placeholder="Optional: type to narrow long product dropdown/result",
+    )
+
+    single_power = st.checkbox(
+        "Single power exact search",
+        value=False,
+        key="clbc_single_power",
+        help="Use exact SPH/CYL/Axis, e.g. -0.25 / -0.50 / 180. Range filters are ignored.",
+    )
+    if single_power:
+        sp1, sp2, sp3 = st.columns(3)
+        exact_sph = sp1.number_input("SPH", value=-0.25, step=0.25, format="%.2f", key="clbc_exact_sph")
+        exact_cyl = sp2.number_input("CYL", value=-0.50, step=0.25, format="%.2f", key="clbc_exact_cyl")
+        exact_axis = int(sp3.number_input("Axis", value=180, min_value=0, max_value=180, step=1, key="clbc_exact_axis"))
+
+    r1, r2, r3, r4 = st.columns(4)
+    sph_min = r1.number_input("SPH min", value=-20.0, step=0.25, format="%.2f", key="clbc_sph_min")
+    sph_max = r2.number_input("SPH max", value=20.0, step=0.25, format="%.2f", key="clbc_sph_max")
+    cyl_min = r3.number_input("CYL min", value=-10.0, step=0.25, format="%.2f", key="clbc_cyl_min")
+    cyl_max = r4.number_input("CYL max", value=10.0, step=0.25, format="%.2f", key="clbc_cyl_max")
+
+    a1, a2 = st.columns(2)
+    axis_min = int(a1.number_input("Axis min", value=0, min_value=0, max_value=180, step=1, key="clbc_axis_min"))
+    axis_max = int(a2.number_input("Axis max", value=180, min_value=0, max_value=180, step=1, key="clbc_axis_max"))
+    sph_low, sph_high = sorted([float(sph_min), float(sph_max)])
+    cyl_low, cyl_high = sorted([float(cyl_min), float(cyl_max)])
+    axis_low, axis_high = sorted([int(axis_min), int(axis_max)])
+    if (sph_low, sph_high) != (float(sph_min), float(sph_max)) or (cyl_low, cyl_high) != (float(cyl_min), float(cyl_max)):
+        st.caption(
+            f"Range auto-corrected for search: SPH {sph_low:+.2f} to {sph_high:+.2f}, "
+            f"CYL {cyl_low:+.2f} to {cyl_high:+.2f}."
+        )
+
+    where = [
+        "UPPER(COALESCE(p.main_group,'')) LIKE '%%CONTACT%%'",
+        "COALESCE(s.is_active, TRUE) = TRUE",
+    ]
+    params = {
+        "sph_min": sph_low, "sph_max": sph_high,
+        "cyl_min": cyl_low, "cyl_max": cyl_high,
+        "axis_min": axis_low, "axis_max": axis_high,
+    }
+    if single_power:
+        where += [
+            "ROUND(COALESCE(s.sph,0)::numeric, 2) = ROUND(%(exact_sph)s::numeric, 2)",
+            "ROUND(COALESCE(s.cyl,0)::numeric, 2) = ROUND(%(exact_cyl)s::numeric, 2)",
+            "COALESCE(s.axis,0) = %(exact_axis)s",
+        ]
+        params.update({
+            "exact_sph": float(exact_sph),
+            "exact_cyl": float(exact_cyl),
+            "exact_axis": exact_axis,
+        })
+    else:
+        where += [
+            "COALESCE(s.sph,0) BETWEEN %(sph_min)s AND %(sph_max)s",
+            "COALESCE(s.cyl,0) BETWEEN %(cyl_min)s AND %(cyl_max)s",
+            "COALESCE(s.axis,0) BETWEEN %(axis_min)s AND %(axis_max)s",
+        ]
+    if brand != "All":
+        where.append("COALESCE(p.brand,'') = %(brand)s")
+        params["brand"] = brand
+    if product_name != "All":
+        where.append("COALESCE(p.product_name,'') = %(product_name)s")
+        params["product_name"] = product_name
+    if product_refine.strip():
+        where.append("COALESCE(p.product_name,'') ILIKE %(prod)s")
+        params["prod"] = f"%{product_refine.strip()}%"
+    if only_missing:
+        where.append("NULLIF(TRIM(COALESCE(s.barcode,'')), '') IS NULL")
+
+    rows = run_query(f"""
+        SELECT
+            s.id::text AS stock_id,
+            p.brand,
+            p.product_name,
+            COALESCE(p.company_product_name, '') AS company_product_name,
+            COALESCE(p.sku_code, '') AS product_sku,
+            COALESCE(p.barcode, '') AS product_barcode,
+            s.batch_no,
+            s.expiry_date::text AS expiry_date,
+            s.sph, s.cyl, s.axis, s.add_power,
+            COALESCE(s.quantity,0) AS quantity,
+            COALESCE(s.mrp,0) AS mrp,
+            COALESCE(s.selling_price,0) AS selling_price,
+            COALESCE(s.purchase_rate, s.purchase_price, 0) AS purchase_rate,
+            COALESCE(s.location,'') AS location,
+            COALESCE(s.barcode,'') AS barcode
+        FROM inventory_stock s
+        JOIN products p ON p.id = s.product_id
+        WHERE {' AND '.join(where)}
+        ORDER BY p.brand, p.product_name, s.sph, s.cyl, s.axis, s.add_power, s.expiry_date
+        LIMIT 300
+    """, params) or []
+
+    if not rows:
+        if single_power:
+            st.warning(
+                "No exact contact lens row found for "
+                f"SPH {float(exact_sph):+.2f} / CYL {float(exact_cyl):+.2f} / AX {int(exact_axis)}."
+            )
+            alt_where = [
+                "UPPER(COALESCE(p.main_group,'')) LIKE '%%CONTACT%%'",
+                "COALESCE(s.is_active, TRUE) = TRUE",
+            ]
+            alt_params = {
+                "exact_sph": float(exact_sph),
+                "exact_cyl": float(exact_cyl),
+                "exact_axis": int(exact_axis),
+            }
+            if brand != "All":
+                alt_where.append("COALESCE(p.brand,'') = %(brand)s")
+                alt_params["brand"] = brand
+            if product_name != "All":
+                alt_where.append("COALESCE(p.product_name,'') = %(product_name)s")
+                alt_params["product_name"] = product_name
+            if product_refine.strip():
+                alt_where.append("COALESCE(p.product_name,'') ILIKE %(prod)s")
+                alt_params["prod"] = f"%{product_refine.strip()}%"
+            if only_missing:
+                alt_where.append("NULLIF(TRIM(COALESCE(s.barcode,'')), '') IS NULL")
+
+            same_sph = run_query(f"""
+                SELECT
+                    p.brand,
+                    p.product_name,
+                    s.sph,
+                    s.cyl,
+                    s.axis,
+                    COALESCE(SUM(s.quantity),0) AS total_qty,
+                    COUNT(*) AS row_count,
+                    COUNT(*) FILTER (
+                        WHERE NULLIF(TRIM(COALESCE(s.barcode,'')), '') IS NULL
+                    ) AS missing_barcode_rows
+                FROM inventory_stock s
+                JOIN products p ON p.id = s.product_id
+                WHERE {' AND '.join(alt_where)}
+                  AND ROUND(COALESCE(s.sph,0)::numeric, 2) = ROUND(%(exact_sph)s::numeric, 2)
+                GROUP BY p.brand, p.product_name, s.sph, s.cyl, s.axis
+                ORDER BY
+                    ABS(COALESCE(s.cyl,0)::numeric - %(exact_cyl)s::numeric),
+                    ABS(COALESCE(s.axis,0)::numeric - %(exact_axis)s::numeric)
+                LIMIT 30
+            """, alt_params) or []
+
+            if same_sph:
+                st.caption("Same SPH is available with these CYL / Axis combinations:")
+                st.dataframe(pd.DataFrame(same_sph), use_container_width=True, hide_index=True)
+            else:
+                nearest = run_query(f"""
+                    SELECT
+                        p.brand,
+                        p.product_name,
+                        s.sph,
+                        s.cyl,
+                        s.axis,
+                        COALESCE(SUM(s.quantity),0) AS total_qty,
+                        COUNT(*) AS row_count,
+                        COUNT(*) FILTER (
+                            WHERE NULLIF(TRIM(COALESCE(s.barcode,'')), '') IS NULL
+                        ) AS missing_barcode_rows
+                    FROM inventory_stock s
+                    JOIN products p ON p.id = s.product_id
+                    WHERE {' AND '.join(alt_where)}
+                    GROUP BY p.brand, p.product_name, s.sph, s.cyl, s.axis
+                    ORDER BY
+                        ABS(COALESCE(s.sph,0)::numeric - %(exact_sph)s::numeric),
+                        ABS(COALESCE(s.cyl,0)::numeric - %(exact_cyl)s::numeric),
+                        ABS(COALESCE(s.axis,0)::numeric - %(exact_axis)s::numeric)
+                    LIMIT 30
+                """, alt_params) or []
+                if nearest:
+                    st.caption("Nearest available powers for the selected brand/product:")
+                    st.dataframe(pd.DataFrame(nearest), use_container_width=True, hide_index=True)
+            st.info("Adjust the exact power above, or untick exact search to use the range search.")
+        else:
+            st.info("No contact lens rows match this filter.")
+        return
+
+    st.markdown(f"#### Matching Stock Rows — {len(rows)}")
+    df_rows = pd.DataFrame(rows)
+    st.dataframe(df_rows, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Multi Update")
+    edit_df = df_rows.copy()
+    edit_df.insert(0, "Update", False)
+    edit_df["new_barcode"] = edit_df["barcode"].fillna("").astype(str)
+    edit_df["new_batch_no"] = edit_df["batch_no"].fillna("").astype(str)
+    edit_df["new_expiry_date"] = edit_df["expiry_date"].fillna("").astype(str)
+    edit_df["new_mrp"] = pd.to_numeric(edit_df.get("mrp", 0), errors="coerce").fillna(0.0)
+    edit_df["new_wlp"] = pd.to_numeric(edit_df.get("selling_price", 0), errors="coerce").fillna(0.0)
+    edit_df["new_purchase_rate"] = pd.to_numeric(edit_df.get("purchase_rate", 0), errors="coerce").fillna(0.0)
+    edit_cols = [
+        "Update", "brand", "product_name", "sph", "cyl", "axis", "add_power",
+        "batch_no", "new_batch_no", "expiry_date", "new_expiry_date", "quantity",
+        "mrp", "new_mrp", "selling_price", "new_wlp", "purchase_rate", "new_purchase_rate",
+        "barcode", "new_barcode", "stock_id"
+    ]
+    edit_df = edit_df[[c for c in edit_cols if c in edit_df.columns]]
+    edited = st.data_editor(
+        edit_df,
+        use_container_width=True,
+        hide_index=True,
+        key="clbc_multi_editor",
+        disabled=[
+            c for c in edit_df.columns
+            if c not in (
+                "Update", "new_barcode", "new_batch_no", "new_expiry_date",
+                "new_mrp", "new_wlp", "new_purchase_rate"
+            )
+        ],
+        column_config={
+            "Update": st.column_config.CheckboxColumn("Update"),
+            "new_barcode": st.column_config.TextColumn(
+                "New SKU / Barcode",
+                help="Leave blank to clear a wrongly tagged barcode.",
+            ),
+            "new_batch_no": st.column_config.TextColumn("New Batch"),
+            "new_expiry_date": st.column_config.TextColumn(
+                "New Expiry",
+                help="Use YYYY-MM-DD. Leave blank if expiry is unknown.",
+            ),
+            "new_mrp": st.column_config.NumberColumn("New MRP", min_value=0.0, step=1.0, format="%.2f"),
+            "new_wlp": st.column_config.NumberColumn("New WLP", min_value=0.0, step=1.0, format="%.2f"),
+            "new_purchase_rate": st.column_config.NumberColumn("New Purchase", min_value=0.0, step=1.0, format="%.2f"),
+            "stock_id": st.column_config.TextColumn("Stock ID", disabled=True),
+        },
+    )
+    if st.button("💾 Save Selected Stock Updates", type="primary", key="clbc_multi_save", use_container_width=True):
+        selected_updates = []
+        for _, er in edited.iterrows():
+            if not bool(er.get("Update")):
+                continue
+            code = str(er.get("new_barcode") or "").strip()
+            sid = str(er.get("stock_id") or "").strip()
+            old = str(er.get("barcode") or "").strip()
+            if not sid:
+                continue
+            new_batch = str(er.get("new_batch_no") or "").strip()
+            new_expiry = str(er.get("new_expiry_date") or "").strip()
+            try:
+                new_mrp = max(float(er.get("new_mrp") or 0), 0.0)
+                new_wlp = max(float(er.get("new_wlp") or 0), 0.0)
+                new_purchase_rate = max(float(er.get("new_purchase_rate") or 0), 0.0)
+            except Exception:
+                st.error(f"Price fields must be numeric for stock row {sid[:8]}.")
+                return
+            if code == old and new_batch == str(er.get("batch_no") or "").strip() \
+                    and new_expiry == str(er.get("expiry_date") or "").strip() \
+                    and round(new_mrp, 2) == round(float(er.get("mrp") or 0), 2) \
+                    and round(new_wlp, 2) == round(float(er.get("selling_price") or 0), 2) \
+                    and round(new_purchase_rate, 2) == round(float(er.get("purchase_rate") or 0), 2):
+                continue
+            selected_updates.append({
+                "sid": sid,
+                "code": code,
+                "batch_no": new_batch,
+                "expiry_date": new_expiry,
+                "mrp": new_mrp,
+                "wlp": new_wlp,
+                "purchase_rate": new_purchase_rate,
+            })
+
+        if not selected_updates:
+            st.info("No changed selected stock rows to save.")
+        else:
+            codes = [u["code"].upper() for u in selected_updates if u["code"]]
+            if len(codes) != len(set(codes)):
+                st.error("Duplicate barcode inside selected update rows. Each stock row needs a unique scan code.")
+                return
+            dup = []
+            if codes:
+                dup = run_query("""
+                    SELECT s.id::text AS stock_id, s.barcode, p.brand, p.product_name, s.batch_no
+                    FROM inventory_stock s
+                    LEFT JOIN products p ON p.id = s.product_id
+                    WHERE UPPER(TRIM(COALESCE(s.barcode,''))) = ANY(%(codes)s)
+                      AND NOT (s.id::text = ANY(%(ids)s))
+                    LIMIT 5
+                """, {
+                    "codes": codes,
+                    "ids": [u["sid"] for u in selected_updates],
+                }) or []
+            if dup:
+                d = dup[0]
+                st.error(
+                    "Duplicate barcode blocked: "
+                    f"{d.get('barcode')} already used by {d.get('brand','')} "
+                    f"{d.get('product_name','')} batch {d.get('batch_no','-')}."
+                )
+                return
+            saved = 0
+            for upd in selected_updates:
+                run_write(
+                    """
+                    UPDATE inventory_stock
+                    SET
+                        barcode=%s,
+                        batch_no=NULLIF(%s, ''),
+                        expiry_date=NULLIF(%s, '')::date,
+                        mrp=%s,
+                        selling_price=%s,
+                        purchase_rate=%s,
+                        updated_at=NOW()
+                    WHERE id=%s::uuid
+                    """,
+                    (
+                        upd["code"] or None,
+                        upd["batch_no"],
+                        upd["expiry_date"],
+                        upd["mrp"],
+                        upd["wlp"],
+                        upd["purchase_rate"],
+                        upd["sid"],
+                    ),
+                )
+                saved += 1
+            st.success(f"✅ Saved {saved} contact lens stock update(s).")
+            st.rerun()
+
+    labels = {}
+    for r in rows:
+        sid = str(r.get("stock_id") or "")
+        power = " ".join([
+            f"SPH {float(r.get('sph') or 0):+.2f}",
+            f"CYL {float(r.get('cyl') or 0):+.2f}" if float(r.get("cyl") or 0) else "",
+            f"AX {int(float(r.get('axis') or 0))}" if int(float(r.get("axis") or 0)) else "",
+            f"ADD {float(r.get('add_power') or 0):+.2f}" if float(r.get("add_power") or 0) else "",
+        ]).strip()
+        labels[sid] = (
+            f"{r.get('brand') or ''} | {r.get('product_name') or ''} | {power or 'No power'} "
+            f"| Batch {r.get('batch_no') or '-'} | Qty {r.get('quantity') or 0} "
+            f"| Current {r.get('barcode') or 'MISSING'}"
+        )
+
+    selected = st.selectbox(
+        "Select exact box / stock row",
+        list(labels.keys()),
+        format_func=lambda sid: labels.get(sid, sid),
+        key="clbc_selected_stock",
+    )
+    current = next((r for r in rows if str(r.get("stock_id")) == selected), {})
+
+    c1, c2 = st.columns([3, 1])
+    new_code = c1.text_input(
+        "Scan / enter SKU barcode",
+        value=str(current.get("barcode") or ""),
+        key=f"clbc_new_code_{selected}",
+        placeholder="Scan box barcode here",
+    )
+    c2.metric("Qty", int(float(current.get("quantity") or 0)))
+
+    if st.button("💾 Save Scan Code", type="primary", key=f"clbc_save_{selected}", use_container_width=True):
+        code = str(new_code or "").strip()
+        if not code:
+            st.warning("Scan code cannot be blank.")
+            return
+        dup = run_query("""
+            SELECT s.id::text AS stock_id, p.brand, p.product_name, s.batch_no
+            FROM inventory_stock s
+            LEFT JOIN products p ON p.id = s.product_id
+            WHERE UPPER(TRIM(COALESCE(s.barcode,''))) = UPPER(TRIM(%(bc)s))
+              AND s.id::text <> %(sid)s
+            LIMIT 1
+        """, {"bc": code, "sid": selected}) or []
+        if dup:
+            d = dup[0]
+            st.error(
+                "Duplicate barcode blocked: already used by "
+                f"{d.get('brand','')} {d.get('product_name','')} batch {d.get('batch_no','-')}."
+            )
+            return
+        try:
+            run_write(
+                "UPDATE inventory_stock SET barcode=%s, updated_at=NOW() WHERE id=%s::uuid",
+                (code, selected),
+            )
+            st.success("✅ Contact lens scan code saved.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Save failed: {exc}")
+
+
 def _tab_main_groups():
     """Manage main_groups master — canonical GST% and HSN code per product group."""
     from modules.sql_adapter import run_query, run_write
@@ -2117,7 +2575,7 @@ def _tab_main_groups():
         "SELECT id, name, gst_percent, hsn_code, description FROM main_groups ORDER BY name"
     ) or []
 
-    GST_OPTIONS = [0, 5, 12, 18, 28]
+    GST_OPTIONS = [0, 5, 18]
 
     st.markdown("#### Existing Groups")
     if not rows:
@@ -2186,7 +2644,7 @@ def render_loader_page():
     st.title("🗂️ Data Loader")
     st.caption("Smart Import (fingerprinted, audited) | Legacy Import (DRY/SHADOW/LIVE) | Export | Audit | Admin")
 
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "🧠 Smart Import",
         "📤 Legacy Import",
         "📊 DB Export",
@@ -2195,6 +2653,7 @@ def render_loader_page():
         "⚙️ Admin",
         "📋 Schema Reference",
         "🏷️ Main Groups",
+        "🧿 CL Barcode Update",
     ])
     with tab0:
         try:
@@ -2211,3 +2670,4 @@ def render_loader_page():
     with tab5: _tab_admin()
     with tab6: _tab_schema_ref()
     with tab7: _tab_main_groups()
+    with tab8: _tab_cl_barcode_update()

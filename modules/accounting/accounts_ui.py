@@ -226,6 +226,18 @@ def _tab_journal_entry():
     vdate   = st.date_input("Date", value=date.today(), key="jv_date")
     narr    = st.text_input("Narration", key="jv_narr",
                             placeholder="e.g. Monthly rent paid, Depreciation, Salary advance…")
+    c_ref, c_mirror = st.columns([2, 1])
+    bank_ref = c_ref.text_input(
+        "Bank / Cheque / UTR Ref",
+        key="jv_bank_ref",
+        placeholder="optional, used in bank book and payment register",
+    )
+    mirror_voucher = c_mirror.checkbox(
+        "Mirror to registers",
+        value=True,
+        key="jv_mirror",
+        help="For manual Journal/Contra, also writes cash/bank legs to payments and party-tagged lines to party ledger.",
+    )
 
     all_accounts = get_all_accounts()
     if not all_accounts:
@@ -246,7 +258,7 @@ def _tab_journal_entry():
     total_dr = total_cr = 0.0
 
     for i in range(int(n_lines)):
-        c1, c2, c3, c4 = st.columns([3, 1.2, 1.2, 2])
+        c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1.2, 2, 2])
         acct_sel  = c1.selectbox(f"Account {i+1}", [""] + acct_names,
                                   key=f"jv_acct_{i}")
         dr_amt    = c2.number_input("Debit ₹",  min_value=0.0, step=0.01,
@@ -254,6 +266,8 @@ def _tab_journal_entry():
         cr_amt    = c3.number_input("Credit ₹", min_value=0.0, step=0.01,
                                      key=f"jv_cr_{i}", value=0.0)
         line_narr = c4.text_input("Line narration", key=f"jv_lnarr_{i}",
+                                   placeholder="optional")
+        party_name = c5.text_input("Party / Supplier", key=f"jv_party_{i}",
                                    placeholder="optional")
 
         if acct_sel and (dr_amt > 0 or cr_amt > 0):
@@ -263,13 +277,14 @@ def _tab_journal_entry():
                 "debit":  dr_amt,
                 "credit": cr_amt,
                 "narration": line_narr,
+                "party_name": party_name.strip(),
             })
             total_dr += dr_amt
             total_cr += cr_amt
 
     # Balance indicator
     bal_diff = round(total_dr - total_cr, 2)
-    bal_color = "#10b981" if abs(bal_diff) < 0.01 else "#ef4444"
+    bal_color = "#10b981" if bal_diff == 0 else "#ef4444"
     st.markdown(
         f"<div style='padding:8px 14px;background:#0d1929;"
         f"border:1px solid {bal_color};border-radius:6px;margin:8px 0;"
@@ -277,7 +292,7 @@ def _tab_journal_entry():
         f"<span style='color:#94a3b8'>Total Dr: <b style='color:#60a5fa'>₹{total_dr:,.2f}</b>"
         f"  &nbsp;  Total Cr: <b style='color:#60a5fa'>₹{total_cr:,.2f}</b></span>"
         f"<span style='color:{bal_color};font-weight:700'>"
-        f"{'✅ Balanced' if abs(bal_diff)<0.01 else f'⚠️ Difference: ₹{abs(bal_diff):,.2f}'}"
+        f"{'✅ Balanced' if bal_diff == 0 else f'⚠️ Difference: ₹{abs(bal_diff):,.2f}'}"
         f"</span></div>",
         unsafe_allow_html=True
     )
@@ -285,7 +300,7 @@ def _tab_journal_entry():
     user = st.session_state.get("user_name", "Staff")
 
     if st.button("📋 Post Voucher", type="primary", key="jv_post",
-                  disabled=(len(lines) < 2 or abs(bal_diff) > 0.01)):
+                  disabled=(len(lines) < 2 or bal_diff != 0)):
         ok, vno, err = post_journal(
             voucher_type = vtype_map[vtype],
             voucher_date = vdate,
@@ -293,6 +308,9 @@ def _tab_journal_entry():
             lines        = lines,
             created_by   = user,
             is_auto      = False,
+            bank_ref     = bank_ref.strip(),
+            mirror_to_payments = mirror_voucher,
+            mirror_to_party_ledger = mirror_voucher,
         )
         if ok:
             st.success(f"✅ {vno} posted successfully")
@@ -328,87 +346,51 @@ def _tab_journal_entry():
 def _tab_bank_book():
     if not _check_db():
         return
-    from modules.accounting.accounts_engine import (
-        ensure_accounting_schema, get_all_accounts, get_bank_book,
-    )
+    from modules.accounting.accounts_engine import ensure_accounting_schema, get_transaction_book
     ensure_accounting_schema()
 
-    st.caption("Bank / Cash book — all receipts and payments through bank/cash accounts")
+    st.caption("Transaction book — combined cash and bank movement")
+    fd, td = _date_range("tbk")
+    tab_all, tab_cash, tab_bank = st.tabs(["Combined", "Cash", "Bank"])
 
-    # Select bank/cash account
-    bank_accts = [a for a in get_all_accounts()
-                  if a["account_type"] in ("BANK", "CASH")]
-    if not bank_accts:
-        st.info("No Bank or Cash accounts in Chart of Accounts.")
-        return
-
-    acct_opts = {f"{a['account_code']} — {a['account_name']}": a["account_code"]
-                 for a in bank_accts}
-    selected  = st.selectbox("Account", list(acct_opts.keys()), key="bb_acct")
-    acct_code = acct_opts[selected]
-    fd, td    = _date_range("bb")
-
-    rows = get_bank_book(acct_code, str(fd), str(td))
-
-    if not rows:
-        st.info("No entries for this account in selected period.")
-        return
-
-    df = _df(rows)
-    for c in ["Receipts (₹)", "Payments (₹)"]:
-        if c in df.columns:
+    def _render_txn(mode: str, key: str):
+        rows = get_transaction_book(str(fd), str(td), mode)
+        if not rows:
+            st.info("No transactions in this period.")
+            return
+        df = _df(rows)
+        for c in ["Receipts (₹)", "Payments (₹)"]:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        df["Balance (₹)"] = (df["Receipts (₹)"] - df["Payments (₹)"]).cumsum().round(2)
 
-    total_in  = df["Receipts (₹)"].sum()
-    total_out = df["Payments (₹)"].sum()
-    closing   = total_in - total_out
+        total_in = df["Receipts (₹)"].sum()
+        total_out = df["Payments (₹)"].sum()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Receipts", f"₹{total_in:,.2f}")
+        c2.metric("Payments", f"₹{total_out:,.2f}")
+        c3.metric("Net", f"₹{(total_in-total_out):,.2f}")
+        c4.metric("Entries", str(len(df)))
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Receipts",    f"₹{total_in:,.0f}")
-    m2.metric("Payments",    f"₹{total_out:,.0f}")
-    m3.metric("Net Balance", f"₹{closing:,.0f}")
-    m4.metric("Entries",     str(len(df)))
+        st.dataframe(
+            df[["Date", "Voucher No", "Type", "Account", "Party", "Ref", "Narration",
+                "Receipts (₹)", "Payments (₹)", "Balance (₹)", "Bank Ref", "Reconciled"]],
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "Receipts (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Payments (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Balance (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Reconciled": st.column_config.CheckboxColumn("Recon?"),
+            },
+        )
+        _download(df, f"Transaction_Book_{key}", f"tbk_dl_{key}")
 
-    st.dataframe(df, width='stretch', hide_index=True,
-        column_config={
-            "Receipts (₹)":  st.column_config.NumberColumn(format="₹%.2f"),
-            "Payments (₹)":  st.column_config.NumberColumn(format="₹%.2f"),
-            "Reconciled":    st.column_config.CheckboxColumn("Recon?"),
-        })
-
-    # Bank reconciliation
-    with st.expander("🔄 Mark Entries as Reconciled", expanded=False):
-        st.caption("Match with bank statement — tick entries that appear in bank statement")
-        unrecon = _q("""
-            SELECT bt.id::text, bt.txn_date::text AS "Date",
-                   bt.description AS "Description",
-                   bt.debit AS "Dr (₹)", bt.credit AS "Cr (₹)",
-                   bt.ref_no AS "Bank Ref"
-            FROM bank_transactions bt
-            JOIN chart_of_accounts a ON a.id = bt.bank_account_id
-            WHERE a.account_code = %s
-              AND bt.is_reconciled = FALSE
-              AND bt.txn_date BETWEEN %s AND %s
-            ORDER BY bt.txn_date
-        """, (acct_code, str(fd), str(td)))
-
-        if unrecon:
-            for row in unrecon:
-                col1, col2 = st.columns([5, 1])
-                col1.markdown(
-                    f"**{row['Date']}** — {row['Description']}  "
-                    f"Dr: ₹{row.get('Dr (₹)',0):,.2f}  Cr: ₹{row.get('Cr (₹)',0):,.2f}  "
-                    f"Ref: {row.get('Bank Ref','—')}"
-                )
-                if col2.button("✅", key=f"recon_{row['id']}"):
-                    from modules.sql_adapter import run_write
-                    run_write("UPDATE bank_transactions SET is_reconciled=TRUE WHERE id=%s::uuid",
-                              (row["id"],))
-                    st.rerun()
-        else:
-            st.success("✅ All entries reconciled for this period.")
-
-    _download(df, f"Bank_Book_{selected.split('—')[1].strip()}", "bb_dl")
+    with tab_all:
+        _render_txn("ALL", "combined")
+    with tab_cash:
+        _render_txn("CASH", "cash")
+    with tab_bank:
+        _render_txn("BANK", "bank")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -423,45 +405,52 @@ def _tab_voucher_register():
     )
     ensure_accounting_schema()
 
-    st.caption("All posted vouchers — auto and manual")
+    st.caption("Voucher register — system and manual vouchers")
 
     fd, td = _date_range("vr")
     vtype_filter = st.selectbox("Voucher Type",
         ["All","SALES","RECEIPT","PAYMENT","JOURNAL","CONTRA","PURCHASE"],
         key="vr_type")
-    source = st.radio("Source", ["All", "Auto-posted", "Manual"],
-                      horizontal=True, key="vr_src")
 
     rows = get_all_vouchers(str(fd), str(td),
                              voucher_type=("" if vtype_filter=="All" else vtype_filter),
                              limit=500)
 
-    if source == "Auto-posted":
-        rows = [r for r in rows if r.get("Auto")]
-    elif source == "Manual":
-        rows = [r for r in rows if not r.get("Auto")]
-
     if not rows:
         st.info("No vouchers found.")
         return
 
-    df = _df(rows)
-    if "Amount (₹)" in df.columns:
+    def _prep(rows_in):
+        df = _df(rows_in)
+        if df.empty:
+            return df
         df["Amount (₹)"] = pd.to_numeric(df["Amount (₹)"], errors="coerce").fillna(0)
+        df["Source"] = df["Auto"].map(lambda x: "System" if x else "Manual")
+        df["User"] = df["User"].replace({
+            "Accounts repair 2026-06-05": "System Backfill",
+        }).fillna("")
+        df.loc[df["User"].astype(str).str.startswith("Backfill by", na=False), "User"] = "System Backfill"
+        return df
 
-    m1, m2 = st.columns(2)
-    m1.metric("Vouchers",     str(len(df)))
-    m2.metric("Total Amount", f"₹{df['Amount (₹)'].sum():,.0f}" if "Amount (₹)" in df.columns else "—")
-
-    st.dataframe(df, width='stretch', hide_index=True,
-        column_config={"Amount (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-                       "Auto": st.column_config.CheckboxColumn("System?")})
-
-    # Drill down into a voucher
-    if rows:
-        vno_sel = st.selectbox("View voucher details",
-                                ["—"] + [r["Voucher No"] for r in rows],
-                                key="vr_drill")
+    def _render_register(rows_in, key):
+        if not rows_in:
+            st.info("No vouchers in this view.")
+            return
+        df = _prep(rows_in)
+        m1, m2 = st.columns(2)
+        m1.metric("Vouchers", str(len(df)))
+        m2.metric("Total Amount", f"₹{df['Amount (₹)'].sum():,.2f}")
+        st.dataframe(
+            df[["Date", "Voucher No", "Type", "Narration", "Amount (₹)", "Ref Doc", "Source", "User"]],
+            width='stretch',
+            hide_index=True,
+            column_config={"Amount (₹)": st.column_config.NumberColumn(format="₹%.2f")},
+        )
+        vno_sel = st.selectbox(
+            "Open voucher",
+            ["—"] + [r["Voucher No"] for r in rows_in],
+            key=f"vr_drill_{key}",
+        )
         if vno_sel and vno_sel != "—":
             lines = _q("""
                 SELECT l.account_name AS "Account",
@@ -480,8 +469,20 @@ def _tab_voucher_register():
                 st.dataframe(ldf, width='stretch', hide_index=True,
                     column_config={"Dr (₹)": st.column_config.NumberColumn(format="₹%.2f"),
                                    "Cr (₹)": st.column_config.NumberColumn(format="₹%.2f")})
+                try:
+                    from modules.reports.registers import _journal_action_drawer
+                    _journal_action_drawer(_prep([r for r in rows_in if r["Voucher No"] == vno_sel]), f"acct_jv_{key}")
+                except Exception:
+                    pass
+        _download(df, f"Voucher_Register_{key}", f"vr_dl_{key}")
 
-    _download(df, f"Voucher_Register", "vr_dl")
+    tab_all, tab_system, tab_manual = st.tabs(["All", "System", "Manual"])
+    with tab_all:
+        _render_register(rows, "all")
+    with tab_system:
+        _render_register([r for r in rows if r.get("Auto")], "system")
+    with tab_manual:
+        _render_register([r for r in rows if not r.get("Auto")], "manual")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -513,7 +514,7 @@ def _tab_trial_balance():
 
     total_dr = df["Closing Dr (₹)"].clip(lower=0).sum()
     total_cr = df["Closing Cr (₹)"].clip(lower=0).sum()
-    balanced = abs(total_dr - total_cr) < 1.0
+    balanced = round(total_dr - total_cr, 2) == 0
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Dr",  f"₹{total_dr:,.2f}")
@@ -548,20 +549,28 @@ def _tab_pl():
     fd, td = _date_range("pl")
 
     rows = _q("""
+        WITH account_period AS (
+            SELECT
+                l.account_id,
+                SUM(l.debit)  AS total_dr,
+                SUM(l.credit) AS total_cr
+            FROM journal_lines l
+            JOIN journal_entries j ON j.id = l.journal_id
+            WHERE j.voucher_date BETWEEN %s AND %s
+            GROUP BY l.account_id
+        )
         SELECT
             g.name                      AS "Group",
             a.account_name              AS "Account",
             a.nature                    AS "Nature",
-            COALESCE(SUM(l.debit),  0)  AS total_dr,
-            COALESCE(SUM(l.credit), 0)  AS total_cr
+            COALESCE(ap.total_dr, 0)    AS total_dr,
+            COALESCE(ap.total_cr, 0)    AS total_cr
         FROM chart_of_accounts a
         LEFT JOIN account_groups  g ON g.id = a.group_id
-        LEFT JOIN journal_lines   l ON l.account_id = a.id
-        LEFT JOIN journal_entries j ON j.id = l.journal_id
-            AND j.voucher_date BETWEEN %s AND %s
+        LEFT JOIN account_period ap ON ap.account_id = a.id
         WHERE a.nature IN ('INCOME', 'EXPENSE')
           AND a.is_active = TRUE
-        GROUP BY g.name, a.account_name, a.nature
+        GROUP BY g.name, a.account_name, a.nature, ap.total_dr, ap.total_cr
         ORDER BY a.nature DESC, g.name, a.account_name
     """, (str(fd), str(td)))
 
@@ -621,21 +630,29 @@ def _tab_balance_sheet():
     fd    = "2000-01-01"      # cumulative from beginning
 
     rows = _q("""
+        WITH account_period AS (
+            SELECT
+                l.account_id,
+                SUM(l.debit)  AS total_dr,
+                SUM(l.credit) AS total_cr
+            FROM journal_lines l
+            JOIN journal_entries j ON j.id = l.journal_id
+            WHERE j.voucher_date <= %s
+            GROUP BY l.account_id
+        )
         SELECT
             g.name                      AS "Group",
             a.account_name              AS "Account",
             a.nature                    AS "Nature",
             a.opening_balance           AS opening,
-            COALESCE(SUM(l.debit),  0)  AS total_dr,
-            COALESCE(SUM(l.credit), 0)  AS total_cr
+            COALESCE(ap.total_dr, 0)    AS total_dr,
+            COALESCE(ap.total_cr, 0)    AS total_cr
         FROM chart_of_accounts a
         LEFT JOIN account_groups  g ON g.id = a.group_id
-        LEFT JOIN journal_lines   l ON l.account_id = a.id
-        LEFT JOIN journal_entries j ON j.id = l.journal_id
-            AND j.voucher_date <= %s
+        LEFT JOIN account_period ap ON ap.account_id = a.id
         WHERE a.nature IN ('ASSET', 'LIABILITY')
           AND a.is_active = TRUE
-        GROUP BY g.name, a.account_name, a.nature, a.opening_balance
+        GROUP BY g.name, a.account_name, a.nature, a.opening_balance, ap.total_dr, ap.total_cr
         ORDER BY a.nature DESC, g.name, a.account_name
     """, (str(td),))
 
@@ -656,16 +673,52 @@ def _tab_balance_sheet():
     df = df[df["Balance"].abs() > 0.01]
 
     assets      = df[df["Nature"] == "ASSET"]
-    liabilities = df[df["Nature"] == "LIABILITY"]
+    liabilities = df[df["Nature"] == "LIABILITY"].copy()
     total_assets = assets["Balance"].sum()
     total_liab   = liabilities["Balance"].sum()
+
+    # Carry current P&L to the capital side until year-end transfer is posted.
+    # This keeps the balance sheet equation true without creating a real JV.
+    _pl = _q("""
+        WITH account_period AS (
+            SELECT
+                l.account_id,
+                SUM(l.debit) AS dr,
+                SUM(l.credit) AS cr
+            FROM journal_lines l
+            JOIN journal_entries j ON j.id = l.journal_id
+            WHERE j.voucher_date <= %s
+            GROUP BY l.account_id
+        )
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN a.nature IN ('INCOME', 'EXPENSE')
+                THEN COALESCE(ap.cr, 0) - COALESCE(ap.dr, 0)
+                ELSE 0
+            END
+        ), 0) AS net_profit
+        FROM chart_of_accounts a
+        LEFT JOIN account_period ap ON ap.account_id = a.id
+        WHERE a.nature IN ('INCOME', 'EXPENSE')
+          AND a.is_active = TRUE
+    """, (str(td),))
+    net_profit = float(_pl[0]["net_profit"]) if _pl else 0.0
+    if abs(net_profit) > 0.01:
+        liabilities = pd.concat([liabilities, pd.DataFrame([{
+            "Group": "Capital",
+            "Account": "Profit & Loss A/c (current period)",
+            "Nature": "LIABILITY",
+            "Balance": net_profit,
+        }])], ignore_index=True)
+        total_liab += net_profit
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Assets",      f"₹{total_assets:,.2f}")
     m2.metric("Total Liabilities", f"₹{total_liab:,.2f}")
-    m3.metric("Difference",        f"₹{abs(total_assets-total_liab):,.2f}",
-              delta="✅ Balanced" if abs(total_assets-total_liab) < 1.0 else "⚠️ Check entries",
-              delta_color="normal" if abs(total_assets-total_liab) < 1.0 else "inverse")
+    _bs_diff = round(total_assets - total_liab, 2)
+    m3.metric("Difference",        f"₹{abs(_bs_diff):,.2f}",
+              delta="✅ Balanced" if _bs_diff == 0 else "⚠️ Check entries",
+              delta_color="normal" if _bs_diff == 0 else "inverse")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -816,6 +869,10 @@ def _tab_backfill():
                 m1.metric("Invoices posted",      stats["invoices"])
                 m2.metric("Payments posted",      stats["payments"])
                 m3.metric("Disbursements posted", stats["disbursements"])
+                st.metric("Purchase invoices posted", stats.get("purchases", 0))
+                n1, n2 = st.columns(2)
+                n1.metric("Credit notes posted", stats.get("credit_notes", 0))
+                n2.metric("Debit notes posted", stats.get("debit_notes", 0))
 
                 if stats["errors"]:
                     st.warning(f"⚠️ {len(stats['errors'])} entries could not be posted:")
@@ -839,82 +896,152 @@ def _tab_backfill():
 # TAB — ACCOUNT LEDGER (drill-down from any account)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _render_source_actions_from_ledger(df: pd.DataFrame, party_name: str, key: str):
+    if df.empty or "Ref No" not in df.columns:
+        return
+    try:
+        from modules.reports.registers import _ledger_doc_action_drawer
+        key = "".join(ch if ch.isalnum() else "_" for ch in str(key or "ledger_doc"))
+        action_df = df.rename(columns={"Doc Type": "Type"}).copy()
+        _ledger_doc_action_drawer(action_df, party_name, key)
+    except Exception as exc:
+        st.caption(f"Document actions unavailable: {exc}")
+
+
 def _tab_account_ledger():
     if not _check_db():
         return
     from modules.accounting.accounts_engine import (
         ensure_accounting_schema, get_all_accounts, get_account_ledger,
+        get_party_control_ledger, get_party_control_summary,
     )
     ensure_accounting_schema()
 
-    st.caption("Click any account to open its full register — daily / monthly / yearly view")
+    st.caption("Tally-style ledger: control accounts open party-wise first")
 
-    # ── Account selector ──────────────────────────────────────────────────
     all_accounts = get_all_accounts()
     if not all_accounts:
         st.info("No accounts yet.")
         return
 
-    # Group by nature for clean display
-    nature_icons = {"INCOME": "📈", "EXPENSE": "📉", "ASSET": "🏦", "LIABILITY": "⚖️"}
-
-    # Filter by nature
-    nat_filter = st.radio(
+    category = st.radio(
         "Category",
-        ["All", "📈 Income", "📉 Expense", "🏦 Asset", "⚖️ Liability"],
-        horizontal=True, key="al_nat",
+        [
+            "Sundry Debtors",
+            "Sundry Creditors",
+            "Cash / Bank",
+            "Current Assets",
+            "Fixed Assets",
+            "Stock-in-Hand",
+            "Sales",
+            "Purchase",
+            "Direct Expenses",
+            "Indirect Expenses",
+            "Duties & Taxes",
+            "All Ledgers",
+        ],
+        horizontal=True,
+        key="al_category",
     )
-    nat_map = {
-        "All": None, "📈 Income": "INCOME", "📉 Expense": "EXPENSE",
-        "🏦 Asset": "ASSET", "⚖️ Liability": "LIABILITY",
-    }
-    nat = nat_map[nat_filter]
-    filtered = [a for a in all_accounts if nat is None or a["nature"] == nat]
 
-    # Build display options with group
-    def _acct_label(a):
-        icon = nature_icons.get(a["nature"], "📋")
-        return f"{icon} {a['account_code']} — {a['account_name']}  [{a.get('group_name','')}]"
+    fd, td   = _date_range("al")
 
-    labels    = [_acct_label(a) for a in filtered]
-    acct_map  = {_acct_label(a): a for a in filtered}
-
-    # Search filter
-    def _on_acct_search():
-        st.session_state["al_search_term"] = st.session_state.get("al_search_input", "")
-
-    st.text_input(
-        "🔍 Filter accounts",
-        key="al_search_input",
-        placeholder="Type account name…",
-        on_change=_on_acct_search,
-    )
-    term = st.session_state.get("al_search_term", "")
-    if term:
-        labels   = [l for l in labels if term.lower() in l.lower()]
-        if not labels:
-            st.caption(f"No accounts matching '{term}'")
+    if category in ("Sundry Debtors", "Sundry Creditors"):
+        account_code = "2001" if category == "Sundry Debtors" else "2002"
+        party_label = "Debtor" if account_code == "2001" else "Creditor"
+        rows = get_party_control_summary(account_code, str(fd), str(td))
+        if not rows:
+            st.info(f"No {party_label.lower()} movement in this period.")
             return
+        df = _df(rows)
+        for c in ["Opening (₹)", "Dr (₹)", "Cr (₹)", "Closing (₹)"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round(2)
 
-    placeholder = f"— Select account ({len(labels)}) —"
-    chosen = st.selectbox("Select Account", [placeholder] + labels, key="al_acct_sel")
+        total_close = df["Closing (₹)"].sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"{party_label}s", str(len(df)))
+        c2.metric("Total Closing", f"₹{total_close:,.2f}")
+        c3.metric("Unmapped", str((df["Party"] == "Unmapped Party").sum()))
 
-    if not chosen or chosen == placeholder:
-        # Show account summary cards when nothing selected
-        st.markdown("---")
-        _render_account_summary_cards(all_accounts)
+        st.dataframe(
+            df,
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "Opening (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Dr (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Cr (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Closing (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            },
+        )
+
+        parties = df["Party"].astype(str).tolist()
+        selected_party = st.selectbox(f"Open {party_label}", parties, key=f"al_party_{account_code}")
+        ledger_rows = get_party_control_ledger(account_code, selected_party, str(fd), str(td))
+        if not ledger_rows:
+            st.info("No ledger rows for selected party.")
+            return
+        ldf = _df(ledger_rows)
+        for c in ["Dr (₹)", "Cr (₹)", "Balance (₹)"]:
+            ldf[c] = pd.to_numeric(ldf[c], errors="coerce").fillna(0).round(2)
+
+        st.markdown(f"**{selected_party} — {category} Ledger**")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Dr", f"₹{ldf['Dr (₹)'].sum():,.2f}")
+        m2.metric("Cr", f"₹{ldf['Cr (₹)'].sum():,.2f}")
+        m3.metric("Closing", f"₹{float(ldf['Balance (₹)'].iloc[-1]):,.2f}")
+        m4.metric("Entries", str(len(ldf)))
+        st.dataframe(
+            ldf[["Date", "Voucher No", "Type", "Doc Type", "Ref No", "Narration",
+                 "Dr (₹)", "Cr (₹)", "Balance (₹)"]],
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "Dr (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Cr (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Balance (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            },
+        )
+        _render_source_actions_from_ledger(ldf, selected_party, f"acct_{account_code}_{selected_party}")
+        _download(ldf, f"{category}_{selected_party}", f"al_party_dl_{account_code}")
         return
 
-    acct = acct_map[chosen]
+    def _acct_filter(a):
+        group = str(a.get("group_name") or "")
+        code = str(a.get("account_code") or "")
+        atype = str(a.get("account_type") or "")
+        if category == "Cash / Bank":
+            return atype in ("CASH", "BANK")
+        if category == "Current Assets":
+            return group in ("Current Assets", "Bank Accounts", "Cash-in-Hand", "Sundry Debtors", "Stock-in-Hand")
+        if category == "Fixed Assets":
+            return group == "Fixed Assets"
+        if category == "Stock-in-Hand":
+            return group == "Stock-in-Hand" or atype == "STOCK"
+        if category == "Sales":
+            return atype == "SALES"
+        if category == "Purchase":
+            return atype == "PURCHASE"
+        if category == "Direct Expenses":
+            return group == "Direct Expenses"
+        if category == "Indirect Expenses":
+            return group == "Indirect Expenses"
+        if category == "Duties & Taxes":
+            return group == "Duties & Taxes" or atype == "TAX"
+        return code not in ("2001", "2002")
 
-    # ── Date range + grouping ─────────────────────────────────────────────
-    st.markdown("---")
-    c1, c2, c3 = st.columns([1, 1, 1])
-    fd, td   = _date_range("al")
-    grouping = c3.radio("View", ["Detail", "Daily", "Monthly", "Yearly"],
+    filtered = [a for a in all_accounts if _acct_filter(a)]
+    if not filtered:
+        st.info("No ledgers in this category.")
+        return
+
+    labels = [f"{a['account_code']} — {a['account_name']} [{a.get('group_name','')}]" for a in filtered]
+    acct_map = dict(zip(labels, filtered))
+    chosen = st.selectbox("Select Ledger", labels, key="al_regular_acct")
+    acct = acct_map[chosen]
+    grouping = st.radio("View", ["Detail", "Daily", "Monthly", "Yearly"],
                         horizontal=True, key="al_grp")
 
-    # ── Fetch ledger ──────────────────────────────────────────────────────
     rows = get_account_ledger(acct["account_code"], str(fd), str(td))
 
     if not rows:
@@ -929,15 +1056,14 @@ def _tab_account_ledger():
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # Running balance
     if acct["nature"] in ("ASSET", "EXPENSE"):
-        df["Balance (₹)"] = (df["Dr (₹)"] - df["Cr (₹)"]).cumsum()
+        df["Balance (₹)"] = (df["Dr (₹)"] - df["Cr (₹)"]).cumsum().round(2)
     else:
-        df["Balance (₹)"] = (df["Cr (₹)"] - df["Dr (₹)"]).cumsum()
+        df["Balance (₹)"] = (df["Cr (₹)"] - df["Dr (₹)"]).cumsum().round(2)
 
     # Opening balance
     opening = float(acct.get("opening_balance") or 0)
-    df["Balance (₹)"] = df["Balance (₹)"] + opening
+    df["Balance (₹)"] = (df["Balance (₹)"] + opening).round(2)
 
     total_dr = df["Dr (₹)"].sum()
     total_cr = df["Cr (₹)"].sum()
@@ -945,6 +1071,7 @@ def _tab_account_ledger():
                           else total_cr - total_dr)
 
     # ── Metrics ───────────────────────────────────────────────────────────
+    nature_icons = {"INCOME": "📈", "EXPENSE": "📉", "ASSET": "🏦", "LIABILITY": "⚖️"}
     icon = nature_icons.get(acct["nature"], "📋")
     st.markdown(
         f"<div style='background:#0a1628;border:1px solid #1e3a5f;border-radius:8px;"
@@ -1028,19 +1155,27 @@ def _render_account_summary_cards(all_accounts: list):
     # Fetch current period balances
     try:
         bal_rows = _q("""
+            WITH account_period AS (
+                SELECT
+                    l.account_id,
+                    SUM(l.debit)  AS total_dr,
+                    SUM(l.credit) AS total_cr
+                FROM journal_lines l
+                JOIN journal_entries j ON j.id = l.journal_id
+                WHERE j.voucher_date >= date_trunc('month', CURRENT_DATE)
+                GROUP BY l.account_id
+            )
             SELECT
                 a.account_code,
                 a.account_name,
                 a.nature,
                 a.opening_balance,
-                COALESCE(SUM(l.debit),  0) AS total_dr,
-                COALESCE(SUM(l.credit), 0) AS total_cr
+                COALESCE(ap.total_dr, 0) AS total_dr,
+                COALESCE(ap.total_cr, 0) AS total_cr
             FROM chart_of_accounts a
-            LEFT JOIN journal_lines   l ON l.account_id = a.id
-            LEFT JOIN journal_entries j ON j.id = l.journal_id
-                AND j.voucher_date >= date_trunc('month', CURRENT_DATE)
+            LEFT JOIN account_period ap ON ap.account_id = a.id
             WHERE a.is_active = TRUE
-            GROUP BY a.account_code, a.account_name, a.nature, a.opening_balance
+            GROUP BY a.account_code, a.account_name, a.nature, a.opening_balance, ap.total_dr, ap.total_cr
             ORDER BY a.account_code
         """)
     except Exception:
@@ -1115,7 +1250,7 @@ def render_accounts():
         st.error(f"Table check failed: {e}")
         return
 
-    # ── Show account count ─────────────────────────────────────────────────
+    # ── Show account count and posting status ──────────────────────────────
     try:
         cnt = _q("SELECT COUNT(*) AS n FROM chart_of_accounts")
         n = int(cnt[0]["n"]) if cnt else 0
@@ -1126,24 +1261,54 @@ def render_accounts():
     except Exception:
         pass
 
-    tabs = st.tabs([
+    try:
+        _has_cancelled = bool(_q("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='payments' AND column_name='is_cancelled' LIMIT 1
+        """))
+        _cf = "AND NOT COALESCE(is_cancelled,FALSE)" if _has_cancelled else ""
+        _stats = {
+            "inv": (_q("SELECT COUNT(*) AS n FROM invoices WHERE COALESCE(is_deleted,FALSE)=FALSE") or [{}])[0].get("n", 0),
+            "pay": (_q(f"SELECT COUNT(*) AS n FROM payments WHERE COALESCE(is_deleted,FALSE)=FALSE {_cf}") or [{}])[0].get("n", 0),
+            "jv":  (_q("SELECT COUNT(*) AS n FROM journal_entries") or [{}])[0].get("n", 0),
+        }
+        st.caption(
+            f"Source docs: invoices {_stats['inv']} · payments {_stats['pay']} · "
+            f"posted vouchers {_stats['jv']}"
+        )
+        if int(_stats["jv"] or 0) == 0 and (int(_stats["inv"] or 0) or int(_stats["pay"] or 0)):
+            st.warning("Accounts has source documents but no journal vouchers yet. Open Backfill and run it once.")
+    except Exception:
+        pass
+
+    sections = [
         "📋 Chart of Accounts",
         "📖 Account Ledger",
         "✏️ Journal Entry",
-        "🏦 Bank Book",
+        "🏦 Transaction Book",
         "📄 Voucher Register",
         "⚖️ Trial Balance",
         "📈 P&L",
         "🏛️ Balance Sheet",
         "🔄 Backfill",
-    ])
+    ]
+    selected = st.radio(
+        "Accounts section",
+        sections,
+        horizontal=True,
+        key="accounts_active_section",
+        label_visibility="collapsed",
+    )
 
-    with tabs[0]: _tab_chart_of_accounts()
-    with tabs[1]: _tab_account_ledger()
-    with tabs[2]: _tab_journal_entry()
-    with tabs[3]: _tab_bank_book()
-    with tabs[4]: _tab_voucher_register()
-    with tabs[5]: _tab_trial_balance()
-    with tabs[6]: _tab_pl()
-    with tabs[7]: _tab_balance_sheet()
-    with tabs[8]: _tab_backfill()
+    render_map = {
+        sections[0]: _tab_chart_of_accounts,
+        sections[1]: _tab_account_ledger,
+        sections[2]: _tab_journal_entry,
+        sections[3]: _tab_bank_book,
+        sections[4]: _tab_voucher_register,
+        sections[5]: _tab_trial_balance,
+        sections[6]: _tab_pl,
+        sections[7]: _tab_balance_sheet,
+        sections[8]: _tab_backfill,
+    }
+    render_map[selected]()

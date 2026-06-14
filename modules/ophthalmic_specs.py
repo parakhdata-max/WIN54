@@ -96,22 +96,37 @@ def check_stock(product_id: str, sph: float, cyl: float, axis: int,
                 eye_side: str = "PAIR") -> dict:
     """
     Check physical stock for power + index + coating.
+    Generic progressive rows may have blank CYL/AXIS and match by SPH+ADD.
+    RX-stock rows that contain CYL/AXIS must match the entered CYL/AXIS.
     Returns {status: STOCK|RX_ORDER, qty_r, qty_l, batch_no}
     """
+    _add = add_power or 0
+    _coats = [str(coating or "").lower()]
+    if _add and str(coating or "").strip().lower() == "green":
+        _coats.append("murk vision")
+
     rows = _q("""
         SELECT eye_side, SUM(quantity) AS qty, MIN(batch_no) AS batch_no
         FROM inventory_stock
         WHERE product_id=%(pid)s::uuid
           AND stock_type IN ('BATCH','POWER')
           AND ABS(COALESCE(sph,0)           - %(sph)s)  < 0.01
-          AND ABS(COALESCE(cyl,0)           - %(cyl)s)  < 0.01
+          AND (
+                ABS(COALESCE(cyl,0) - %(cyl)s) < 0.01
+                OR (%(add)s <> 0 AND COALESCE(cyl,0) = 0)
+              )
+          AND (
+                COALESCE(axis,0) = 0
+                OR ABS(COALESCE(axis,0) - %(axis)s) <= 1
+              )
+          AND ABS(COALESCE(add_power,0)     - %(add)s)  < 0.01
           AND (index_value IS NULL OR ABS(index_value - %(idx)s::numeric) < 0.01)
-          AND LOWER(COALESCE(coating,''))   = LOWER(%(coat)s)
+          AND LOWER(COALESCE(coating,''))   = ANY(%(coats)s)
           AND COALESCE(is_active,TRUE) = TRUE
           AND quantity > 0
         GROUP BY eye_side
-    """, {"pid": product_id, "sph": sph or 0, "cyl": cyl or 0,
-           "idx": index_value or "0", "coat": coating or ""})
+    """, {"pid": product_id, "sph": sph or 0, "cyl": cyl or 0, "axis": axis or 0, "add": _add,
+           "idx": index_value or "0", "coats": _coats})
 
     qty_r = qty_l = 0; batch = ""
     for row in rows:
@@ -120,7 +135,8 @@ def check_stock(product_id: str, sph: float, cyl: float, axis: int,
         b    = row.get("batch_no") or ""
         if side in ("R","RIGHT"):       qty_r = q; batch = b
         elif side in ("L","LEFT"):      qty_l = q; batch = b
-        elif side in ("PAIR","","MAIN"):qty_r = q; qty_l = q; batch = b
+        elif side in ("B","BOTH","PAIR","","MAIN"):
+            qty_r = q; qty_l = q; batch = b
 
     if qty_r > 0 or qty_l > 0:
         return {"status": "STOCK", "qty_r": qty_r, "qty_l": qty_l,
@@ -173,4 +189,3 @@ def get_addons_for_product(
         if existing is None or int(r.get("prec",9)) < int(existing.get("prec",9)):
             seen[name] = r
     return sorted(seen.values(), key=lambda x: (int(x.get("sort_order") or 99), x.get("addon_name","")))
-

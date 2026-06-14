@@ -1,7 +1,7 @@
 """
 modules/printing/label_preview.py
 ====================================
-SVG/HTML preview of the 80×14mm jewellery label.
+SVG/HTML preview of the 80×12mm jewellery label.
 Shows exact proportional layout — barcode bars, text, zones.
 No printer needed. Use in Streamlit to verify before printing.
 """
@@ -41,7 +41,7 @@ def render_label_preview(
     show_zones: bool = False,
 ):
     """
-    Render an accurate proportional SVG preview of the 80×14mm label.
+    Render an accurate proportional SVG preview of the 80×12mm frame jewellery label.
     Matches the actual TSPL layout zones exactly.
     """
     import sys
@@ -62,7 +62,7 @@ def render_label_preview(
     left_start  = mm(H_SHIFT_MM)
     left_w      = fold - left_start
     right_start = fold + mm(RIGHT_PAD_MM)
-    right_w     = mm(LABEL_W_MM) - right_start
+    right_w     = (fold * 2) - right_start
     label_h     = mm(LABEL_H_MM)
     voff        = mm(V_OFFSET_MM)
 
@@ -158,7 +158,7 @@ body {{ font-family: Arial, sans-serif; background: #f1f5f9; padding: 20px; }}
 </head>
 <body>
 <div class="wrap">
-  <div class="title">LABEL PREVIEW — 80mm × 14mm · TSC TTP-244 Pro</div>
+  <div class="title">FRAME STICKER PREVIEW — 80mm × 12mm · two 26.5mm panels + tail</div>
 
   <div class="label-outer">
     <div class="cut-mark cut-tl"></div>
@@ -205,7 +205,7 @@ body {{ font-family: Arial, sans-serif; background: #f1f5f9; padding: 20px; }}
   <div class="info-grid">
     <div class="info-item">
       <div class="info-label">Label size</div>
-      <div class="info-val">80 × 14 mm</div>
+      <div class="info-val">80 × 12 mm</div>
     </div>
     <div class="info-item">
       <div class="info-label">Barcode</div>
@@ -217,11 +217,11 @@ body {{ font-family: Arial, sans-serif; background: #f1f5f9; padding: 20px; }}
     </div>
     <div class="info-item">
       <div class="info-label">Left zone</div>
-      <div class="info-val">{FOLD_MM}mm · SKU + barcode</div>
+      <div class="info-val">0–{FOLD_MM:g}mm · SKU + barcode</div>
     </div>
     <div class="info-item">
       <div class="info-label">Right zone</div>
-      <div class="info-val">{round(LABEL_W_MM - FOLD_MM, 1)}mm · name + MRP</div>
+      <div class="info-val">{FOLD_MM:g}–{FOLD_MM * 2:g}mm · shop + MRP</div>
     </div>
     <div class="info-item">
       <div class="info-label">Font sizes</div>
@@ -242,7 +242,7 @@ def render_label_preview_widget():
     Full interactive Streamlit widget — edit code/shop/price and see preview update live.
     """
     st.markdown("#### 🏷️ Label Preview")
-    st.caption("Live preview of the 80×14mm jewellery sticker. Edit values to see changes.")
+    st.caption("Live preview of the 80×12mm frame jewellery sticker. Edit values to see changes.")
 
     c1, c2, c3, c4 = st.columns(4)
     code   = c1.text_input("SKU / Barcode", value="D10007",   key="prev_code")

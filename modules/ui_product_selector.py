@@ -8,6 +8,96 @@ import pandas as pd
 from modules.sql_adapter import execute_query
 
 
+def _install_product_selectbox_mouse_fix():
+    """Commit highlighted BaseWeb selectbox options on touchpad/click before menu collapse."""
+    try:
+        st.markdown(
+            """
+<style>
+[data-baseweb="popover"] [role="listbox"],
+[data-baseweb="menu"],
+ul[role="listbox"] {
+    max-height: 46vh !important;
+    overflow-y: auto !important;
+    overscroll-behavior: contain !important;
+}
+[data-baseweb="popover"] [role="option"],
+[data-baseweb="menu"] [role="option"],
+ul[role="listbox"] [role="option"] {
+    pointer-events: auto !important;
+    cursor: pointer !important;
+}
+div[role="dialog"] {
+    max-height: 94vh !important;
+}
+div[role="dialog"] > div {
+    max-height: 90vh !important;
+    overflow-y: auto !important;
+}
+div[role="dialog"] [data-testid="stVerticalBlock"] {
+    gap: 0.35rem !important;
+}
+div[role="dialog"] label,
+div[role="dialog"] [data-testid="stWidgetLabel"] {
+    font-size: 0.82rem !important;
+}
+</style>
+            """,
+            unsafe_allow_html=True,
+        )
+        import streamlit.components.v1 as components
+        components.html(
+            """
+<script>
+(function(){
+  const w = window.parent || window;
+  const doc = w.document;
+  const MARK = "dv-product-selectbox-mouse-fix-v3";
+  if (w[MARK]) return;
+  w[MARK] = true;
+
+  function isOption(el){
+    return !!(el && el.closest && el.closest('[role="option"], li[role="option"]'));
+  }
+
+  function commitOption(target){
+    const opt = target && target.closest ? target.closest('[role="option"], li[role="option"]') : null;
+    if (!opt) return;
+    if (opt.getAttribute("aria-disabled") === "true") return;
+
+    try { opt.scrollIntoView({block:"nearest"}); } catch(e) {}
+    try {
+      opt.dispatchEvent(new MouseEvent("mouseover", {bubbles:true, cancelable:true, view:window}));
+      opt.dispatchEvent(new MouseEvent("mouseenter", {bubbles:true, cancelable:true, view:window}));
+    } catch(e) {}
+
+    setTimeout(function(){
+      try {
+        if (w.PointerEvent) {
+          opt.dispatchEvent(new PointerEvent("pointerup", {bubbles:true, cancelable:true, view:window}));
+        }
+        opt.dispatchEvent(new MouseEvent("mouseup", {bubbles:true, cancelable:true, view:window}));
+        opt.dispatchEvent(new MouseEvent("click", {bubbles:true, cancelable:true, view:window}));
+        if (typeof opt.click === "function") opt.click();
+      } catch(e) {}
+    }, 0);
+  }
+
+  ["pointerdown", "mousedown", "pointerup", "mouseup", "touchstart"].forEach(function(evt){
+    doc.addEventListener(evt, function(e){
+      if (!isOption(e.target)) return;
+      commitOption(e.target);
+    }, true);
+  });
+})();
+</script>
+            """,
+            height=0,
+        )
+    except Exception:
+        pass
+
+
 # --------------------------------------------------
 # REFERENCE PRICE LOOKUP — for out-of-stock products
 # --------------------------------------------------
@@ -118,13 +208,15 @@ def is_frame_category(category: str) -> bool:
 # --------------------------------------------------
 
 def _fetch_frame_skus(product_id: str) -> list:
-    """Fetch all active SKUs for a frame product from inventory_stock."""
+    """Fetch all active scan/item codes for a frame product from inventory_stock."""
     try:
         from modules.sql_adapter import run_query
         rows = run_query("""
             SELECT
-                batch_no                            AS sku,
-                COALESCE(quantity, 0)               AS qty,
+                item_code                           AS sku,
+                batch_no                            AS batch_no,
+                COALESCE(item_code, '')             AS item_code,
+                GREATEST(0, COALESCE(quantity, 0) - COALESCE(allocated_qty, 0)) AS qty,
                 COALESCE(mrp, 0)                    AS mrp,
                 COALESCE(selling_price, 0)          AS selling_price,
                 COALESCE(purchase_rate, 0)          AS purchase_rate,
@@ -134,8 +226,10 @@ def _fetch_frame_skus(product_id: str) -> list:
             FROM inventory_stock
             WHERE product_id = %s
               AND COALESCE(is_active, true) = true
-              AND COALESCE(quantity, 0) > 0
-            ORDER BY batch_no
+              AND item_code IS NOT NULL
+              AND TRIM(item_code) != ''
+              AND GREATEST(0, COALESCE(quantity, 0) - COALESCE(allocated_qty, 0)) > 0
+            ORDER BY item_code
         """, (product_id,))
         return rows or []
     except Exception:
@@ -144,10 +238,11 @@ def _fetch_frame_skus(product_id: str) -> list:
 
 def lookup_sku(barcode: str) -> dict:
     """
-    Resolve a Barcode (scanned or typed) to a product + stock row.
+    Resolve a scan/item code (scanned or typed) to a product + stock row.
     Search order:
-      1. inventory_stock.batch_no  — frames, CLENS, OPHLENS, SOL (has quantity + price)
-      2. products.barcode         — services, fitting, colouring (no stock row needed)
+      1. inventory_stock.barcode / product_barcode — printed product barcodes
+      2. inventory_stock.item_code                 — universal scan code
+      3. products.barcode / products.sku_code      — product master/service codes
     """
     if not barcode or not barcode.strip():
         return None
@@ -187,22 +282,25 @@ def lookup_sku(barcode: str) -> dict:
             JOIN products p ON p.id = s.product_id
         """
 
-        # ── Search 1a: inventory_stock by barcode (FIFO — oldest expiry first) ──
+        # ── Search 1a: inventory_stock by barcode/product_barcode (FIFO — oldest expiry first) ──
         # Product barcode encodes product+power — one scan fills everything
         rows = run_query(
             _stock_select +
-            """WHERE UPPER(TRIM(COALESCE(s.barcode,''))) = %s
+            """WHERE (
+                    UPPER(TRIM(COALESCE(s.barcode,''))) = %s
+                 OR UPPER(TRIM(COALESCE(s.product_barcode,''))) = %s
+               )
                  AND COALESCE(s.quantity,0) > 0
                ORDER BY s.expiry_date ASC NULLS LAST
                LIMIT 1""",
-            (sku,)
+            (sku, sku)
         )
         if rows:
             r = dict(rows[0])
             r["_resolved_by"] = "barcode"
             return r
 
-        # ── Search 1b: inventory_stock by item_code (Tally alias) ──────────────────────
+        # ── Search 1b: inventory_stock by item_code (universal scan code) ───────────────
         rows = run_query(
             _stock_select +
             """WHERE UPPER(TRIM(COALESCE(s.item_code,''))) = %s
@@ -216,18 +314,7 @@ def lookup_sku(barcode: str) -> dict:
             r["_resolved_by"] = "item_code"
             return r
 
-        # ── Search 1c: inventory_stock by batch_no (frame SKU, lot barcode) ────────────
-        rows = run_query(
-            _stock_select +
-            "WHERE UPPER(TRIM(s.batch_no)) = %s LIMIT 1",
-            (sku,)
-        )
-        if rows:
-            r = dict(rows[0])
-            r["_resolved_by"] = "batch_no"
-            return r
-
-        # ── Search 2: products.barcode — services, accessories ──────────────
+        # ── Search 2: products.barcode/sku_code — services, accessories ────
         prod_rows = run_query("""
             SELECT
                 id::text                                AS product_id,
@@ -248,10 +335,13 @@ def lookup_sku(barcode: str) -> dict:
                 ''                                      AS colour_mix,
                 ''                                      AS frame_group
             FROM products
-            WHERE UPPER(TRIM(COALESCE(barcode,''))) = %s
+            WHERE (
+                    UPPER(TRIM(COALESCE(barcode,''))) = %s
+                 OR UPPER(TRIM(COALESCE(sku_code,''))) = %s
+            )
               AND COALESCE(is_active, true) = true
             LIMIT 1
-        """, (sku,))
+        """, (sku, sku))
 
         return prod_rows[0] if prod_rows else None
 
@@ -318,8 +408,30 @@ def _oph_spec_price(product_id: str, index_value: str, coating: str,
         return {"wlp":0,"srp":0,"purchase":0,"selling":0,"found":False}
 
 
+def _oph_specs_for_products(product_ids: list[str]) -> pd.DataFrame:
+    if not product_ids:
+        return pd.DataFrame()
+    try:
+        from modules.sql_adapter import run_query
+        rows = run_query("""
+            SELECT DISTINCT
+                product_id::text AS product_id,
+                index_value::text AS lens_index,
+                COALESCE(coating,'') AS coating_type,
+                COALESCE(treatment,'Clear') AS treatment
+            FROM ophthalmic_lens_specs
+            WHERE product_id::text = ANY(%(pids)s)
+              AND COALESCE(is_active, TRUE) = TRUE
+            ORDER BY lens_index, coating_type, treatment
+        """, {"pids": [str(p) for p in product_ids]}) or []
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
+
 def render_product_selector():
 
+    _install_product_selectbox_mouse_fix()
     st.subheader("🔍 Product Selection")
 
     # ── Scanner / SKU quick entry ─────────────────────────────────────────────
@@ -328,13 +440,16 @@ def render_product_selector():
     with scanner_col:
         autofocus_scan("Scan")
         typed = st.text_input(
-            "📷 Scan SKU / Barcode",
-            placeholder="Scan or type SKU → press Enter",
+            "📷 Scan Code / Item Code / Barcode",
+            placeholder="Scan or type item code → press Enter",
             key="ps_scanner_input",
             label_visibility="collapsed",
         )
+        st.caption("Scanning rule: use Scan Code / Item Code from inventory_stock.item_code. Batch No is not used for frame scanning.")
         if typed and typed.strip():
             st.session_state["ps_scanner_val"] = typed.strip().upper()
+        else:
+            st.session_state.pop("ps_scanner_val", None)
 
     with clear_col:
         if st.button("✕ Clear", key="ps_scanner_clear", use_container_width=True):
@@ -351,7 +466,7 @@ def render_product_selector():
             is_frame  = is_frame_category(mg)
             is_lens   = is_lens_category(mg)
             is_contact = is_contact_category(mg)
-            sku_val   = str(hit.get("batch_no") or "")
+            sku_val   = str(hit.get("item_code") or "")
             # Build display line — include power if present (contact/ophthalmic lens)
             _parts = [f"✅ {hit['product_name']}"]
             if hit.get('brand'):        _parts.append(hit['brand'])
@@ -362,6 +477,7 @@ def render_product_selector():
             if hit.get('eye_side'):     _parts.append(f"👁 {hit['eye_side']}")
             _mrp = float(hit.get('mrp') or 0)
             if _mrp:                    _parts.append(f"₹{_mrp:.0f}")
+            if hit.get('item_code'):    _parts.append(f"Code:{hit['item_code']}")
             if hit.get('batch_no'):     _parts.append(f"Batch:{hit['batch_no']}")
             if hit.get('expiry_date'):  _parts.append(f"Exp:{hit['expiry_date'][:7]}")
             if hit.get('location'):     _parts.append(f"📍{hit['location']}")
@@ -380,7 +496,8 @@ def render_product_selector():
                 "mrp":           float(hit.get("mrp") or 0),
                 "selling_price": float(hit.get("selling_price") or 0),
                 "purchase_rate": float(hit.get("purchase_rate") or 0),
-                "batch_no":      sku_val,
+                "item_code":     str(hit.get("item_code") or ""),
+                "batch_no":      str(hit.get("batch_no") or ""),
                 "location":      hit.get("location",""),
                 "available_qty": int(hit.get("available_qty") or 0),
                 "stock_status":  "READY" if int(hit.get("available_qty") or 0) > 0 else "OUT",
@@ -396,7 +513,7 @@ def render_product_selector():
             }
         else:
             st.warning(
-                f"⚠️ SKU **{scanned_sku}** not found in inventory. "
+                f"⚠️ Scan code **{scanned_sku}** not found in inventory. "
                 "Check Barcode or use the product dropdown below."
             )
 
@@ -531,35 +648,78 @@ def render_product_selector():
 
     c5, c6, c7, c8 = st.columns(4)
 
+    _mg_sel = st.session_state.get("ps_main_group","")
+    _is_oph_filter = is_ophthalmic_category(_mg_sel) if _mg_sel else False
+    _oph_base_df = products_df.copy()
+    for _col, _key in [
+        ("main_group","ps_main_group"),
+        ("brand","ps_brand"),
+        ("material","ps_material"),
+        ("type","ps_type"),
+    ]:
+        _val = st.session_state.get(_key)
+        if _val:
+            _oph_base_df = _oph_base_df[_oph_base_df[_col].astype(str) == str(_val)]
+    _oph_specs_df = (
+        _oph_specs_for_products(_oph_base_df["product_id"].dropna().astype(str).unique().tolist())
+        if not _oph_base_df.empty else pd.DataFrame()
+    )
+    _has_oph_specs = not _oph_specs_df.empty
+
     with c5:
-        _mg_sel = st.session_state.get("ps_main_group","")
-        _is_oph_filter = is_ophthalmic_category(_mg_sel) if _mg_sel else False
-        if not _is_oph_filter:
+        if _has_oph_specs:
+            _idx_opts = [""] + sorted(_oph_specs_df["lens_index"].dropna().astype(str).unique())
+            if st.session_state.get("ps_lens_index") not in _idx_opts:
+                st.session_state["ps_lens_index"] = ""
+            st.selectbox(
+                "Lens Index",
+                _idx_opts,
+                key="ps_lens_index", on_change=clear_product,
+            )
+        else:
             st.selectbox(
                 "Lens Index",
                 [""] + sorted(products_df["lens_index"].dropna().astype(str).unique()),
                 key="ps_lens_index", on_change=clear_product,
-                help="Index selected after product for ophthalmic lenses"
             )
-        else:
-            st.session_state["ps_lens_index"] = ""
-            st.markdown("**🔢 Index**"); st.caption("after product ↓")
 
     with c6:
-        if not _is_oph_filter:
+        if _has_oph_specs:
+            _idx_filter = st.session_state.get("ps_lens_index", "")
+            _coat_src = _oph_specs_df
+            if _idx_filter:
+                _coat_src = _coat_src[_coat_src["lens_index"].astype(str) == str(_idx_filter)]
+            _coat_opts = [""] + sorted(_coat_src["coating_type"].dropna().astype(str).unique())
+            if st.session_state.get("ps_coating_type") not in _coat_opts:
+                st.session_state["ps_coating_type"] = ""
+            st.selectbox(
+                "Coating",
+                _coat_opts,
+                key="ps_coating_type", on_change=clear_product,
+            )
+        else:
             st.selectbox(
                 "Coating",
                 [""] + sorted(products_df["coating_type"].dropna().astype(str).unique()),
                 key="ps_coating_type", on_change=clear_product,
             )
-        else:
-            st.session_state["ps_coating_type"] = ""
-            st.markdown("**🛡️ Coating**"); st.caption("after product ↓")
 
     with c7:
+        # Colour options scoped to current main_group selection so stale
+        # colour from a previous category (e.g. "Brown" lens) does not
+        # filter out frames whose colour is in inventory_stock not products.
+        _mg_for_colour = st.session_state.get("ps_main_group", "")
+        if _mg_for_colour:
+            _colour_src = products_df[products_df["main_group"].astype(str) == _mg_for_colour]
+        else:
+            _colour_src = products_df
+        _colour_opts = [""] + sorted(_colour_src["colour"].dropna().astype(str).unique())
+        # Guard: if saved colour not valid for this group, clear it
+        if st.session_state.get("ps_colour") not in _colour_opts:
+            st.session_state["ps_colour"] = ""
         st.selectbox(
             "Colour",
-            [""] + sorted(products_df["colour"].dropna().astype(str).unique()),
+            _colour_opts,
             key="ps_colour",
             on_change=clear_product
         )
@@ -578,25 +738,68 @@ def render_product_selector():
 
     df = products_df.copy()
 
+    _frame_groups = {"frames", "sunglasses", "accessories", "accessory"}
+    _current_mg = str(st.session_state.get("ps_main_group") or "").lower()
+    _is_stock_group = _current_mg in _frame_groups
+
     for col, key in [
         ("main_group","ps_main_group"),
         ("brand","ps_brand"),
         ("material","ps_material"),
         ("type","ps_type"),
-        ("lens_index","ps_lens_index"),
-        ("coating_type","ps_coating_type"),
         ("colour","ps_colour"),
         ("unit","ps_unit"),
     ]:
-
         val = st.session_state.get(key)
-
         if val:
+            # For frame/stock groups, skip colour filter on products table —
+            # colour lives in inventory_stock per batch, not products.colour.
+            # Staff pick colour at the SKU picker (📷 Scan Barcode) step.
+            if col == "colour" and _is_stock_group:
+                continue
             df = df[df[col].astype(str) == str(val)]
+
+    if _has_oph_specs:
+        _spec_df = _oph_specs_for_products(df["product_id"].dropna().astype(str).unique().tolist())
+        _idx_filter = st.session_state.get("ps_lens_index")
+        _coat_filter = st.session_state.get("ps_coating_type")
+        if _idx_filter:
+            _spec_df = _spec_df[_spec_df["lens_index"].astype(str) == str(_idx_filter)]
+        if _coat_filter:
+            _spec_df = _spec_df[_spec_df["coating_type"].astype(str) == str(_coat_filter)]
+        if _idx_filter or _coat_filter:
+            _allowed = set(_spec_df["product_id"].astype(str).tolist())
+            df = df[df["product_id"].astype(str).isin(_allowed)]
+    else:
+        for col, key in [
+            ("lens_index","ps_lens_index"),
+            ("coating_type","ps_coating_type"),
+        ]:
+            val = st.session_state.get(key)
+            if val:
+                df = df[df[col].astype(str) == str(val)]
 
     # ----------------------------------
     # Product Dropdown
     # ----------------------------------
+
+    # Safety net: if filters produce 0 products, progressively relax them.
+    # Stale ps_colour from a prior search is the most common cause — clear it
+    # and retry before showing a blank dropdown.
+    if df.empty and st.session_state.get("ps_colour"):
+        st.session_state["ps_colour"] = ""
+        df = products_df.copy()
+        for _col, _key in [
+            ("main_group", "ps_main_group"),
+            ("brand",      "ps_brand"),
+            ("material",   "ps_material"),
+            ("type",       "ps_type"),
+            ("unit",       "ps_unit"),
+        ]:
+            _v = st.session_state.get(_key)
+            if _v:
+                df = df[df[_col].astype(str) == str(_v)]
+        st.caption("⚠️ Colour filter cleared — no products matched the previous colour.")
 
     product_list = sorted(df["product_name"].dropna().astype(str).unique())
 
@@ -638,6 +841,13 @@ def render_product_selector():
         if _oph_sel_fn:
             _order_type = (st.session_state.get("_current_order_type")
                            or st.session_state.get("pricing_mode","RETAIL"))
+            _spec_prefix = f"ps_{pid[:8]}"
+            _filter_idx = st.session_state.get("ps_lens_index")
+            _filter_coat = st.session_state.get("ps_coating_type")
+            if _filter_idx:
+                st.session_state[f"oph_{_spec_prefix}_index"] = _filter_idx
+            if _filter_coat:
+                st.session_state[f"oph_{_spec_prefix}_coating"] = _filter_coat
             _oph_spec_result = _oph_sel_fn(
                 product_id   = pid,
                 product_name = sel,
@@ -646,7 +856,7 @@ def render_product_selector():
                 rx_l         = st.session_state.get("retail_new_rx_l")
                                or st.session_state.get("wholesale_rx_l", {}),
                 order_type   = _order_type,
-                key_prefix   = f"ps_{pid[:8]}",
+                key_prefix   = _spec_prefix,
             )
             if _oph_spec_result and _oph_spec_result.get("complete"):
                 # Store spec in session_state for fast-path in wholesale_punching
@@ -667,7 +877,7 @@ def render_product_selector():
 
     is_frame = is_frame_category(str(row.get("main_group") or ""))
 
-    # ── Frame: show SKU picker (each SKU = one physical frame) ──────────────
+    # ── Frame: show Scan Code picker (each code = one physical frame) ───────
     if is_frame:
         skus = _fetch_frame_skus(str(row["product_id"]))
 
@@ -675,21 +885,22 @@ def render_product_selector():
             st.warning(f"⚠️ {row['product_name']} — no stock available")
             return None
 
-        # SKU scan / type box
+        # Scan code / type box
         scanned = st.text_input(
-            "📷 Scan or type SKU",
+            "📷 Scan or type Item Code",
             placeholder="e.g. D10007",
             key="ps_frame_sku_scan"
         ).strip().upper()
+        st.caption("This is the physical frame scan code saved in inventory_stock.item_code.")
 
-        # If scanned SKU matches one of this product's SKUs — auto-select
+        # If scanned code matches one of this product's stock codes — auto-select
         sku_match = None
         if scanned:
             sku_match = next((s for s in skus if s["sku"].upper() == scanned), None)
             if not sku_match:
-                st.warning(f"SKU {scanned!r} not found in stock for this product")
+                st.warning(f"Item code {scanned!r} not found in stock for this product")
 
-        # SKU dropdown — label shows SKU + location + price
+        # Code dropdown — label shows code + location + price
         sku_labels = [
             f"{s['sku']}  |  📍{s['location']}  |  ₹{s['mrp']:.0f}"
             + (f"  |  {s['colour_mix']}" if s.get("colour_mix") else "")
@@ -701,7 +912,7 @@ def render_product_selector():
             default_idx = next((i for i, s in enumerate(skus) if s["sku"].upper() == scanned), 0)
 
         sel_label = st.selectbox(
-            f"Select SKU ({len(skus)} in stock)",
+            f"Select Item Code ({len(skus)} in stock)",
             sku_labels,
             index=default_idx,
             key="ps_frame_sku_select"
@@ -710,7 +921,7 @@ def render_product_selector():
 
         st.success(
             f"🕶️ {row['product_name']} | {row['brand']} | "
-            f"SKU: {sel_sku['sku']} | 📍{sel_sku['location']} | ₹{sel_sku['mrp']:.0f}"
+            f"Code: {sel_sku['sku']} | 📍{sel_sku['location']} | ₹{sel_sku['mrp']:.0f}"
         )
 
         # Merge SKU-level prices into product row
@@ -718,7 +929,8 @@ def render_product_selector():
         product_row["mrp"]           = sel_sku["mrp"]
         product_row["selling_price"] = sel_sku["selling_price"]
         product_row["purchase_rate"] = sel_sku["purchase_rate"]
-        product_row["batch_no"]      = sel_sku["sku"]
+        product_row["item_code"]     = sel_sku["sku"]
+        product_row["batch_no"]      = sel_sku.get("batch_no") or ""
         product_row["available_qty"] = sel_sku["qty"]
 
         return {

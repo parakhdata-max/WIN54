@@ -16,7 +16,8 @@
   },
   "tax": {
     "strict_gst_required": true,
-    "valid_gst_slabs": [0, 5, 12, 18, 28]
+    "block_zero_gst_unless_exempt": true,
+    "valid_gst_slabs": [0, 5, 18]
   },
   "fulfillment": {
     "rx_tolerance_default":           false,

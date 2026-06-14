@@ -31,13 +31,30 @@ _ALIAS: Dict[str, str] = {
     "READY_FOR_BILLING":   "READY_FOR_BILLING",  # own station
     "UNDER_REVIEW":        "UNDER_REVIEW",
     "PENDING_PAYMENT":     "PENDING_PAYMENT",    # own station — payment gate
+    "HOLD":                "HOLD",
+    "ON_HOLD":             "HOLD",
+    "CREDIT_HOLD":         "CREDIT_HOLD",
 }
 
 # ── Done job stages — means job is finished, order can move to READY ─────────
 _JOB_DONE_STAGES = {
-    "READY_FOR_PACK", "DISPATCHED", "FINAL_QC",
-    "HARDCOAT_COMPLETED", "ARC_RECEIVED",
-    "COLOURING_COMPLETED", "PRODUCTION_COMPLETED",
+    # Inhouse final stages — job complete, order moves to READY/BILLING
+    "READY_FOR_PACK",       # packing step — visible in pipeline
+    "READY_TO_BILL",        # billing gate open (is_closed=TRUE)
+    "READY_FOR_BILLING",    # supplier pipeline terminal (alias)
+    "FINAL_QC",
+    "FITTING_DONE",
+    "DELIVERED",
+    "INVOICED",
+    # Coating completion stages
+    "HARDCOAT_COMPLETED",
+    "HARDCOAT_DONE",        # canonical stage name
+    "ARC_RECEIVED",
+    "COLOURING_COMPLETED",
+    "COLOURING_DONE",
+    "PRODUCTION_COMPLETED",
+    "PRODUCTION_DONE",
+    "DISPATCHED",
 }
 
 # ── Status metadata — one place to update labels/icons/colors ────────────────
@@ -55,12 +72,14 @@ STATUS_META: Dict[str, Dict] = {
     "DELIVERED":        {"label": "Delivered",       "icon": "✅", "color": "#10b981", "badge": "green"},
     "CLOSED":           {"label": "Closed",          "icon": "🔒", "color": "#334155", "badge": "slate"},
     "PENDING_PAYMENT":  {"label": "Awaiting Payment","icon": "💳", "color": "#f97316", "badge": "orange"},
+    "HOLD":             {"label": "On Hold",         "icon": "⏸️", "color": "#f97316", "badge": "orange"},
+    "CREDIT_HOLD":      {"label": "Credit Hold",     "icon": "🛑", "color": "#dc2626", "badge": "red"},
     "CANCELLED":        {"label": "Cancelled",       "icon": "❌", "color": "#ef4444", "badge": "red"},
 }
 
 # ── Train stations in order ───────────────────────────────────────────────────
 STATUS_TRAIN = [
-    "PENDING", "UNDER_REVIEW", "PENDING_PAYMENT", "CONFIRMED",
+    "PENDING", "UNDER_REVIEW", "HOLD", "CREDIT_HOLD", "PENDING_PAYMENT", "CONFIRMED",
     "IN_PRODUCTION", "READY", "READY_FOR_BILLING",
     "PARTIALLY_BILLED", "CHALLANED", "BILLED",
     "DISPATCHED", "DELIVERED", "CLOSED",
@@ -130,14 +149,42 @@ def get_live_status(order: dict) -> str:
                 _total    = int(coverage[0].get("total_lines") or 0)
                 _billed   = int(coverage[0].get("billed_lines") or 0)
                 _invoiced = int(coverage[0].get("invoiced_challans") or 0)
-                if _total > 0 and _billed >= _total:
-                    # All lines challaned — check if any invoice exists
-                    if _invoiced > 0:
-                        return "BILLED"      # invoice exists → fully invoiced
-                    else:
-                        return "CHALLANED"   # challan only, no invoice yet
-                elif _billed > 0:
-                    return "PARTIALLY_BILLED"
+
+                if _total > 0:
+                    # Normal order: check product line coverage
+                    if _billed >= _total:
+                        if _invoiced > 0:
+                            return "BILLED"
+                        else:
+                            return "CHALLANED"
+                    elif _billed > 0:
+                        return "PARTIALLY_BILLED"
+                else:
+                    # Service-only order (total_lines=0) — check challan/invoice existence
+                    svc_cov = _rq("""
+                        SELECT
+                            COUNT(DISTINCT cl.id) AS challan_lines,
+                            COUNT(DISTINCT i.id)  AS invoices
+                        FROM order_lines ol
+                        JOIN orders o ON o.id = ol.order_id
+                        LEFT JOIN challan_lines cl ON cl.order_line_id = ol.id
+                            AND EXISTS (
+                                SELECT 1 FROM challans c
+                                WHERE c.id = cl.challan_id
+                                  AND c.status NOT IN ('CANCELLED','VOID','DELETED')
+                            )
+                        LEFT JOIN challans ch2 ON ch2.order_ids::text[] @> ARRAY[o.id::text]
+                            AND ch2.status NOT IN ('CANCELLED','VOID','DELETED')
+                        LEFT JOIN invoices i ON i.challan_id = ch2.id
+                            AND i.status NOT IN ('CANCELLED','VOID')
+                        WHERE (o.id::text = %(oid)s OR o.order_no = %(ono)s)
+                          AND COALESCE(ol.is_deleted, FALSE) = FALSE
+                          AND COALESCE(ol.is_service_line, FALSE) = TRUE
+                    """, {"oid": _oid_txt, "ono": _ono_txt})
+                    if svc_cov and int(svc_cov[0].get("challan_lines") or 0) > 0:
+                        if int(svc_cov[0].get("invoices") or 0) > 0:
+                            return "BILLED"
+                        return "CHALLANED"
         except Exception:
             pass
 
@@ -228,6 +275,9 @@ def get_live_status(order: dict) -> str:
                 WHERE (%(oid)s IS NOT NULL AND o.id = %(oid)s::uuid
                     OR o.order_no = %(ono)s)
                   AND NOT jm.is_closed
+                  AND COALESCE(ol.is_service_line, FALSE) = FALSE
+                  AND UPPER(COALESCE(ol.eye_side,'')) NOT IN ('S','SERVICE')
+                  AND UPPER(COALESCE(ol.batch_status,'')) NOT IN ('CONFIRMED','DRAFT')
                 LIMIT 5
             """, {"oid": _oid_jm, "ono": ono})
             if jobs:
@@ -431,6 +481,11 @@ def compute_order_status(order: dict, write: bool = True) -> str:
                     """, (str(_u.uuid4()), oid, cur, live))
                 except Exception:
                     pass  # history table optional
+                try:
+                    from modules.backoffice.backoffice_helpers import load_orders_from_database
+                    load_orders_from_database.clear()
+                except Exception:
+                    pass
             except Exception:
                 pass  # non-fatal — status will sync on next load
 

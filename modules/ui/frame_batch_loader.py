@@ -4,10 +4,10 @@ modules/ui/frame_batch_loader.py
 Frame Stock Manager — two tabs:
 
   ✏️  EDIT  — Download current frame stock → edit prices/qty → upload back
-              Barcode is the key — duplicate SKUs in upload = error, not silent overwrite
+              Scan Code / Item Code is the scanning key — duplicate codes in upload = error
 
   ➕  ADD   — Upload your BatchData Excel (multi-sheet, StartCode, colour normalisation)
-              New SKUs only — existing SKU in ADD tab = error (use EDIT tab to change price)
+              New scan codes only — existing scan code in ADD tab = error (use EDIT tab to change price)
 """
 
 import io
@@ -27,10 +27,16 @@ COL_MAP = {
     "Brand":                "brand",
     "🔒 Brand":             "brand",
     "Barcode":              "barcode",
+    "Scan Code":            "barcode",
+    "Item Code":            "barcode",
+    "Scan Code / Item Code": "barcode",
+    "Scan Code / Item Code (for scanning)": "barcode",
     "SKU Code":             "barcode",
     "SKU CODE":             "barcode",
     "SKU":                  "barcode",
     "🔒 SKU Code":          "barcode",
+    "🔒 Scan Code / Item Code": "barcode",
+    "🔒 Scan Code / Item Code (for scanning)": "barcode",
     # ── Dimensions ────────────────────────────────────────────────────────────
     "ASize":                "size_a",
     "A Size":               "size_a",
@@ -156,7 +162,7 @@ def _fetch_frame_stock() -> pd.DataFrame:
         from modules.sql_adapter import run_query
         rows = run_query("""
             SELECT
-                s.batch_no                                          AS barcode,
+                COALESCE(NULLIF(s.item_code,''), NULLIF(s.batch_no,'')) AS barcode,
                 p.product_name,
                 COALESCE(p.brand,'')                               AS brand,
                 COALESCE(p.model,'')                               AS model,
@@ -181,7 +187,7 @@ def _fetch_frame_stock() -> pd.DataFrame:
             JOIN products p ON p.id = s.product_id
             WHERE LOWER(COALESCE(p.main_group,'')) IN ('frames','frame','sunglasses')
               AND COALESCE(s.is_active, true) = true
-            ORDER BY p.product_name, s.batch_no
+            ORDER BY p.product_name, COALESCE(NULLIF(s.item_code,''), NULLIF(s.batch_no,''))
         """)
         if not rows:
             return pd.DataFrame()
@@ -198,7 +204,7 @@ def _fetch_frame_stock() -> pd.DataFrame:
 def _build_edit_excel(df: pd.DataFrame) -> bytes:
     """
     Build a formatted Excel for editing.
-    Barcode column is locked (grey). Price + qty columns are white (editable).
+    Scan Code / Item Code column is locked (grey). Price + qty columns are white (editable).
     """
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -234,7 +240,7 @@ def _build_edit_excel(df: pd.DataFrame) -> bytes:
     ALT_ROW     = "E8F4FD"
 
     FRIENDLY = {
-        "barcode":      "🔒 SKU Code",
+        "barcode":      "🔒 Scan Code / Item Code (for scanning)",
         "product_name":  "🔒 Product Name",
         "brand":         "🔒 Brand",
         "colour":        "Colour",
@@ -294,8 +300,10 @@ def _build_edit_excel(df: pd.DataFrame) -> bytes:
         ("🕶️ Frame Stock — EDIT FILE", "title"),
         ("", None),
         ("🔒 LOCKED columns (grey) — DO NOT change:", "head"),
-        ("   • SKU Code, Product Name, Brand, Colour, Material", "body"),
+        ("   • Scan Code / Item Code, Product Name, Brand, Colour, Material", "body"),
         ("   These are identity fields — changing them breaks the match to DB.", "body"),
+        ("   Scan Code / Item Code is the code used by scanners in punching and stock search.", "body"),
+        ("   Batch No is not the frame scan field; keep batch numbers only for true batch/lot stock.", "body"),
         ("", None),
         ("✅ EDITABLE columns (white/blue):", "head"),
         ("   • Location / Box  — update box/tray location", "body"),
@@ -308,7 +316,7 @@ def _build_edit_excel(df: pd.DataFrame) -> bytes:
         ("⚠️ RULES:", "head"),
         ("   • Do NOT add or delete rows", "body"),
         ("   • Do NOT rename or move columns", "body"),
-        ("   • SKU Code is the key — it must match exactly", "body"),
+        ("   • Scan Code / Item Code is the scanning key — it must match exactly", "body"),
         ("   • To add new frames, use the ➕ Add New tab (separate upload)", "body"),
     ]
     TITLE_FILL  = PatternFill("solid", start_color="1A3C5E")
@@ -385,7 +393,7 @@ def read_frame_excel(file_bytes: bytes) -> pd.DataFrame:
 
     # ── Case-insensitive column mapping ───────────────────────────────────────
     # Build a lookup: lowercase(excel_header) → db_column_name
-    # This means "SKU Code", "SKU CODE", "sku code", "Sku Code" all work equally.
+    # This means "Scan Code", "SKU Code", "SKU CODE", "sku code" all work equally.
     _col_map_lower = {k.lower(): v for k, v in COL_MAP.items()}
     _rename = {
         col: _col_map_lower[col.lower()]
@@ -448,7 +456,7 @@ def render_frame_batch_loader():
         "padding:10px 16px;border-radius:6px;margin-bottom:12px'>"
         "<b style='color:#7dd3fc;font-size:1rem'>🕶️ Frame Stock Manager</b>"
         "<span style='color:#94a3b8;font-size:0.78rem;margin-left:10px'>"
-        "Edit prices · Add new stock · SKU is the unique key</span>"
+        "Edit prices · Add new stock · Scan Code / Item Code is the scanner key</span>"
         "</div>",
         unsafe_allow_html=True
     )
@@ -470,7 +478,7 @@ def _render_edit_tab():
     st.markdown("#### ✏️ Edit Existing Frame Stock")
     st.caption(
         "Download current stock → edit prices, qty, location → upload back. "
-        "**SKU Code is locked** — it's the key that matches rows to DB records."
+        "**Scan Code / Item Code is locked** — this is the field used by scanners in punching and stock search."
     )
 
     # ── Step 1: Download ──────────────────────────────────────────────────────
@@ -512,7 +520,8 @@ def _render_edit_tab():
                 st.caption("Edit the white/blue columns → upload in Step 2 below.")
         with c2:
             st.info(
-                "🔒 **Locked** (grey): SKU Code, Product Name, Brand\n\n"
+                "🔒 **Locked** (grey): Scan Code / Item Code, Product Name, Brand\n\n"
+                "📷 **Scanning field**: Scan Code / Item Code. Do not use Batch No for frame scan codes.\n\n"
                 "✏️ **Editable** (white): Colour, ColourMix, TempleColour, Material, "
                 "BSize, Location, FrameGroup, Qty, Purchase Price, Selling Price, MRP, Active"
             )
@@ -530,7 +539,7 @@ def _render_edit_tab():
 
 
 def _handle_edit_upload(uploaded):
-    """Process edit upload — SKU is key, validate no duplicates, preview changes."""
+    """Process edit upload — Scan Code / Item Code is key, validate no duplicates, preview changes."""
     from modules.sql_adapter import run_query, run_write
 
     file_bytes = uploaded.read()
@@ -542,7 +551,7 @@ def _handle_edit_upload(uploaded):
         st.error("❌ Could not read 'Frame Stock' sheet — make sure you uploaded a file downloaded from Step 1.")
         return
 
-    # Detect file type — EDIT file has "🔒 SKU Code", ADD template has "Barcode"
+    # Detect file type — EDIT file has a locked scan-code column; ADD template has Barcode.
     cols = list(df.columns)
     is_edit_file   = any("🔒" in str(c) for c in cols)
     is_add_template = "Barcode" in cols or "skucode" in [str(c).lower() for c in cols]
@@ -560,6 +569,8 @@ def _handle_edit_upload(uploaded):
     reverse_friendly = {
         # Edit file headers (from _build_edit_excel FRIENDLY map)
         "🔒 SKU Code":       "barcode",
+        "🔒 Scan Code / Item Code": "barcode",
+        "🔒 Scan Code / Item Code (for scanning)": "barcode",
         "🔒 Product Name":   "product_name",
         "🔒 Brand":          "brand",
         "Colour":            "colour",
@@ -579,7 +590,7 @@ def _handle_edit_upload(uploaded):
 
     if "barcode" not in df.columns:
         st.error(
-            "❌ SKU Code column not found. \n\n"
+            "❌ Scan Code / Item Code column not found. \n\n"
             "Make sure you are uploading a file downloaded from **Step 1 — Download Current Frame Stock** above, "
             "not the Add New template or any other file."
         )
@@ -588,10 +599,10 @@ def _handle_edit_upload(uploaded):
     # ── Validation ────────────────────────────────────────────────────────────
     issues = []
 
-    # 1. Duplicate SKUs in uploaded file
+    # 1. Duplicate scan codes in uploaded file
     dup_skus = df[df.duplicated("barcode", keep=False) & df["barcode"].notna()]
     if not dup_skus.empty:
-        issues.append(f"❌ **{len(dup_skus)} duplicate SKU(s)** in uploaded file — each SKU must appear once only: "
+        issues.append(f"❌ **{len(dup_skus)} duplicate scan code(s)** in uploaded file — each code must appear once only: "
                       f"`{'`, `'.join(dup_skus['barcode'].dropna().unique()[:5])}`")
 
     # 2. Missing MRP
@@ -613,13 +624,13 @@ def _handle_edit_upload(uploaded):
     # ── Match to DB and show change preview ───────────────────────────────────
     all_skus = [_safe_str(s).upper() for s in df["barcode"].dropna()]
     if not all_skus:
-        st.error("No valid Barcodes found.")
+        st.error("No valid Scan Code / Item Code values found.")
         return
 
     # Fetch current DB state for these SKUs
     placeholders = ",".join(["%s"] * len(all_skus))
     current_rows = run_query(f"""
-        SELECT s.batch_no AS barcode,
+        SELECT COALESCE(NULLIF(s.item_code,''), NULLIF(s.batch_no,'')) AS barcode,
                COALESCE(s.quantity,0)      AS qty,
                COALESCE(s.purchase_rate,0) AS purchase_rate,
                COALESCE(s.selling_price,0) AS selling_price,
@@ -629,7 +640,7 @@ def _handle_edit_upload(uploaded):
         FROM inventory_stock s
         JOIN products p ON p.id = s.product_id
         WHERE LOWER(COALESCE(p.main_group,'')) IN ('frames','frame','sunglasses')
-          AND UPPER(s.batch_no) IN ({placeholders})
+          AND UPPER(COALESCE(NULLIF(s.item_code,''), NULLIF(s.batch_no,''))) IN ({placeholders})
     """, tuple(all_skus)) or []
 
     db_map = {str(r["barcode"]).upper(): r for r in current_rows}
@@ -710,7 +721,7 @@ def _handle_edit_upload(uploaded):
         changes_df.style.apply(_highlight, axis=1),
         use_container_width=True, hide_index=True,
         column_config={
-            "SKU":   st.column_config.TextColumn("SKU Code"),
+            "SKU":   st.column_config.TextColumn("Scan Code / Item Code"),
             "Field": st.column_config.TextColumn("Field"),
             "Old":   st.column_config.TextColumn("Current Value"),
             "New":   st.column_config.TextColumn("New Value"),
@@ -789,7 +800,7 @@ def _apply_edit(df: pd.DataFrame, db_map: dict):
                     temple_length = COALESCE(%s, temple_length),
                     frame_group   = NULLIF(%s,\'\'),
                     updated_at    = NOW()
-                WHERE UPPER(batch_no) = %s
+                WHERE UPPER(COALESCE(NULLIF(item_code,''), NULLIF(batch_no,''))) = %s
                   AND product_id IN (
                       SELECT id FROM products WHERE LOWER(COALESCE(main_group,'')) IN (\'frames\',\'frame\',\'sunglasses\')
                   )
@@ -927,7 +938,7 @@ def _build_blank_template() -> bytes:
         ("4. Upload via Frame Stock Manager → ➕ Add New Frames tab", "body"),
         ("", None),
         ("🟢 REQUIRED columns (dark green header):", "head"),
-        ("   Barcode · Product · Qty · MRP", "body"),
+        ("   Scan Code / Item Code · Product · Qty · MRP", "body"),
         ("", None),
         ("📋 NEW COLUMNS:", "head"),
         ("   BSize        — B measurement (vertical lens height in mm)", "body"),
@@ -938,7 +949,8 @@ def _build_blank_template() -> bytes:
         ("                  Leave blank for standard stock", "body"),
         ("", None),
         ("⚠️ RULES:", "head"),
-        ("   • Barcode must be unique — cannot reuse a SKU already in the system", "body"),
+        ("   • Scan Code / Item Code must be unique — this is what scanner reads in punching", "body"),
+        ("   • For frames, this code is saved in inventory_stock.item_code, not Batch No", "body"),
         ("   • To update prices on existing frames, use the ✏️ Edit Existing tab", "body"),
         ("   • IsActive: Y or 1 = active (default), N or 0 = inactive", "body"),
         ("   • Prices in ₹: MRP = retail, selling_price = wholesale, Purchase price = cost", "body"),
@@ -966,7 +978,7 @@ def _render_add_tab():
     st.markdown("#### ➕ Add New Frames")
     st.caption(
         "Upload your BatchData Excel to add new frames. "
-        "**SKU Codes that already exist in the DB will be rejected** — "
+        "**Scan Code / Item Code values that already exist in the DB will be rejected** — "
         "use the ✏️ Edit tab to update prices/qty on existing frames."
     )
 
@@ -997,7 +1009,8 @@ def _render_add_tab():
         with c2:
             st.info(
                 "Includes all columns: BSize, ColourMix, TempleColour, FrameGroup. "
-                "Dark green header = required. Delete the orange example row before uploading."
+                "Dark green header = required. Scan Code / Item Code is for scanning. "
+                "Delete the orange example row before uploading."
             )
 
     with st.expander("📋 Expected Excel Format", expanded=False):
@@ -1005,7 +1018,7 @@ def _render_add_tab():
 | Column | Required | Notes |
 |---|---|---|
 | Product | ✅ | Full product name |
-| Barcode | ✅ | Unique — rejected if already in DB |
+| Barcode / Scan Code / Item Code | ✅ | Scanner code — unique, rejected if already in DB |
 | Brand | | e.g. Parakh |
 | StartCode | | Box/tray location (D1, T3, BOX1) |
 | Colour | | Primary colour |
@@ -1076,7 +1089,7 @@ def _render_preview(df: pd.DataFrame):
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Frames",      len(df))
-    c2.metric("Unique SKUs", df["barcode"].nunique() if "barcode" in df.columns else "—")
+    c2.metric("Unique Scan Codes", df["barcode"].nunique() if "barcode" in df.columns else "—")
     c3.metric("Locations",   df["location"].dropna().astype(str).replace("","_").replace("_", pd.NA).dropna().nunique() if "location" in df.columns else "—")
     c4.metric("Colours",     df["colour"].dropna().astype(str).replace("","_").replace("_", pd.NA).dropna().nunique()   if "colour"   in df.columns else "—")
     c5.metric("MRP Range",   f"₹{mrp_col.min():.0f}–₹{mrp_col.max():.0f}" if not mrp_col.empty else "—")
@@ -1128,33 +1141,34 @@ def _render_issues(df: pd.DataFrame):
 
     no_sku = df[df["barcode"].isna() | (df["barcode"].astype(str).str.strip() == "")] if "barcode" in df.columns else pd.DataFrame()
     if not no_sku.empty:
-        issues.append(("❌ Missing SKU Code", no_sku))
+        issues.append(("❌ Missing Scan Code / Item Code", no_sku))
 
     if "barcode" in df.columns:
         dup = df[df.duplicated("barcode", keep=False) & df["barcode"].notna()]
         if not dup.empty:
             issues.append((
-                f"❌ Duplicate Barcodes in Excel — {dup['barcode'].nunique()} SKU(s) appear more than once. "
-                f"Each frame must have a unique SKU. Check if SKU was mis-typed — "
+                f"❌ Duplicate scan codes in Excel — {dup['barcode'].nunique()} code(s) appear more than once. "
+                f"Each frame must have a unique Scan Code / Item Code. Check if code was mistyped — "
                 f"only the FIRST occurrence will be kept during import.", dup
             ))
 
-        # Check which SKUs already exist in DB — these will be REJECTED in ADD mode
+        # Check which scan codes already exist in DB — these will be REJECTED in ADD mode.
         all_skus = [_safe_str(s).upper() for s in df["barcode"].dropna() if _safe_str(s)]
         if all_skus and _db_available and run_query:
             try:
                 ph = ",".join(["%s"] * len(all_skus))
                 existing = run_query(
-                    f"SELECT UPPER(batch_no) AS sku FROM inventory_stock s "
+                    f"SELECT UPPER(COALESCE(NULLIF(item_code,''), NULLIF(batch_no,''))) AS sku FROM inventory_stock s "
                     f"JOIN products p ON p.id=s.product_id "
-                    f"WHERE LOWER(COALESCE(p.main_group,'')) IN ('frames','frame','sunglasses') AND UPPER(s.batch_no) IN ({ph})",
+                    f"WHERE LOWER(COALESCE(p.main_group,'')) IN ('frames','frame','sunglasses') "
+                    f"AND UPPER(COALESCE(NULLIF(s.item_code,''), NULLIF(s.batch_no,''))) IN ({ph})",
                     tuple(all_skus)
                 ) or []
                 existing_skus = {r["sku"] for r in existing}
                 if existing_skus:
                     already_df = df[df["barcode"].astype(str).str.upper().isin(existing_skus)]
                     issues.append((
-                        f"🚫 {len(existing_skus)} SKU(s) already in DB — will be SKIPPED in Add mode "
+                        f"🚫 {len(existing_skus)} scan code(s) already in DB — will be SKIPPED in Add mode "
                         f"(use ✏️ Edit tab to update prices)", already_df
                     ))
             except Exception:
@@ -1206,7 +1220,7 @@ def _render_import(df: pd.DataFrame):
 
     st.markdown("### 📥 Import New Frames")
 
-    st.caption("Each SKU = 1 unique physical frame · Qty always 1 · No stacking · Duplicate SKUs kept first only")
+    st.caption("Each Scan Code / Item Code = 1 unique physical frame · Qty always 1 · No stacking · duplicate codes kept first only")
 
     # Filter valid rows — use pd.to_numeric for safe conversion
     valid = df.copy()
@@ -1237,7 +1251,7 @@ def _render_import(df: pd.DataFrame):
 
             st.caption(
                 "Fix duplicates in your source Excel before uploading. "
-                "Each SKU must appear once only."
+                "Each Scan Code / Item Code must appear once only."
             )
         valid = valid.drop_duplicates("barcode", keep="first")
 
@@ -1245,7 +1259,7 @@ def _render_import(df: pd.DataFrame):
     if "qty" in valid.columns:
         non_one = (pd.to_numeric(valid["qty"], errors="coerce").fillna(1) != 1).sum()
         if non_one:
-            st.info(f"ℹ️ {non_one} row(s) had Qty ≠ 1 — reset to 1 (each SKU is one frame).")
+            st.info(f"ℹ️ {non_one} row(s) had Qty ≠ 1 — reset to 1 (each scan code is one frame).")
         valid["qty"] = 1
 
     skipped_pre = len(df) - len(valid)
@@ -1337,8 +1351,8 @@ def _auto_create_frame_products(df: pd.DataFrame, missing: list) -> tuple:
       - Looks up first matching row in df for brand, gender, model
       - Detects SKU prefix (BS/TS) to set Sunglasses vs Frames
       - Sets correct HSN + GST automatically
-      - Does NOT put barcode/SKU in products table
-        (barcode/SKU lives in inventory_stock.batch_no only)
+      - Does NOT put scan code in products table
+        (frame scan code lives in inventory_stock.item_code)
 
     Returns (created_count, error_list).
     """
@@ -1418,7 +1432,7 @@ def _do_add_import(df: pd.DataFrame, dry_run: bool):
         st.error(f"❌ Database connection unavailable: {_ie}")
         return
 
-    # ── Normalise column name: accept both 'barcode' and 'sku_code' ──────────
+    # ── Normalise column name: accept barcode/sku/item-code aliases ──────────
     # universal_loader_core maps Barcode → sku_code; this file maps it → barcode.
     # Whichever arrived, unify to 'barcode' so the rest of this function works.
     if "sku_code" in df.columns and "barcode" not in df.columns:
@@ -1427,8 +1441,8 @@ def _do_add_import(df: pd.DataFrame, dry_run: bool):
     # Hard stop if no SKU column at all — give a clear message
     if "barcode" not in df.columns:
         st.error(
-            "❌ SKU / Barcode column not found in the uploaded file. "
-            "Make sure the file has a column named **Barcode** or **SKU Code**."
+            "❌ Scan Code / Item Code column not found in the uploaded file. "
+            "Make sure the file has a column named **Barcode**, **Scan Code**, **Item Code** or **SKU Code**."
         )
         return
 
@@ -1440,15 +1454,16 @@ def _do_add_import(df: pd.DataFrame, dry_run: bool):
     progress = st.progress(0, text="Processing...")
     total = max(len(df), 1)
 
-    # Pre-fetch all existing SKUs for this batch to avoid per-row DB calls
+    # Pre-fetch all existing scan codes for this batch to avoid per-row DB calls
     all_skus = [_safe_str(r).upper() for r in df["barcode"].dropna()]
     try:
         ph = ",".join(["%s"] * len(all_skus))
         existing_in_db = {
             r["sku"] for r in (run_query(
-                f"SELECT UPPER(batch_no) AS sku FROM inventory_stock s "
+                f"SELECT UPPER(COALESCE(NULLIF(item_code,''), NULLIF(batch_no,''))) AS sku FROM inventory_stock s "
                 f"JOIN products p ON p.id=s.product_id "
-                f"WHERE LOWER(COALESCE(p.main_group,'')) IN ('frames','frame','sunglasses') AND UPPER(s.batch_no) IN ({ph})",
+                f"WHERE LOWER(COALESCE(p.main_group,'')) IN ('frames','frame','sunglasses') "
+                f"AND UPPER(COALESCE(NULLIF(s.item_code,''), NULLIF(s.batch_no,''))) IN ({ph})",
                 tuple(all_skus)
             ) or [])
         }
@@ -1467,7 +1482,7 @@ def _do_add_import(df: pd.DataFrame, dry_run: bool):
             skipped_error += 1
             continue
 
-        # STRICT: reject existing SKUs in ADD mode
+        # STRICT: reject existing scan codes in ADD mode
         if sku in existing_in_db:
             skipped_existing += 1
             continue
@@ -1568,7 +1583,7 @@ def _do_add_import(df: pd.DataFrame, dry_run: bool):
 
             run_write("""
                 INSERT INTO inventory_stock
-                (id, product_id, batch_no, quantity,
+                (id, product_id, item_code, batch_no, quantity,
                  purchase_rate, selling_price, mrp,
                  location, stock_type, is_active,
                  size_a, size_b, dbl, temple_length,
@@ -1579,7 +1594,7 @@ def _do_add_import(df: pd.DataFrame, dry_run: bool):
                  image_path,
                  created_at, updated_at)
                 VALUES (
-                    %s, %s, %s, %s,
+                    %s, %s, %s, NULL, %s,
                     %s, %s, %s,
                     %s, 'BATCH', %s,
                     %s, %s, %s, %s,
@@ -1593,7 +1608,7 @@ def _do_add_import(df: pd.DataFrame, dry_run: bool):
             """, (
                 str(uuid.uuid4()),   # id
                 prod_id,             # product_id
-                sku,                 # batch_no
+                sku,                 # item_code: universal scan code used by scanners
                 excel_qty,           # quantity
                 purchase or None,    # purchase_rate
                 selling  or None,    # selling_price

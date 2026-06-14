@@ -40,6 +40,20 @@ def _q(sql, params):
         return []
 
 
+def _sync_supplier_orders_id_sequence() -> None:
+    try:
+        from modules.sql_adapter import run_write
+        run_write("""
+            SELECT setval(
+                pg_get_serial_sequence('supplier_orders','id'),
+                GREATEST((SELECT COALESCE(MAX(id), 0) FROM supplier_orders), 1),
+                TRUE
+            )
+        """, {})
+    except Exception:
+        pass
+
+
 def _fetch_supplier_stages():
     """Ordered stage list from supplier_stage_master."""
     return _q(
@@ -183,7 +197,7 @@ def _save_received_qtys(po_id_int, received_map):
             _pending_lines = run_query("""
                 SELECT ol.id
                 FROM supplier_order_items soi
-                JOIN order_lines ol ON ol.id = soi.customer_line_id
+                JOIN order_lines ol ON ol.id::text = soi.customer_line_id::text
                 WHERE soi.supplier_order_id = %(po)s
                   AND COALESCE(ol.is_deleted, FALSE) = FALSE
                   AND COALESCE(ol.ready_qty, 0) < COALESCE(ol.quantity, 1)
@@ -198,6 +212,11 @@ def _save_received_qtys(po_id_int, received_map):
                 # Suppress errors — transition may already be at READY_TO_BILL
         except Exception:
             pass  # never block save
+        try:
+            from modules.backoffice.backoffice_helpers import load_orders_from_database
+            load_orders_from_database.clear()
+        except Exception:
+            pass
         return True
     except Exception as e:
         st.error(f"Receipt save failed: {e}")
@@ -208,6 +227,64 @@ STAGE_ICONS  = {"DRAFT":"📝","SENT":"📤","ACKNOWLEDGED":"👍",
                 "PARTIAL":"⚡","RECEIVED":"📬","CLOSED":"🔒"}
 STAGE_COLORS = {"DRAFT":"#6b7280","SENT":"#3b82f6","ACKNOWLEDGED":"#8b5cf6",
                 "PARTIAL":"#f59e0b","RECEIVED":"#10b981","CLOSED":"#374151"}
+
+
+def _build_bonzer_autofill_url(order: dict, items: list) -> str:
+    """
+    Build the Bonzer autofill URL for a supplier order.
+    Encodes order + Rx data as base64 in the URL hash so the
+    Tampermonkey script can read it and fill the Bonzer form.
+    """
+    import json, base64
+
+    # Pull patient name and mobile from order
+    patient  = str(order.get("patient_name") or order.get("party_name") or "")
+    mobile   = str(order.get("patient_mobile") or order.get("mobile") or "")
+    order_no = str(order.get("order_no") or "")
+
+    # Build R and L dicts from items
+    right = next((it for it in items if str(it.get("eye_side","")).upper() in ("R","RIGHT")), None)
+    left  = next((it for it in items if str(it.get("eye_side","")).upper() in ("L","LEFT")),  None)
+
+    def _rx(it):
+        if not it:
+            return None
+        return {
+            "product": str(it.get("product_name","")).strip(),
+            "qty":     int(it.get("ordered_qty") or 1),
+            "sph":     _fmt_pwr(it.get("sph")),
+            "cyl":     _fmt_pwr(it.get("cyl")),
+            "axis":    str(int(float(it["axis"]))) if it.get("axis") else "",
+            "add":     _fmt_pwr(it.get("add_power")),
+        }
+
+    def _fmt_pwr(v):
+        if v is None:
+            return ""
+        try:
+            f = float(v)
+            return f"{f:+.2f}"
+        except Exception:
+            return str(v)
+
+    payload = {
+        "order_no":       order_no,
+        "customer_name":  patient,
+        "customer_mobile": mobile,
+        "right":          _rx(right),
+        "left":           _rx(left),
+        "master_brand":   "",   # staff picks
+        "notes":          f"ERP order {order_no}",
+    }
+
+    encoded = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+
+    return (
+        "https://www.bonzerlenses.com/orders/add"
+        f"#erprx={encoded}"
+    )
 
 
 def _render_timeline(stages, current_status):
@@ -281,6 +358,7 @@ def _create_replenishment_po(order, lines):
             pass
 
         # Insert replenishment PO
+        _sync_supplier_orders_id_sequence()
         po_id = run_scalar("""
             INSERT INTO supplier_orders (
                 supplier_order_id, customer_order_id, supplier_id, supplier_name,
@@ -383,6 +461,7 @@ def _create_external_lab_order(order, lab_lines):
             return f"LAB-{po_id}"
 
         # Create fresh PO header
+        _sync_supplier_orders_id_sequence()
         po_id = run_scalar("""
             INSERT INTO supplier_orders (
                 supplier_order_id, customer_order_id, supplier_id, supplier_name,
@@ -685,6 +764,7 @@ def _create_vendor_po(order, lines):
         except Exception:
             expected = (datetime.datetime.now() + datetime.timedelta(days=7)).date()
 
+        _sync_supplier_orders_id_sequence()
         po_id = run_scalar("""
             INSERT INTO supplier_orders (
                 supplier_order_id, supplier_id, supplier_name, customer_order_id,
@@ -866,6 +946,30 @@ def _render_po_list(pos, stages, order_id, order, po_type_label,
 
             with st.expander(f"📋 Items & Actions ({len(items)} items)", expanded=can_receive):
                 _render_po_items_rl(items)
+
+                # ── 🔗 Bonzer Autofill Link ──────────────────────────────────
+                # Shown when supplier is Bonzer Lenses. Staff click → Bonzer
+                # order form opens with all fields pre-filled via Tampermonkey.
+                # Staff only need to pick Dealer / Master Brand / Price → Save.
+                if "bonzer" in supplier_name.lower():
+                    _bonzer_url = _build_bonzer_autofill_url(order, items)
+                    st.markdown(
+                        f"<div style='background:#0f1e38;border:1px solid #1e3a5f;"
+                        f"border-left:4px solid #f59e0b;border-radius:8px;"
+                        f"padding:10px 14px;margin:10px 0'>"
+                        f"<div style='color:#fbbf24;font-weight:700;font-size:0.82rem'>"
+                        f"🔗 Send to Bonzer Portal</div>"
+                        f"<div style='color:#94a3b8;font-size:0.72rem;margin-top:3px'>"
+                        f"Opens Bonzer order form with Order No., R/L Rx and customer "
+                        f"pre-filled. Pick Dealer / Master Brand / Price, then Save.</div>"
+                        f"<div style='margin-top:8px'>"
+                        f"<a href='{_bonzer_url}' target='_blank' "
+                        f"style='background:#f59e0b;color:#000;font-weight:700;"
+                        f"padding:6px 16px;border-radius:6px;text-decoration:none;"
+                        f"font-size:0.82rem'>📤 Open Bonzer Form (Autofill)</a>"
+                        f"</div></div>",
+                        unsafe_allow_html=True,
+                    )
 
                 # ── Purchase link + READY_TO_BILL shortcut ──────────────────
                 # When PO is RECEIVED or in INSPECTION/COMPLETE, show the

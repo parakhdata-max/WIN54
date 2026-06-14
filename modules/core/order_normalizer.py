@@ -33,7 +33,7 @@ USAGE:
     order, report = normalize_order(order)
 
     if report.had_issues:
-        logger.warning(report.summary())
+        logger.info(report.summary())
 """
 
 from __future__ import annotations
@@ -206,7 +206,7 @@ def normalize_order(order: dict) -> tuple[dict, NormalizationReport]:
             report.line_reports.append(lr)
 
     if report.had_issues:
-        logger.warning(report.summary())
+        logger.info(report.summary())
 
     order["_normalized_at"] = ts
     return order, report

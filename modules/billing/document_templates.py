@@ -23,7 +23,10 @@ def _q(sql: str, params: dict = None) -> List[Dict]:
 
 def format_currency(amount: float) -> str:
     """Format currency with Indian rupee symbol"""
-    return f"₹{amount:,.2f}"
+    try:
+        return f"₹{float(amount or 0):,.2f}"
+    except Exception:
+        return "₹0.00"
 
 
 def format_date(date_val) -> str:
@@ -44,10 +47,14 @@ def render_challan_template(challan_no: str):
     
     # Get challan details
     challan_data = _q("""
-        SELECT c.*, p.party_name, p.mobile, p.address, p.gst_no,
+        SELECT c.*,
+               COALESCE(p.party_name, 'Walk-in') AS party_name,
+               COALESCE(p.mobile, '') AS mobile,
+               COALESCE(p.address, '') AS address,
+               COALESCE(p.gstin, '') AS gst_no,
                p.email, p.contact_person
         FROM challans c
-        JOIN parties p ON p.id = c.party_id
+        LEFT JOIN parties p ON p.id = c.party_id
         WHERE c.challan_no = %(challan_no)s
     """, {"challan_no": challan_no})
     
@@ -61,8 +68,8 @@ def render_challan_template(challan_no: str):
     lines = _q("""
         SELECT cl.*,
                COALESCE(o.order_no, '')    AS order_no,
-               COALESCE(o.order_date, o.created_at) AS order_date,
-               COALESCE(cl.product_name, ol.product_name, pr.product_name, '') AS product_name,
+               o.created_at AS order_date,
+               COALESCE(cl.product_name, pr.product_name, '') AS product_name,
                cl.quantity,
                cl.unit_price,
                cl.line_total              AS total_price,
@@ -321,11 +328,15 @@ def render_invoice_template(invoice_no: str):
     
     # Get invoice details
     invoice_data = _q("""
-        SELECT i.*, p.party_name, p.mobile, p.address, p.gst_no,
+        SELECT i.*,
+               COALESCE(p.party_name, 'Walk-in') AS party_name,
+               COALESCE(p.mobile, '') AS mobile,
+               COALESCE(p.address, '') AS address,
+               COALESCE(p.gstin, '') AS gst_no,
                p.email, p.contact_person,
                c.challan_no
         FROM invoices i
-        JOIN parties p ON p.id = i.party_id
+        LEFT JOIN parties p ON p.id = i.party_id
         LEFT JOIN challans c ON c.id = i.challan_id
         WHERE i.invoice_no = %(invoice_no)s
     """, {"invoice_no": invoice_no})
@@ -340,8 +351,8 @@ def render_invoice_template(invoice_no: str):
     lines = _q("""
         SELECT il.*,
                COALESCE(o.order_no, '')   AS order_no,
-               COALESCE(o.order_date, o.created_at) AS order_date,
-               COALESCE(il.product_name, ol.product_name, pr.product_name, '') AS product_name,
+               o.created_at AS order_date,
+               COALESCE(il.product_name, pr.product_name, '') AS product_name,
                il.quantity,
                il.unit_price,
                COALESCE(il.total_price, il.line_total, 0) AS total_price,
@@ -644,7 +655,13 @@ def render_print_preview(document_type: str, document_no: str):
     
     with col1:
         if st.button("🖨️ Print", type="primary", use_container_width=True):
-            st.info("🖨️ Use browser's print function (Ctrl+P) to print this document")
+            try:
+                from modules.printing.print_opener import open_html_print
+
+                path = open_html_print(html_content, f"{document_type}_{document_no}.html")
+                st.success(f"Print document opened: {path}")
+            except Exception as exc:
+                st.error(f"Print open failed: {exc}")
     
     with col2:
         if st.button("💾 Download as HTML", use_container_width=True):

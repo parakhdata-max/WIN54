@@ -295,7 +295,7 @@ def get_po(po_id: str) -> Optional[Dict]:
                     'notes',        soi.notes
                 )) AS items
             FROM supplier_orders so
-            JOIN parties p ON p.id = so.supplier_id
+            JOIN parties p ON p.id::text = so.supplier_id::text
             LEFT JOIN supplier_order_items soi ON soi.supplier_order_id = so.id
             WHERE so.id::text = %(po_id)s
             GROUP BY so.id, p.party_name, p.mobile, p.email

@@ -3,6 +3,9 @@
 from .transition_rules import can_move
 from .history_engine import log_history
 from typing import Dict, List, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowEngine:
@@ -86,7 +89,7 @@ def refresh_line_state(line: Dict) -> Dict:
             # Apply pricing to allocated quantity
             line = update_line_billing(line)
             
-            print(f"✅ Pricing applied: {line.get('product_name')} → ₹{line.get('billing_total', 0):.2f}")
+            logger.debug("Pricing applied: %s -> Rs %.2f", line.get('product_name'), line.get('billing_total', 0))
             
         except ImportError:
             # If backoffice_logic doesn't exist yet, try direct pricing
@@ -95,21 +98,20 @@ def refresh_line_state(line: Dict) -> Dict:
                 line.pop('pricing_applied_at', None)  # Allow re-pricing
                 line = apply_pricing_line(line)
                 line['billing_total'] = line.get('total_price', 0)
-                print(f"✅ Direct pricing applied: {line.get('product_name')}")
+                logger.debug("Direct pricing applied: %s", line.get('product_name'))
             except Exception as e:
-                print(f"⚠️ Pricing skipped for {line.get('product_name')}: {e}")
+                logger.debug("Pricing skipped for %s: %s", line.get('product_name'), e)
         
         except Exception as e:
-            print(f"❌ Pricing error for {line.get('product_name')}: {e}")
+            logger.debug("Pricing error for %s: %s", line.get('product_name'), e)
     
     else:
         # No allocation = no pricing
         line['unit_price'] = 0
         line['billing_total'] = 0
-        print(f"ℹ️ No allocation for {line.get('product_name')}, pricing cleared")
+        logger.debug("No allocation for %s, pricing cleared", line.get('product_name'))
     
     return line
-
 
 
 

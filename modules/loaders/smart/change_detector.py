@@ -260,6 +260,7 @@ def detect_changes(df: pd.DataFrame, file_type: str) -> ChangeReport:
     is_ophlens   = file_type == "OPHLENS"
     is_clens     = file_type == "CLENS"
     is_lens_type = is_ophlens or is_clens
+    is_blank     = file_type == "BLANK"
 
     # Build DB lookup — composite key for lens types, natural key for others
     db_lookup = _build_db_lookup(file_type, cfg, df, key_col)
@@ -271,11 +272,22 @@ def detect_changes(df: pd.DataFrame, file_type: str) -> ChangeReport:
     # editable_cols = list of (df_col_name, db_col_name) tuples
     editable_cols = []
     tracked_df_cols = set()
+    # SAFETY: a DB column can be reachable by multiple Excel aliases
+    # (for example Recomended Base / Recommended Base -> base_recommended).
+    # Only compare each DB column once, otherwise the same field can later be
+    # assigned twice in one UPDATE statement.
+    _seen_editable_db_cols = set()
     for db_col in all_cols:
         actual = _resolve_col(db_col)
-        if actual in df.columns and actual not in locked and db_col not in exclude_from_edit:
+        if (
+            actual in df.columns
+            and actual not in locked
+            and db_col not in exclude_from_edit
+            and db_col not in _seen_editable_db_cols
+        ):
             editable_cols.append((actual, db_col))
             tracked_df_cols.add(actual)
+            _seen_editable_db_cols.add(db_col)
 
     # ── Detect untracked columns (present in file but not in system config) ───
     _known_system_cols = {"_id", key_col}
@@ -310,6 +322,16 @@ def detect_changes(df: pd.DataFrame, file_type: str) -> ChangeReport:
             sph_n       = _normalise(row.get("sph", "")) or "NULL"
             lookup_key  = f"{batch}|{sph_n}"
             display_key = f"{batch} sph={sph_n}"
+        elif is_blank:
+            brand_n = _normalise(row.get("brand", ""))
+            cat_n   = _normalise(row.get("category", ""))
+            mat_n   = _normalise(row.get("material", ""))
+            col_n   = _normalise(row.get("colour", ""))
+            add_n   = _normalise(row.get("add_power", "")) or "NULL"
+            base_n  = _normalise(row.get("base_recommended", "")) or "NULL"
+            legacy_key = f"{brand_n}|{cat_n}|{mat_n}|{col_n}|{add_n}"
+            lookup_key = f"{legacy_key}|{base_n}"
+            display_key = f"{row.get('brand','')} {row.get('category','')} {row.get('material','')} add={add_n} base={base_n}"
         else:
             lookup_key  = str(row.get(key_col, "")).strip()
             display_key = lookup_key
@@ -318,6 +340,8 @@ def detect_changes(df: pd.DataFrame, file_type: str) -> ChangeReport:
             continue
 
         db_row = db_lookup.get(lookup_key)
+        if db_row is None and is_blank:
+            db_row = db_lookup.get(legacy_key)
         if db_row is None:
             report.rows_not_found.append(display_key)
             continue
@@ -354,6 +378,14 @@ def detect_changes(df: pd.DataFrame, file_type: str) -> ChangeReport:
 
             if _values_differ(uploaded_val, db_val):
                 risk = FIELD_RISK.get(col, RISK_SAFE)
+                # BLANK migration/backfill rule:
+                # Existing blank rows may have NULL base_recommended because the
+                # base-aware identity was added later. Filling NULL -> numeric base
+                # from the system edit sheet is a safe backfill, not a high-risk
+                # master-data change. Changing one non-empty base to another remains
+                # WARNING via FIELD_RISK.
+                if is_blank and col == "base_recommended" and db_val in (None, "") and uploaded_val not in (None, ""):
+                    risk = RISK_SAFE
                 report.changes.append(FieldChange(
                     row_index  = row_idx + 2,
                     entity_key = display_key,
@@ -372,6 +404,25 @@ def detect_changes(df: pd.DataFrame, file_type: str) -> ChangeReport:
                     "Risk":           _risk_emoji(risk),
                     "Approved":       True,   # default approved; user can uncheck in UI
                 })
+
+    # Final safety: collapse duplicate changes by the actual DB target.
+    # This prevents SQL like SET base_recommended=..., base_recommended=...
+    # when the same DB field is reached through more than one alias/control row.
+    _dedup = {}
+    for _ch in report.changes:
+        _key = (_ch.entity_id or _ch.entity_key, _ch.field_name)
+        _dedup[_key] = _ch  # last value wins, matching the visible approval grid
+    if len(_dedup) != len(report.changes):
+        report.changes = list(_dedup.values())
+        _seen = set()
+        _rows = []
+        for _row in report.comparison_rows:
+            _key = (_row.get("Record"), _row.get("Field"))
+            if _key in _seen:
+                continue
+            _seen.add(_key)
+            _rows.append(_row)
+        report.comparison_rows = _rows
 
     return report
 
@@ -510,7 +561,38 @@ def _build_db_lookup(file_type: str, cfg: dict, df: pd.DataFrame, key_col: str) 
         for r in rows:
             lookup[str(r.get("sku_code", ""))] = r
 
-    elif file_type in ("SOL", "BLANK"):
+    elif file_type == "BLANK":
+        actual_brand_col = "brand" if "brand" in df.columns else key_col
+        brands = df[actual_brand_col].dropna().astype(str).str.strip().unique().tolist()
+        brands = [b for b in brands if b.lower() not in ("nan", "none", "")]
+        if not brands:
+            return {}
+        placeholders = ", ".join(["%s"] * len(brands))
+        safe_cols = [c for c in all_cols if c and c not in ("id", "_id")]
+        select_cols = ["id AS _id"]
+        for c in safe_cols:
+            select_cols.append(f'"{c}"')
+        rows = run_query(f"""
+            SELECT {', '.join(select_cols)}
+            FROM blank_inventory
+            WHERE brand IN ({placeholders})
+        """, tuple(brands)) or []
+
+        for r in rows:
+            brand_n = _normalise(r.get("brand", ""))
+            cat_n   = _normalise(r.get("category", ""))
+            mat_n   = _normalise(r.get("material", ""))
+            col_n   = _normalise(r.get("colour", ""))
+            add_n   = _normalise(r.get("add_power", "")) or "NULL"
+            base_n  = _normalise(r.get("base_recommended", "")) or "NULL"
+            legacy_key = f"{brand_n}|{cat_n}|{mat_n}|{col_n}|{add_n}"
+            full_key   = f"{legacy_key}|{base_n}"
+            lookup[full_key] = r
+            # Legacy fallback allows old rows with blank base to be filled by
+            # edit upload instead of being reported as "not matched".
+            lookup.setdefault(legacy_key, r)
+
+    elif file_type == "SOL":
         keys = df[key_col].dropna().astype(str).str.strip().unique().tolist()
         if not keys: return {}
         placeholders = ", ".join(["%s"] * len(keys))

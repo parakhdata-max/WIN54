@@ -45,11 +45,34 @@ def _w(sql, params=None) -> bool:
         return False
 
 def _tx(steps) -> Tuple[bool, Optional[str]]:
+    """
+    Execute a list of (sql, params) steps atomically.
+    Uses run_transaction when available; falls back to individual run_write calls.
+
+    IMPORTANT: run_transaction must NOT leave an open connection on failure.
+    If it does (connection leak → idle in transaction locks), we force-terminate
+    any idle-in-transaction sessions before falling back, to avoid lock contention.
+    """
     try:
         from modules.sql_adapter import run_transaction
         run_transaction(steps)
         return True, None
-    except Exception:
+    except Exception as _tx_err:
+        _log.warning("[accounts._tx] run_transaction failed (%s) — falling back to run_write", _tx_err)
+        # Terminate any connections this process left idle-in-transaction
+        # so the fallback writes don't deadlock against our own leaked transaction.
+        try:
+            from modules.sql_adapter import run_write as _rw_clean
+            _rw_clean(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE pid != pg_backend_pid() "
+                "  AND state = 'idle in transaction' "
+                "  AND application_name = current_setting('application_name', TRUE) "
+                "  AND now() - state_change > interval '5 seconds'",
+                {}
+            )
+        except Exception:
+            pass
         ok, err = True, None
         for sql, p in steps:
             try:
@@ -110,7 +133,7 @@ def ensure_accounting_schema() -> None:
             is_auto_posted  BOOLEAN DEFAULT FALSE,  -- system-generated vs manual
             created_by      TEXT,
             created_at      TIMESTAMPTZ DEFAULT NOW(),
-            CONSTRAINT jv_balanced CHECK (ABS(total_debit - total_credit) < 0.01)
+            CONSTRAINT jv_balanced CHECK (total_debit = total_credit)
         )
     """)
 
@@ -150,6 +173,27 @@ def ensure_accounting_schema() -> None:
     _w("CREATE INDEX IF NOT EXISTS idx_jv_date    ON journal_entries(voucher_date DESC)")
     _w("CREATE INDEX IF NOT EXISTS idx_jv_type    ON journal_entries(voucher_type)")
     _w("CREATE INDEX IF NOT EXISTS idx_jv_ref     ON journal_entries(ref_doc_id)")
+    _w("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_auto_ref_id
+        ON journal_entries (
+            UPPER(COALESCE(ref_doc_type, '')),
+            COALESCE(ref_doc_id, '')
+        )
+        WHERE is_auto_posted = TRUE
+          AND COALESCE(ref_doc_type, '') <> ''
+          AND COALESCE(ref_doc_id, '') <> ''
+    """)
+    _w("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_auto_ref_no_when_no_id
+        ON journal_entries (
+            UPPER(COALESCE(ref_doc_type, '')),
+            COALESCE(ref_doc_no, '')
+        )
+        WHERE is_auto_posted = TRUE
+          AND COALESCE(ref_doc_type, '') <> ''
+          AND COALESCE(ref_doc_id, '') = ''
+          AND COALESCE(ref_doc_no, '') <> ''
+    """)
     _w("CREATE INDEX IF NOT EXISTS idx_jl_jv      ON journal_lines(journal_id)")
     _w("CREATE INDEX IF NOT EXISTS idx_jl_account ON journal_lines(account_id)")
     _w("CREATE INDEX IF NOT EXISTS idx_bank_date  ON bank_transactions(txn_date DESC)")
@@ -189,6 +233,10 @@ DEFAULT_ACCOUNTS = [
     ("1002", "Bank - SBI",              "Bank Accounts",      "ASSET",     "BANK"),
     ("1003", "Bank - HDFC",             "Bank Accounts",      "ASSET",     "BANK"),
     ("1004", "Petty Cash",              "Cash-in-Hand",       "ASSET",     "CASH"),
+    ("1101", "Inventory Stock",         "Stock-in-Hand",      "ASSET",     "STOCK"),
+    ("1501", "Furniture & Fixtures",    "Fixed Assets",       "ASSET",     "FIXED_ASSET"),
+    ("1502", "Computer & Equipment",    "Fixed Assets",       "ASSET",     "FIXED_ASSET"),
+    ("1599", "Accumulated Depreciation","Fixed Assets",       "ASSET",     "CONTRA_ASSET"),
     ("2001", "Sundry Debtors",          "Sundry Debtors",     "ASSET",     "PARTY"),
     ("2002", "Sundry Creditors",        "Sundry Creditors",   "LIABILITY", "PARTY"),
     ("3001", "Sales - Retail",          "Direct Income",      "INCOME",    "SALES"),
@@ -196,16 +244,19 @@ DEFAULT_ACCOUNTS = [
     ("3003", "Sales - Contact Lens",    "Direct Income",      "INCOME",    "SALES"),
     ("3004", "Consultation Fees",       "Direct Income",      "INCOME",    "SALES"),
     ("3005", "Other Income",            "Indirect Income",    "INCOME",    "OTHER"),
+    ("3006", "Stock Adjustment Gain",   "Indirect Income",    "INCOME",    "OTHER"),
     ("4001", "Purchase - Frames",       "Purchase Accounts",  "EXPENSE",   "PURCHASE"),
     ("4002", "Purchase - Lenses",       "Purchase Accounts",  "EXPENSE",   "PURCHASE"),
     ("4003", "Purchase - Contact Lens", "Purchase Accounts",  "EXPENSE",   "PURCHASE"),
     ("4004", "Purchase - Accessories",  "Purchase Accounts",  "EXPENSE",   "PURCHASE"),
+    ("4101", "Cost of Goods Sold",      "Direct Expenses",    "EXPENSE",   "COGS"),
     ("5001", "Salaries",                "Direct Expenses",    "EXPENSE",   "EXPENSE"),
     ("5002", "Rent",                    "Indirect Expenses",  "EXPENSE",   "EXPENSE"),
     ("5003", "Electricity",             "Indirect Expenses",  "EXPENSE",   "EXPENSE"),
     ("5004", "Telephone & Internet",    "Indirect Expenses",  "EXPENSE",   "EXPENSE"),
     ("5005", "Courier & Transport",     "Indirect Expenses",  "EXPENSE",   "EXPENSE"),
     ("5006", "Miscellaneous Expense",   "Indirect Expenses",  "EXPENSE",   "EXPENSE"),
+    ("5101", "Depreciation Expense",    "Indirect Expenses",  "EXPENSE",   "EXPENSE"),
     ("6001", "CGST Payable",            "Duties & Taxes",     "LIABILITY", "TAX"),
     ("6002", "SGST Payable",            "Duties & Taxes",     "LIABILITY", "TAX"),
     ("6003", "IGST Payable",            "Duties & Taxes",     "LIABILITY", "TAX"),
@@ -292,6 +343,10 @@ def _gen_voucher_no(vtype: str) -> str:
         "JOURNAL":   "JV",
         "CONTRA":    "CV",
         "PURCHASE":  "PIV",
+        "CREDIT_NOTE": "CNV",
+        "DEBIT_NOTE":  "DNV",
+        "STOCK_JOURNAL": "STJV",
+        "DEPRECIATION": "DPV",
     }
     prefix = prefix_map.get(vtype, "JV")
     try:
@@ -318,6 +373,9 @@ def post_journal(
     ref_doc_no: str = "",
     created_by: str = "System",
     is_auto: bool = False,
+    bank_ref: str = "",
+    mirror_to_payments: bool = True,
+    mirror_to_party_ledger: bool = True,
 ) -> Tuple[bool, str, str]:
     """
     Post a balanced journal entry.
@@ -331,11 +389,48 @@ def post_journal(
     if len(lines) < 2:
         return False, "", "Journal must have at least 2 lines (one Dr, one Cr)."
 
+    normalized_lines = []
+    for line in lines:
+        normalized_lines.append({
+            **line,
+            "debit": round(float(line.get("debit", 0) or 0), 2),
+            "credit": round(float(line.get("credit", 0) or 0), 2),
+        })
+    lines = normalized_lines
+
     total_dr = round(sum(float(l.get("debit",  0) or 0) for l in lines), 2)
     total_cr = round(sum(float(l.get("credit", 0) or 0) for l in lines), 2)
 
-    if abs(total_dr - total_cr) > 0.01:
+    if total_dr != total_cr:
         return False, "", f"Journal not balanced — Dr ₹{total_dr:,.2f} ≠ Cr ₹{total_cr:,.2f}"
+
+    if is_auto and ref_doc_type and (ref_doc_id or ref_doc_no):
+        if ref_doc_id:
+            existing = _q("""
+                SELECT voucher_no
+                FROM journal_entries
+                WHERE is_auto_posted = TRUE
+                  AND UPPER(COALESCE(ref_doc_type,'')) = UPPER(%s)
+                  AND COALESCE(ref_doc_id,'') = %s
+                ORDER BY created_at ASC
+                LIMIT 1
+            """, (ref_doc_type, ref_doc_id))
+        else:
+            existing = _q("""
+                SELECT voucher_no
+                FROM journal_entries
+                WHERE is_auto_posted = TRUE
+                  AND UPPER(COALESCE(ref_doc_type,'')) = UPPER(%s)
+                  AND COALESCE(ref_doc_id,'') = ''
+                  AND COALESCE(ref_doc_no,'') = %s
+                ORDER BY created_at ASC
+                LIMIT 1
+            """, (ref_doc_type, ref_doc_no))
+        if existing:
+            vno = existing[0].get("voucher_no") or ""
+            _log.info("[accounts] skipped duplicate auto JV for %s %s/%s -> %s",
+                      ref_doc_type, ref_doc_id, ref_doc_no, vno)
+            return True, vno, ""
 
     # Resolve account IDs
     resolved = []
@@ -343,7 +438,26 @@ def post_journal(
         acc = get_account(line.get("account_code") or line.get("account_name", ""))
         if not acc:
             return False, "", f"Account not found: {line.get('account_code') or line.get('account_name')}"
-        resolved.append({**line, "account_id": acc["id"], "account_name": acc["account_name"]})
+        resolved.append({
+            **line,
+            "account_id": acc["id"],
+            "account_name": acc["account_name"],
+            "account_type": acc.get("account_type", ""),
+        })
+
+    try:
+        from modules.core.date_guard import is_future_date
+        if is_future_date(voucher_date) and any(
+            str(l.get("account_type") or "").upper() in ("BANK", "CASH")
+            and (float(l.get("debit", 0) or 0) > 0 or float(l.get("credit", 0) or 0) > 0)
+            for l in resolved
+        ):
+            return False, "", (
+                "Cash/Bank voucher date cannot be in the future. "
+                "Only provisional advance cheques may be post-dated from the payment screen."
+            )
+    except Exception as _dg_e:
+        return False, "", f"Voucher date validation failed: {_dg_e}"
 
     jid     = str(uuid.uuid4())
     vno     = _gen_voucher_no(voucher_type)
@@ -369,6 +483,83 @@ def post_journal(
               float(line.get("credit", 0) or 0),
               line.get("narration", narration),
               line.get("party_name", ""))))
+
+    # Bank/cash attachment: every voucher leg touching cash/bank also creates
+    # a bank_transactions row, so Accounts > Bank Book has ref/reconcile detail.
+    bank_cash_lines = [
+        l for l in resolved
+        if str(l.get("account_type") or "").upper() in ("BANK", "CASH")
+        and (float(l.get("debit", 0) or 0) > 0 or float(l.get("credit", 0) or 0) > 0)
+    ]
+    for line in bank_cash_lines:
+        dr = float(line.get("debit", 0) or 0)
+        cr = float(line.get("credit", 0) or 0)
+        steps.append(("""
+            INSERT INTO bank_transactions
+                (bank_account_id, txn_date, description, debit, credit,
+                 ref_no, journal_id, is_reconciled)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,FALSE)
+        """, (
+            line["account_id"], voucher_date,
+            line.get("narration") or narration,
+            dr, cr,
+            bank_ref or ref_doc_no or vno,
+            jid,
+        )))
+
+    # Manual Journal/Contra mirror: put cash/bank legs into payments with a
+    # direction-specific type. Registers can show them without treating them as
+    # customer receipts or disbursements.
+    manual_mirror = (not is_auto) and str(voucher_type or "").upper() in ("JOURNAL", "CONTRA")
+    if manual_mirror and mirror_to_payments:
+        for idx, line in enumerate(bank_cash_lines, 1):
+            dr = float(line.get("debit", 0) or 0)
+            cr = float(line.get("credit", 0) or 0)
+            amount = round(dr or cr, 2)
+            if amount <= 0:
+                continue
+            direction = "IN" if dr > 0 else "OUT"
+            ptype = f"{str(voucher_type).upper()}_{direction}"
+            pno = vno if len(bank_cash_lines) == 1 else f"{vno}-{idx}"
+            mode = "CASH" if str(line.get("account_type") or "").upper() == "CASH" else "BANK"
+            steps.append(("""
+                INSERT INTO payments
+                    (id, payment_no, party_name, amount, method, payment_date,
+                     payment_mode, reference_no, bank_name, remarks, payment_type,
+                     is_advance, created_by, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,FALSE,%s,NOW())
+            """, (
+                str(uuid.uuid4()), pno,
+                line.get("party_name") or "",
+                amount,
+                mode, voucher_date, mode,
+                bank_ref or ref_doc_no or vno,
+                line.get("account_name") or "",
+                line.get("narration") or narration,
+                ptype,
+                created_by,
+            )))
+
+    if manual_mirror and mirror_to_party_ledger:
+        for line in resolved:
+            party_name = str(line.get("party_name") or "").strip()
+            if not party_name:
+                continue
+            dr = float(line.get("debit", 0) or 0)
+            cr = float(line.get("credit", 0) or 0)
+            if dr <= 0 and cr <= 0:
+                continue
+            steps.append(("""
+                INSERT INTO party_ledger
+                    (party_name, entry_date, entry_type, ref_id, ref_no,
+                     debit, credit, running_balance, narration, created_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s,%s)
+            """, (
+                party_name, voucher_date, str(voucher_type).upper(),
+                jid, vno, dr, cr,
+                line.get("narration") or narration,
+                created_by,
+            )))
 
     ok, err = _tx(steps)
     if not ok:
@@ -443,6 +634,12 @@ def post_payment_receipt_jv(
     # Map mode to account
     # CASH → Cash (1001) | UPI/NEFT/RTGS/CHEQUE/CARD → Bank-SBI (1002)
     acc_code = "1001" if (payment_mode or "").upper().strip() == "CASH" else "1002"
+    is_consultation_receipt = str(payment_no or "").upper().startswith("CPR")
+    credit_line = (
+        {"account_code": "3004", "debit": 0, "credit": amount, "party_name": party_name}
+        if is_consultation_receipt
+        else {"account_code": "2001", "debit": 0, "credit": amount, "party_name": party_name}
+    )
 
     ok, vno, err = post_journal(
         voucher_type="RECEIPT",
@@ -450,7 +647,7 @@ def post_payment_receipt_jv(
         narration=f"Payment received {payment_no} — {party_name} — {payment_mode}",
         lines=[
             {"account_code": acc_code, "debit": amount,  "credit": 0, "party_name": party_name},
-            {"account_code": "2001",   "debit": 0, "credit": amount,  "party_name": party_name},
+            credit_line,
         ],
         ref_doc_type="PAYMENT", ref_doc_id=payment_id, ref_doc_no=payment_no,
         created_by=created_by, is_auto=True,
@@ -502,6 +699,14 @@ def post_purchase_invoice_jv(
       Dr  GST Input Credit     tax_amount  (if GST registered)
       Cr  Sundry Creditors     grand_total
     """
+    try:
+        from modules.core.date_guard import validate_not_future
+        _ok_dt, _msg_dt = validate_not_future(voucher_date, "Purchase invoice date")
+        if not _ok_dt:
+            return False, _msg_dt
+    except Exception as _dg_e:
+        return False, f"Purchase date validation failed: {_dg_e}"
+
     # Map category to purchase account
     purchase_map = {
         "FRAMES":       "4001",
@@ -512,14 +717,23 @@ def post_purchase_invoice_jv(
     cat_upper    = purchase_category.upper() if purchase_category else ""
     purch_code   = next((v for k, v in purchase_map.items() if k in cat_upper), "4002")
 
+    _grand_total = round(float(grand_total or 0), 2)
+    _tax_amount = round(max(float(tax_amount or 0), 0), 2)
+    _taxable = round(_grand_total - _tax_amount, 2)
+    if _taxable < 0:
+        _taxable = round(float(taxable or 0), 2)
+        _tax_amount = round(max(_grand_total - _taxable, 0), 2)
+
     lines = [
-        {"account_code": purch_code, "debit": taxable,     "credit": 0,           "party_name": supplier_name},
-        {"account_code": "2002",     "debit": 0,           "credit": grand_total,  "party_name": supplier_name},
+        {"account_code": purch_code, "debit": _taxable,     "credit": 0,            "party_name": supplier_name},
+        {"account_code": "2002",     "debit": 0,            "credit": _grand_total,  "party_name": supplier_name},
     ]
     # Only add GST input if there is tax
-    if tax_amount > 0.01:
-        lines.insert(1, {"account_code": "6001", "debit": tax_amount / 2, "credit": 0})  # CGST Input
-        lines.insert(2, {"account_code": "6002", "debit": tax_amount / 2, "credit": 0})  # SGST Input
+    if _tax_amount > 0.01:
+        cgst = round(_tax_amount / 2, 2)
+        sgst = round(_tax_amount - cgst, 2)
+        lines.insert(1, {"account_code": "6001", "debit": cgst, "credit": 0})  # CGST Input / set-off
+        lines.insert(2, {"account_code": "6002", "debit": sgst, "credit": 0})  # SGST Input / set-off
         # Re-balance: Dr total must = Cr total
         # Dr = taxable + tax_amount, Cr = grand_total — already balanced if grand_total = taxable + tax
         pass
@@ -534,6 +748,174 @@ def post_purchase_invoice_jv(
         ref_doc_no   = invoice_no,
         created_by   = created_by,
         is_auto      = True,
+    )
+    return ok, vno if ok else err
+
+
+def post_credit_note_jv(
+    cn_number: str,
+    cn_id: str,
+    party_name: str,
+    grand_total: float,
+    taxable: float,
+    cgst_amount: float = 0,
+    sgst_amount: float = 0,
+    igst_amount: float = 0,
+    order_type: str = "RETAIL",
+    voucher_date: datetime.date | None = None,
+    created_by: str = "System",
+) -> Tuple[bool, str]:
+    """Credit Note -> Dr Sales/GST, Cr Sundry Debtors."""
+    sales_code = "3002" if "WHOLESALE" in str(order_type or "").upper() else "3001"
+    _grand_total = round(float(grand_total or 0), 2)
+    _tax = round(float(cgst_amount or 0) + float(sgst_amount or 0) + float(igst_amount or 0), 2)
+    _taxable = round(_grand_total - _tax, 2)
+    if _taxable < 0:
+        _taxable = round(float(taxable or 0), 2)
+    lines = [
+        {"account_code": sales_code, "debit": _taxable, "credit": 0, "party_name": party_name},
+        {"account_code": "2001", "debit": 0, "credit": _grand_total, "party_name": party_name},
+    ]
+    if float(cgst_amount or 0) > 0.005:
+        lines.insert(1, {"account_code": "6001", "debit": round(float(cgst_amount or 0), 2), "credit": 0})
+    if float(sgst_amount or 0) > 0.005:
+        lines.insert(2, {"account_code": "6002", "debit": round(float(sgst_amount or 0), 2), "credit": 0})
+    if float(igst_amount or 0) > 0.005:
+        lines.insert(1, {"account_code": "6003", "debit": round(float(igst_amount or 0), 2), "credit": 0})
+    ok, vno, err = post_journal(
+        voucher_type="CREDIT_NOTE",
+        voucher_date=voucher_date or datetime.date.today(),
+        narration=f"Credit Note {cn_number} — {party_name}",
+        lines=lines,
+        ref_doc_type="CREDIT_NOTE",
+        ref_doc_id=cn_id,
+        ref_doc_no=cn_number,
+        created_by=created_by,
+        is_auto=True,
+    )
+    return ok, vno if ok else err
+
+
+def post_debit_note_jv(
+    dn_number: str,
+    dn_id: str,
+    party_name: str,
+    grand_total: float,
+    taxable: float,
+    cgst_amount: float = 0,
+    sgst_amount: float = 0,
+    igst_amount: float = 0,
+    order_type: str = "RETAIL",
+    voucher_date: datetime.date | None = None,
+    created_by: str = "System",
+) -> Tuple[bool, str]:
+    """Debit Note -> Dr Sundry Debtors, Cr Sales/GST."""
+    sales_code = "3002" if "WHOLESALE" in str(order_type or "").upper() else "3001"
+    _grand_total = round(float(grand_total or 0), 2)
+    _tax = round(float(cgst_amount or 0) + float(sgst_amount or 0) + float(igst_amount or 0), 2)
+    _taxable = round(_grand_total - _tax, 2)
+    if _taxable < 0:
+        _taxable = round(float(taxable or 0), 2)
+    lines = [
+        {"account_code": "2001", "debit": _grand_total, "credit": 0, "party_name": party_name},
+        {"account_code": sales_code, "debit": 0, "credit": _taxable, "party_name": party_name},
+    ]
+    if float(cgst_amount or 0) > 0.005:
+        lines.append({"account_code": "6001", "debit": 0, "credit": round(float(cgst_amount or 0), 2)})
+    if float(sgst_amount or 0) > 0.005:
+        lines.append({"account_code": "6002", "debit": 0, "credit": round(float(sgst_amount or 0), 2)})
+    if float(igst_amount or 0) > 0.005:
+        lines.append({"account_code": "6003", "debit": 0, "credit": round(float(igst_amount or 0), 2)})
+    ok, vno, err = post_journal(
+        voucher_type="DEBIT_NOTE",
+        voucher_date=voucher_date or datetime.date.today(),
+        narration=f"Debit Note {dn_number} — {party_name}",
+        lines=lines,
+        ref_doc_type="DEBIT_NOTE",
+        ref_doc_id=dn_id,
+        ref_doc_no=dn_number,
+        created_by=created_by,
+        is_auto=True,
+    )
+    return ok, vno if ok else err
+
+
+def post_stock_journal(
+    *,
+    amount: float,
+    movement_type: str,
+    voucher_date: datetime.date | None = None,
+    narration: str = "",
+    ref_doc_type: str = "STOCK_JOURNAL",
+    ref_doc_id: str = "",
+    ref_doc_no: str = "",
+    created_by: str = "System",
+) -> Tuple[bool, str]:
+    """
+    Stock Journal / inventory accounting:
+      ISSUE / CONSUME / SALE_COST  -> Dr Cost of Goods Sold, Cr Inventory Stock
+      INCREASE / FOUND / OPENING   -> Dr Inventory Stock, Cr Stock Adjustment Gain
+
+    Use this only when a reliable stock valuation amount is available.
+    Quantity-only stock movement must remain operational until valued.
+    """
+    amt = round(float(amount or 0), 2)
+    if amt <= 0:
+        return False, "Stock journal amount must be greater than zero."
+    mtype = str(movement_type or "").upper().strip()
+    if mtype in ("ISSUE", "CONSUME", "SALE_COST", "SHORTAGE", "DAMAGE"):
+        lines = [
+            {"account_code": "4101", "debit": amt, "credit": 0},
+            {"account_code": "1101", "debit": 0, "credit": amt},
+        ]
+    elif mtype in ("INCREASE", "FOUND", "OPENING", "RECEIVE_ADJUSTMENT"):
+        lines = [
+            {"account_code": "1101", "debit": amt, "credit": 0},
+            {"account_code": "3006", "debit": 0, "credit": amt},
+        ]
+    else:
+        return False, "Unknown stock journal type. Use ISSUE/CONSUME or INCREASE/OPENING."
+    ok, vno, err = post_journal(
+        voucher_type="STOCK_JOURNAL",
+        voucher_date=voucher_date or datetime.date.today(),
+        narration=narration or f"Stock Journal {mtype}",
+        lines=lines,
+        ref_doc_type=ref_doc_type,
+        ref_doc_id=ref_doc_id,
+        ref_doc_no=ref_doc_no,
+        created_by=created_by,
+        is_auto=bool(ref_doc_id or ref_doc_no),
+    )
+    return ok, vno if ok else err
+
+
+def post_depreciation_jv(
+    *,
+    asset_name: str,
+    amount: float,
+    voucher_date: datetime.date | None = None,
+    ref_doc_id: str = "",
+    ref_doc_no: str = "",
+    created_by: str = "System",
+) -> Tuple[bool, str]:
+    """Depreciation -> Dr Depreciation Expense, Cr Accumulated Depreciation."""
+    amt = round(float(amount or 0), 2)
+    if amt <= 0:
+        return False, "Depreciation amount must be greater than zero."
+    label = str(asset_name or "Fixed Asset").strip()
+    ok, vno, err = post_journal(
+        voucher_type="DEPRECIATION",
+        voucher_date=voucher_date or datetime.date.today(),
+        narration=f"Depreciation — {label}",
+        lines=[
+            {"account_code": "5101", "debit": amt, "credit": 0},
+            {"account_code": "1599", "debit": 0, "credit": amt},
+        ],
+        ref_doc_type="DEPRECIATION",
+        ref_doc_id=ref_doc_id,
+        ref_doc_no=ref_doc_no,
+        created_by=created_by,
+        is_auto=bool(ref_doc_id or ref_doc_no),
     )
     return ok, vno if ok else err
 
@@ -582,30 +964,80 @@ def get_trial_balance(date_from: str, date_to: str) -> List[Dict]:
     Opening balance + period movement = closing balance.
     """
     return _q("""
+        WITH pre AS (
+            SELECT l.account_id,
+                   SUM(l.debit) - SUM(l.credit) AS pre_net
+            FROM journal_lines l
+            JOIN journal_entries j ON j.id = l.journal_id
+            WHERE j.voucher_date < %s
+            GROUP BY l.account_id
+        ),
+        period AS (
+            SELECT l.account_id,
+                   SUM(l.debit) AS period_dr,
+                   SUM(l.credit) AS period_cr
+            FROM journal_lines l
+            JOIN journal_entries j ON j.id = l.journal_id
+            WHERE j.voucher_date BETWEEN %s AND %s
+            GROUP BY l.account_id
+        )
         SELECT
-            a.account_code                          AS "Code",
-            a.account_name                          AS "Account",
-            g.name                                  AS "Group",
-            a.nature                                AS "Nature",
-            a.opening_balance                       AS "Opening (₹)",
-            COALESCE(SUM(l.debit),  0)              AS "Period Dr (₹)",
-            COALESCE(SUM(l.credit), 0)              AS "Period Cr (₹)",
-            a.opening_balance
-              + COALESCE(SUM(l.debit),  0)
-              - COALESCE(SUM(l.credit), 0)          AS "Closing Dr (₹)",
-            -(a.opening_balance
-              + COALESCE(SUM(l.debit),  0)
-              - COALESCE(SUM(l.credit), 0))         AS "Closing Cr (₹)"
+            a.account_code AS "Code",
+            a.account_name AS "Account",
+            g.name AS "Group",
+            a.nature AS "Nature",
+            a.opening_balance AS "Opening (₹)",
+            COALESCE(p.period_dr, 0) AS "Period Dr (₹)",
+            COALESCE(p.period_cr, 0) AS "Period Cr (₹)",
+            CASE
+                WHEN (
+                    CASE
+                        WHEN a.nature IN ('ASSET', 'EXPENSE')
+                        THEN a.opening_balance
+                        ELSE -a.opening_balance
+                    END
+                    + COALESCE(pr.pre_net, 0)
+                    + COALESCE(p.period_dr, 0) - COALESCE(p.period_cr, 0)
+                ) >= 0
+                THEN (
+                    CASE
+                        WHEN a.nature IN ('ASSET', 'EXPENSE')
+                        THEN a.opening_balance
+                        ELSE -a.opening_balance
+                    END
+                    + COALESCE(pr.pre_net, 0)
+                    + COALESCE(p.period_dr, 0) - COALESCE(p.period_cr, 0)
+                )
+                ELSE 0
+            END AS "Closing Dr (₹)",
+            CASE
+                WHEN (
+                    CASE
+                        WHEN a.nature IN ('ASSET', 'EXPENSE')
+                        THEN a.opening_balance
+                        ELSE -a.opening_balance
+                    END
+                    + COALESCE(pr.pre_net, 0)
+                    + COALESCE(p.period_dr, 0) - COALESCE(p.period_cr, 0)
+                ) < 0
+                THEN -(
+                    CASE
+                        WHEN a.nature IN ('ASSET', 'EXPENSE')
+                        THEN a.opening_balance
+                        ELSE -a.opening_balance
+                    END
+                    + COALESCE(pr.pre_net, 0)
+                    + COALESCE(p.period_dr, 0) - COALESCE(p.period_cr, 0)
+                )
+                ELSE 0
+            END AS "Closing Cr (₹)"
         FROM chart_of_accounts a
-        LEFT JOIN account_groups g ON g.id  = a.group_id
-        LEFT JOIN journal_lines  l ON l.account_id = a.id
-        LEFT JOIN journal_entries j ON j.id = l.journal_id
-            AND j.voucher_date BETWEEN %s AND %s
+        LEFT JOIN account_groups g ON g.id = a.group_id
+        LEFT JOIN pre pr ON pr.account_id = a.id
+        LEFT JOIN period p ON p.account_id = a.id
         WHERE a.is_active = TRUE
-        GROUP BY a.account_code, a.account_name, g.name,
-                 a.nature, a.opening_balance
         ORDER BY a.account_code
-    """, (date_from, date_to))
+    """, (date_from, date_from, date_to))
 
 
 def get_account_ledger(account_code: str, date_from: str, date_to: str) -> List[Dict]:
@@ -626,6 +1058,163 @@ def get_account_ledger(account_code: str, date_from: str, date_to: str) -> List[
           AND j.voucher_date BETWEEN %s AND %s
         ORDER BY j.voucher_date ASC, j.created_at ASC
     """, (account_code, date_from, date_to))
+
+
+def get_party_control_summary(account_code: str, date_from: str | None = None, date_to: str | None = None) -> List[Dict]:
+    """Party-wise view for Sundry Debtors/Creditors control accounts."""
+    acc = get_account(account_code)
+    nature = (acc or {}).get("nature", "ASSET")
+    sign_expr = "COALESCE(l.debit,0) - COALESCE(l.credit,0)"
+    if nature == "LIABILITY":
+        sign_expr = "COALESCE(l.credit,0) - COALESCE(l.debit,0)"
+
+    return _q(f"""
+        WITH control_lines AS (
+            SELECT
+                COALESCE(NULLIF(TRIM(l.party_name), ''), 'Unmapped Party') AS party_name,
+                j.voucher_date,
+                j.voucher_no,
+                j.ref_doc_type,
+                j.ref_doc_no,
+                COALESCE(l.debit, 0) AS debit,
+                COALESCE(l.credit, 0) AS credit,
+                {sign_expr} AS signed_amount
+            FROM journal_lines l
+            JOIN journal_entries j ON j.id = l.journal_id
+            JOIN chart_of_accounts a ON a.id = l.account_id
+            WHERE a.account_code = %s
+        ),
+        agg AS (
+            SELECT
+                party_name,
+                COALESCE(SUM(signed_amount) FILTER (WHERE voucher_date < %s), 0) AS opening,
+                COALESCE(SUM(debit) FILTER (WHERE voucher_date BETWEEN %s AND %s), 0) AS period_dr,
+                COALESCE(SUM(credit) FILTER (WHERE voucher_date BETWEEN %s AND %s), 0) AS period_cr,
+                COALESCE(SUM(signed_amount), 0) AS closing,
+                MAX(voucher_date) AS last_txn,
+                COUNT(*) FILTER (WHERE voucher_date BETWEEN %s AND %s) AS entries
+            FROM control_lines
+            GROUP BY party_name
+        )
+        SELECT
+            party_name AS "Party",
+            ROUND(opening, 2) AS "Opening (₹)",
+            ROUND(period_dr, 2) AS "Dr (₹)",
+            ROUND(period_cr, 2) AS "Cr (₹)",
+            ROUND(closing, 2) AS "Closing (₹)",
+            last_txn::text AS "Last Transaction",
+            entries AS "Entries"
+        FROM agg
+        WHERE ABS(opening) > 0.005
+           OR ABS(period_dr) > 0.005
+           OR ABS(period_cr) > 0.005
+           OR ABS(closing) > 0.005
+        ORDER BY ABS(closing) DESC, party_name
+    """, (account_code, date_from, date_from, date_to, date_from, date_to, date_from, date_to))
+
+
+def get_party_control_ledger(
+    account_code: str,
+    party_name: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> List[Dict]:
+    """One debtor/creditor party ledger inside the control account."""
+    acc = get_account(account_code)
+    nature = (acc or {}).get("nature", "ASSET")
+    sign_expr = "COALESCE(l.debit,0) - COALESCE(l.credit,0)"
+    if nature == "LIABILITY":
+        sign_expr = "COALESCE(l.credit,0) - COALESCE(l.debit,0)"
+
+    blank_filter = party_name == "Unmapped Party"
+    party_clause = (
+        "COALESCE(NULLIF(TRIM(l.party_name), ''), 'Unmapped Party') = %s"
+    )
+
+    return _q(f"""
+        WITH control_lines AS (
+            SELECT
+                j.voucher_date,
+                j.voucher_no,
+                j.voucher_type,
+                COALESCE(NULLIF(j.ref_doc_type, ''), j.voucher_type) AS ref_doc_type,
+                COALESCE(NULLIF(j.ref_doc_no, ''), j.voucher_no) AS ref_doc_no,
+                j.narration,
+                COALESCE(NULLIF(TRIM(l.party_name), ''), 'Unmapped Party') AS party_name,
+                COALESCE(l.debit, 0) AS debit,
+                COALESCE(l.credit, 0) AS credit,
+                {sign_expr} AS signed_amount,
+                j.created_at
+            FROM journal_lines l
+            JOIN journal_entries j ON j.id = l.journal_id
+            JOIN chart_of_accounts a ON a.id = l.account_id
+            WHERE a.account_code = %s
+              AND {party_clause}
+        ),
+        opening AS (
+            SELECT COALESCE(SUM(signed_amount), 0) AS opening
+            FROM control_lines
+            WHERE voucher_date < %s
+        ),
+        period AS (
+            SELECT *
+            FROM control_lines
+            WHERE voucher_date BETWEEN %s AND %s
+        )
+        SELECT
+            p.voucher_date::text AS "Date",
+            p.voucher_no AS "Voucher No",
+            p.voucher_type AS "Type",
+            p.ref_doc_type AS "Doc Type",
+            p.ref_doc_no AS "Ref No",
+            p.narration AS "Narration",
+            p.party_name AS "Party",
+            ROUND(p.debit, 2) AS "Dr (₹)",
+            ROUND(p.credit, 2) AS "Cr (₹)",
+            ROUND(
+                (SELECT opening FROM opening)
+                + SUM(p.signed_amount) OVER (ORDER BY p.voucher_date, p.created_at, p.voucher_no),
+                2
+            ) AS "Balance (₹)"
+        FROM period p
+        ORDER BY p.voucher_date ASC, p.created_at ASC, p.voucher_no ASC
+    """, (account_code, party_name, date_from, date_from, date_to))
+
+
+def get_transaction_book(date_from: str | None = None, date_to: str | None = None, mode: str = "ALL") -> List[Dict]:
+    """Combined/Cash/Bank transaction book from cash and bank account legs."""
+    mode = (mode or "ALL").upper()
+    mode_filter = ""
+    params: tuple = (date_from, date_to)
+    if mode == "CASH":
+        mode_filter = "AND a.account_type = 'CASH'"
+    elif mode == "BANK":
+        mode_filter = "AND a.account_type = 'BANK'"
+
+    return _q(f"""
+        SELECT
+            j.voucher_date::text AS "Date",
+            j.voucher_no AS "Voucher No",
+            j.voucher_type AS "Type",
+            a.account_name AS "Account",
+            COALESCE(NULLIF(l.party_name, ''), '') AS "Party",
+            COALESCE(NULLIF(j.ref_doc_no, ''), bt.ref_no, j.voucher_no) AS "Ref",
+            j.narration AS "Narration",
+            ROUND(COALESCE(l.debit, 0), 2) AS "Receipts (₹)",
+            ROUND(COALESCE(l.credit, 0), 2) AS "Payments (₹)",
+            bt.ref_no AS "Bank Ref",
+            COALESCE(bt.is_reconciled, FALSE) AS "Reconciled"
+        FROM journal_lines l
+        JOIN journal_entries j ON j.id = l.journal_id
+        JOIN chart_of_accounts a ON a.id = l.account_id
+        LEFT JOIN bank_transactions bt ON bt.journal_id = j.id
+                                  AND bt.bank_account_id = l.account_id
+        WHERE a.account_type IN ('CASH', 'BANK')
+          AND (%s IS NULL OR j.voucher_date >= %s::date)
+          AND (%s IS NULL OR j.voucher_date <= %s::date)
+          {mode_filter}
+        ORDER BY j.voucher_date ASC, j.created_at ASC, j.voucher_no ASC
+    """, (date_from, date_from, date_to, date_to))
 
 
 def get_bank_book(account_code: str, date_from: str, date_to: str) -> List[Dict]:
@@ -689,7 +1278,10 @@ def backfill_journal_entries(created_by: str = "Migration") -> Dict:
 
     Returns: {"invoices": n, "payments": n, "disbursements": n, "errors": [...]}
     """
-    stats  = {"invoices": 0, "payments": 0, "disbursements": 0, "errors": []}
+    stats  = {
+        "invoices": 0, "payments": 0, "disbursements": 0,
+        "purchases": 0, "credit_notes": 0, "debit_notes": 0, "errors": []
+    }
 
     # ── Already-posted ref_doc_ids (skip these) ───────────────────────────
     posted = {r["ref_doc_id"] for r in
@@ -757,7 +1349,7 @@ def backfill_journal_entries(created_by: str = "Migration") -> Dict:
                amount, payment_mode, payment_date, payment_type
         FROM payments
         WHERE COALESCE(is_deleted, FALSE) = FALSE
-          AND payment_type IN ('PAYMENT', 'RECEIPT', 'ADVANCE')
+          AND payment_type IN ('PAYMENT', 'RECEIPT', 'ADVANCE', 'OPENING')
           {_cancelled_filter}
     """)
     for pay in payments:
@@ -806,5 +1398,129 @@ def backfill_journal_entries(created_by: str = "Migration") -> Dict:
         except Exception as e:
             stats["errors"].append(f"Disbursement {disb.get('payment_no')}: {e}")
 
-    stats["total"] = stats["invoices"] + stats["payments"] + stats["disbursements"]
+    # ── Backfill supplier purchase invoices ───────────────────────────────
+    try:
+        purchases = _q("""
+            SELECT
+                COALESCE(NULLIF(invoice_no, ''), supplier_invoice_no, '') AS invoice_no,
+                COALESCE(NULLIF(invoice_no, ''), supplier_invoice_no, '') AS id,
+                COALESCE(NULLIF(supplier_name, ''), 'Unknown Supplier') AS supplier_name,
+                COALESCE(invoice_total, 0) AS grand_total,
+                COALESCE(subtotal, 0) AS taxable,
+                COALESCE(gst_amount, 0) AS tax_amount,
+                COALESCE(invoice_date, CURRENT_DATE) AS invoice_date,
+                'LENSES' AS purchase_category
+            FROM purchase_invoices
+            WHERE COALESCE(is_deleted, FALSE) = FALSE
+              AND COALESCE(invoice_total, 0) > 0
+            ORDER BY invoice_date
+        """)
+    except Exception as _pur_q_err:
+        stats["errors"].append(f"Purchase query failed: {_pur_q_err}")
+        purchases = []
+
+    for pur in purchases:
+        pur_id = str(pur.get("id") or pur.get("invoice_no") or "")
+        if not pur_id or pur_id in posted:
+            continue
+        try:
+            ok, _ = post_purchase_invoice_jv(
+                invoice_no=pur.get("invoice_no") or pur_id,
+                invoice_id=pur_id,
+                supplier_name=pur.get("supplier_name") or "Unknown Supplier",
+                grand_total=float(pur.get("grand_total") or 0),
+                taxable=float(pur.get("taxable") or 0),
+                tax_amount=float(pur.get("tax_amount") or 0),
+                purchase_category=pur.get("purchase_category") or "LENSES",
+                voucher_date=pur.get("invoice_date"),
+                created_by=created_by,
+            )
+            if ok:
+                stats["purchases"] += 1
+            else:
+                stats["errors"].append(f"Purchase {pur.get('invoice_no')}: {_}")
+        except Exception as e:
+            stats["errors"].append(f"Purchase {pur.get('invoice_no')}: {e}")
+
+    # ── Backfill credit notes / debit notes ───────────────────────────────
+    try:
+        credit_notes = _q("""
+            SELECT id::text, cn_number, party_name,
+                   COALESCE(grand_total, 0) AS grand_total,
+                   COALESCE(taxable_amount, 0) AS taxable_amount,
+                   COALESCE(cgst_amount, 0) AS cgst_amount,
+                   COALESCE(sgst_amount, 0) AS sgst_amount,
+                   COALESCE(igst_amount, 0) AS igst_amount,
+                   COALESCE(cn_date, CURRENT_DATE) AS note_date
+            FROM credit_notes
+            WHERE COALESCE(is_deleted, FALSE) = FALSE
+              AND UPPER(COALESCE(status, '')) != 'CANCELLED'
+              AND COALESCE(grand_total, 0) > 0
+            ORDER BY cn_date
+        """)
+    except Exception:
+        credit_notes = []
+    for cn in credit_notes:
+        cn_id = str(cn.get("id") or "")
+        if not cn_id or cn_id in posted:
+            continue
+        ok, msg = post_credit_note_jv(
+            cn_number=cn.get("cn_number") or "",
+            cn_id=cn_id,
+            party_name=cn.get("party_name") or "",
+            grand_total=float(cn.get("grand_total") or 0),
+            taxable=float(cn.get("taxable_amount") or 0),
+            cgst_amount=float(cn.get("cgst_amount") or 0),
+            sgst_amount=float(cn.get("sgst_amount") or 0),
+            igst_amount=float(cn.get("igst_amount") or 0),
+            voucher_date=cn.get("note_date"),
+            created_by=created_by,
+        )
+        if ok:
+            stats["credit_notes"] += 1
+        else:
+            stats["errors"].append(f"Credit Note {cn.get('cn_number')}: {msg}")
+
+    try:
+        debit_notes = _q("""
+            SELECT id::text, dn_number, party_name,
+                   COALESCE(grand_total, 0) AS grand_total,
+                   COALESCE(taxable_amount, 0) AS taxable_amount,
+                   COALESCE(cgst_amount, 0) AS cgst_amount,
+                   COALESCE(sgst_amount, 0) AS sgst_amount,
+                   COALESCE(igst_amount, 0) AS igst_amount,
+                   COALESCE(dn_date, CURRENT_DATE) AS note_date
+            FROM debit_notes
+            WHERE COALESCE(is_deleted, FALSE) = FALSE
+              AND UPPER(COALESCE(status, '')) != 'CANCELLED'
+              AND COALESCE(grand_total, 0) > 0
+            ORDER BY dn_date
+        """)
+    except Exception:
+        debit_notes = []
+    for dn in debit_notes:
+        dn_id = str(dn.get("id") or "")
+        if not dn_id or dn_id in posted:
+            continue
+        ok, msg = post_debit_note_jv(
+            dn_number=dn.get("dn_number") or "",
+            dn_id=dn_id,
+            party_name=dn.get("party_name") or "",
+            grand_total=float(dn.get("grand_total") or 0),
+            taxable=float(dn.get("taxable_amount") or 0),
+            cgst_amount=float(dn.get("cgst_amount") or 0),
+            sgst_amount=float(dn.get("sgst_amount") or 0),
+            igst_amount=float(dn.get("igst_amount") or 0),
+            voucher_date=dn.get("note_date"),
+            created_by=created_by,
+        )
+        if ok:
+            stats["debit_notes"] += 1
+        else:
+            stats["errors"].append(f"Debit Note {dn.get('dn_number')}: {msg}")
+
+    stats["total"] = (
+        stats["invoices"] + stats["payments"] + stats["disbursements"]
+        + stats["purchases"] + stats["credit_notes"] + stats["debit_notes"]
+    )
     return stats

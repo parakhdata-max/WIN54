@@ -187,15 +187,84 @@ def simulate_request(
                 namespace  = request.namespace,
             )
 
+        # Fix 3: Apply supplier/party schemes and include in API response
+        scheme_lines   = invoice_data["lines"]
+        scheme_applied = []
+        try:
+            try:
+                from pricing.supplier_scheme_engine import apply_customer_scheme_to_line
+            except ImportError:
+                from modules.pricing.supplier_scheme_engine import apply_customer_scheme_to_line
+            party_id = getattr(request, "party_id", "") or ""
+            order_type = request.channel.value if hasattr(request.channel, "value") else "WHOLESALE"
+            scheme_lines = []
+            for line in invoice_data["lines"]:
+                patched = apply_customer_scheme_to_line(
+                    dict(line), party_id=str(party_id), order_type=order_type
+                )
+                scheme_lines.append(patched)
+                lp = patched.get("lens_params") or {}
+                if lp.get("supplier_scheme_status") == "APPLIED":
+                    scheme_applied.append({
+                        "product": patched.get("product_name",""),
+                        "scheme":  lp.get("supplier_scheme_name",""),
+                        "rule":    lp.get("supplier_scheme_rule",""),
+                        "old_price": lp.get("supplier_scheme_old_price"),
+                        "new_price": lp.get("supplier_scheme_price"),
+                        "discount_zeroed": lp.get("supplier_scheme_discount_zeroed", False),
+                    })
+        except Exception as _se:
+            import logging as _sl
+            _sl.getLogger(__name__).warning("Scheme evaluation failed in API: %s", _se)
+            scheme_lines = invoice_data["lines"]
+
+        # Recalculate ALL total aliases from scheme_lines — lines may have changed
+        try:
+            _scheme_subtotal  = sum(
+                float(l.get("total_price") or l.get("billing_total") or l.get("net") or 0)
+                for l in scheme_lines
+            )
+            _scheme_tax = sum(
+                float(l.get("gst_amount") or l.get("tax_amount") or l.get("gst") or 0)
+                for l in scheme_lines
+            )
+            _scheme_disc = sum(
+                float(l.get("discount_amount") or 0)
+                for l in scheme_lines
+            )
+            _scheme_gross = sum(
+                float(l.get("unit_price") or 0) * int(l.get("billing_qty") or l.get("quantity") or 1)
+                for l in scheme_lines
+            )
+            _scheme_grand = round(_scheme_subtotal + _scheme_tax, 2)
+            scheme_totals = {
+                **invoice_data["totals"],
+                # Standard names
+                "subtotal":       round(_scheme_subtotal, 2),
+                "tax":            round(_scheme_tax, 2),
+                "grand_total":    _scheme_grand,
+                # Common aliases — ensure downstream never reads stale values
+                "gross":          round(_scheme_gross, 2),
+                "total_discount": round(_scheme_disc, 2),
+                "total_gst":      round(_scheme_tax, 2),
+                "payable":        _scheme_grand,
+                "net_payable":    _scheme_grand,
+                "total_tax":      round(_scheme_tax, 2),
+                "scheme_recalculated": True,
+            }
+        except Exception:
+            scheme_totals = invoice_data["totals"]
+
         return {
-            "status":       "ok",
-            "channel":      request.channel.value,
-            "namespace":    request.namespace,
-            "policy":       policy.name,
-            "lines":        invoice_data["lines"],
-            "totals":       invoice_data["totals"],
-            "simulations":  simulations,
-            "decision_ids": decision_ids,
+            "status":         "ok",
+            "channel":        request.channel.value,
+            "namespace":      request.namespace,
+            "policy":         policy.name,
+            "lines":          scheme_lines,
+            "totals":         scheme_totals,
+            "simulations":    simulations,
+            "decision_ids":   decision_ids,
+            "schemes_applied": scheme_applied,
             "pipeline":     "INPUT → Policy → Engine → GST → Margin[Tiered] → Log",
         }
 

@@ -209,6 +209,20 @@ class OrderGuard:
         self._role   = self._get_role()
         self._cancelled = (self.status == "CANCELLED")
 
+    def _status_allowed_by_admin(self, action: str) -> bool:
+        if action not in ("edit", "cancel"):
+            return True
+        try:
+            from modules.settings.shop_master import get_order_action_statuses
+            allowed = get_order_action_statuses(action)
+            return self.status in allowed
+        except Exception:
+            if action == "edit":
+                return self.status in {"PENDING", "PROVISIONAL", "UNDER_REVIEW"}
+            if action == "cancel":
+                return self.status in {"PENDING", "PROVISIONAL", "UNDER_REVIEW"}
+            return True
+
     def _get_role(self) -> str:
         try:
             from modules.security.roles import current_role
@@ -219,6 +233,8 @@ class OrderGuard:
     def can(self, action: str) -> bool:
         """Returns True if current user can perform action on this order."""
         if self._cancelled and action != "view":
+            return False
+        if not self._status_allowed_by_admin(action):
             return False
         roles = self._perms.get(action)
         if roles is None:

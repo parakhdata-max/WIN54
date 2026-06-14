@@ -132,7 +132,9 @@ def _get_orders_for_stage(status: str) -> list[dict]:
             id::text                                            AS oid,
             COALESCE(display_order_no::text, order_no)         AS order_no,
             COALESCE(patient_name, party_name, '')             AS party_name,
-            COALESCE(patient_mobile, party_mobile, '')         AS mobile,
+            COALESCE(patient_mobile,
+                     (SELECT mobile FROM parties p WHERE p.id = orders.party_id LIMIT 1),
+                     '')                                      AS mobile,
             COALESCE(total_value, 0)                           AS total_value,
             status,
             created_at::date::text                             AS date

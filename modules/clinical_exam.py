@@ -67,6 +67,7 @@ def initialize_clinical_state():
             "doctor_notes": "",
             "treatment_plan": "",
             "followup_advice": "",
+            "diagnosis": "",
         }
     
     # Doctor mode toggle
@@ -583,6 +584,7 @@ def save_clinical_examination() -> bool:
         clinical.get("doctor_notes", "").strip(),
         clinical.get("treatment_plan", "").strip(),
         clinical.get("followup_advice", "").strip(),
+        clinical.get("diagnosis", "").strip(),
     ])
     
     if not has_data:
@@ -635,6 +637,7 @@ def save_clinical_examination() -> bool:
                     doctor_notes = %(doctor_notes)s,
                     treatment_plan = %(treatment_plan)s,
                     followup_advice = %(followup_advice)s,
+                    diagnosis = %(diagnosis)s,
                     updated_at = NOW(),
                     updated_by = %(updated_by)s
                 WHERE patient_id = %(patient_id)s 
@@ -656,7 +659,7 @@ def save_clinical_examination() -> bool:
                     subj_duochrome_r, subj_duochrome_l,
                     subj_binocular_balance, subj_worth_4_dot,
                     subj_distance_phoria, subj_near_phoria,
-                    doctor_notes, treatment_plan, followup_advice,
+                    doctor_notes, treatment_plan, followup_advice, diagnosis,
                     created_by, updated_by
                 ) VALUES (
                     %(patient_id)s, %(visit_id)s, %(record_no)s,
@@ -671,7 +674,7 @@ def save_clinical_examination() -> bool:
                     %(subj_duochrome_r)s, %(subj_duochrome_l)s,
                     %(subj_binocular_balance)s, %(subj_worth_4_dot)s,
                     %(subj_distance_phoria)s, %(subj_near_phoria)s,
-                    %(doctor_notes)s, %(treatment_plan)s, %(followup_advice)s,
+                    %(doctor_notes)s, %(treatment_plan)s, %(followup_advice)s, %(diagnosis)s,
                     %(updated_by)s, %(updated_by)s
                 )
             """
@@ -960,6 +963,13 @@ def render_doctor_notes_treatment():
             key="clinical_followup_advice"
         )
 
+        st.session_state.retail_clinical_exam["diagnosis"] = st.text_input(
+            "Diagnosis (ICD / clinical label)",
+            value=st.session_state.retail_clinical_exam.get("diagnosis", ""),
+            placeholder="e.g., H52.1 Myopia, H40.1 Open-angle glaucoma",
+            key="clinical_diagnosis",
+        )
+
     with col2:
         st.session_state.retail_clinical_exam["treatment_plan"] = st.text_area(
             "Treatment Plan / Medicines",
@@ -1023,11 +1033,15 @@ def _render_saved_photos(patient_id):
     """Show previously saved photos for patient"""
     import os
 
+    _pid_str = str(patient_id or "")
+    if not _pid_str or _pid_str.upper().startswith("TEMP-") or len(_pid_str) < 10:
+        return
+
     try:
         result = run_query(
             "SELECT image_path, notes, created_at FROM clinical_media "
             "WHERE patient_id = %(pid)s ORDER BY created_at DESC LIMIT 10",
-            {"pid": str(patient_id)}
+            {"pid": _pid_str}
         ) or []
     except Exception:
         result = []

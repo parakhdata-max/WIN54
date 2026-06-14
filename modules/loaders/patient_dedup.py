@@ -24,6 +24,25 @@ import uuid
 from typing import Optional, Tuple
 
 
+# ── Schema guard ─────────────────────────────────────────────────────────────
+
+def _ensure_patient_identity_columns() -> None:
+    """Add optional identity fields used by Quick Add on older/live DBs."""
+    try:
+        from modules.sql_adapter import run_write
+        run_write("ALTER TABLE patients ADD COLUMN IF NOT EXISTS relation TEXT DEFAULT 'Self'")
+        run_write("ALTER TABLE patients ADD COLUMN IF NOT EXISTS gender TEXT")
+        run_write("ALTER TABLE patients DROP CONSTRAINT IF EXISTS patients_mobile_key")
+        run_write(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_patients_name_mobile "
+            "ON patients (LOWER(TRIM(master_name)), COALESCE(TRIM(mobile),'')) "
+            "WHERE master_name IS NOT NULL"
+        )
+    except Exception:
+        # Callers still have safe fallbacks for search; never block the page here.
+        pass
+
+
 # ── Normalisation helpers ─────────────────────────────────────────────────────
 
 def _norm_name(name: str) -> str:
@@ -70,6 +89,7 @@ def resolve_patient(
         from modules.sql_adapter import run_query
     except Exception as ex:
         return {'action': 'error', 'message': f'DB unavailable: {ex}'}
+    _ensure_patient_identity_columns()
 
     name = (name or '').strip()
     if not name:
@@ -224,6 +244,7 @@ def save_patient(
 
     try:
         from modules.sql_adapter import run_write, run_query
+        _ensure_patient_identity_columns()
 
         # Generate barcode: P + 6-digit sequence
         seq = run_query("SELECT COUNT(*) AS n FROM patients") or [{'n': 0}]

@@ -120,7 +120,7 @@ engine = DiscountEngine([rule])
 item   = LineItem(base_price=Decimal("1000"), quantity=10,
                   party_tags=["wholesale"], channel=SalesChannel.WHOLESALE)
 result = engine.calculate(item)
-print(result.pretty())
+logger.debug(result.pretty())
 
 # Using a policy:
 from modules.pricing import WHOLESALE_POLICY

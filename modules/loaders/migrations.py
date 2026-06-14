@@ -72,6 +72,7 @@ MIGRATIONS = [
 
     # ── parties table ─────────────────────────────────────────────────────────
     ("parties", "barcode",         "TEXT",         "Party barcode — scan sticker to auto-fill party in billing/PO/challan"),
+    ("parties", "customer_no",     "TEXT",         "Unique customer number — auto-assigned (CUST000001). Never changes."),
     ("parties", "credit_limit",    "NUMERIC(12,2) DEFAULT 0", "Credit limit for ON_ACCOUNT parties"),
     ("parties", "credit_days",     "INTEGER DEFAULT 0",        "Credit period in days"),
     ("parties", "billing_category","TEXT DEFAULT 'ON_COMPLETION'",
@@ -91,6 +92,9 @@ MIGRATIONS = [
     # ── orders table ──────────────────────────────────────────────────────────
     ("orders", "is_converted", "BOOLEAN DEFAULT FALSE", "Consultation converted to billing order"),
     ("orders", "expected_supply_date", "DATE", "Expected date of supply — set in backoffice"),
+    ("orders", "expected_supply_window", "TEXT", "Planned supply time window — rule based / backoffice"),
+    ("orders", "cs_expected_supply_date", "DATE", "Customer-service updated expected supply date"),
+    ("orders", "cs_expected_supply_window", "TEXT", "Customer-service updated supply time window"),
 
     # ── Supplier fulfillment automation ─────────────────────────────────────────
     ("products", "preferred_supplier_id", "UUID",
@@ -199,9 +203,11 @@ def run_all_migrations(silent: bool = True) -> dict:
          "CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_item_code "
          "ON inventory_stock (item_code) WHERE item_code IS NOT NULL AND item_code <> ''"),
 
-        # batch_no unique per product in inventory_stock (frames especially)
-        ("uq_inventory_batch_per_product",
-         "CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_batch_per_product "
+        # batch_no is a lookup key, not a unique identity. Contact lens and
+        # ophthalmic imports can legitimately split one supplier batch across
+        # powers/eyes/expiry rows, so uniqueness here blocks valid stock data.
+        ("idx_inventory_batch_per_product",
+         "CREATE INDEX IF NOT EXISTS idx_inventory_batch_per_product "
          "ON inventory_stock (product_id, batch_no) WHERE batch_no IS NOT NULL"),
 
         # product_name unique in products (already enforced by ON CONFLICT but make explicit)
@@ -320,6 +326,12 @@ def run_all_migrations(silent: bool = True) -> dict:
         except Exception as ex:
             logger.warning(f"[migrations] table {tbl_name}: {ex}")
             errors.append(f"table {tbl_name}: {ex}")
+
+    try:
+        run_write("DROP INDEX IF EXISTS uq_inventory_batch_per_product")
+        logger.debug("[migrations] removed obsolete strict batch uniqueness index")
+    except Exception as ex:
+        logger.warning(f"[migrations] obsolete batch unique index cleanup failed: {ex}")
 
     for idx_name, idx_sql in _unique_indexes:
         try:

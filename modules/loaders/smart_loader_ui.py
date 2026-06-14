@@ -250,6 +250,23 @@ def _handle_edit_upload(uploaded, file_type: str, cfg: dict):
     _applied_key = f"schema_applied_{file_type}_{uploaded.name}"
     _active_df   = st.session_state.get(_fix_key, guard.df)
 
+    try:
+        from modules.loaders.loader_contract import (
+            build_loader_contract_report,
+            render_loader_contract_panel,
+        )
+        _contract_report = build_loader_contract_report(file_type, _active_df)
+        _contract_ok = render_loader_contract_panel(
+            st,
+            _contract_report,
+            require_ack=True,
+            key=f"smart_loader_contract_{file_type}_{uploaded.name}",
+        )
+        if not _contract_ok:
+            st.stop()
+    except Exception as _contract_ex:
+        st.warning(f"Loader contract check unavailable: {_contract_ex}")
+
     # ── Learning Memory: auto-apply known fixes silently ──────────────────────
     # If we've seen these column names before for this file type, fix them
     # automatically without asking the user. Show a quiet notice only.
@@ -477,6 +494,7 @@ def _handle_edit_upload(uploaded, file_type: str, cfg: dict):
     # Stamps approved_by + manually_edited on every surviving FieldChange
     if _edited_df is not None:
         report = apply_grid_edits_to_report(report, _edited_df, user=user)
+        report = _dedupe_report_changes(report)
 
     # ── Pre-Apply Validation Shield ────────────────────────────────────────────
     # Runs the same checks process_upload does — catches bad values BEFORE commit.
@@ -646,6 +664,42 @@ def _render_guided_approval(report, advice, file_type, user, guard, uploaded,
                 st.error(f"❌ Undo failed: {'; '.join(undo_result['errors'])}")
 
 
+
+def _dedupe_report_changes(report):
+    """
+    Collapse duplicate approved changes by actual DB target.
+
+    Prevents PostgreSQL errors like:
+        multiple assignments to same column "base_recommended"
+
+    Dedupe key is (entity_id/entity_key, field_name). Last visible value wins.
+    """
+    try:
+        changes = list(getattr(report, "changes", []) or [])
+        if not changes:
+            return report
+        dedup = {}
+        for ch in changes:
+            key = (getattr(ch, "entity_id", None) or getattr(ch, "entity_key", ""), getattr(ch, "field_name", ""))
+            dedup[key] = ch
+        if len(dedup) != len(changes):
+            report.changes = list(dedup.values())
+
+        rows = list(getattr(report, "comparison_rows", []) or [])
+        if rows:
+            seen = set()
+            clean_rows = []
+            for row in rows:
+                key = (row.get("Record"), row.get("Field"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                clean_rows.append(row)
+            report.comparison_rows = clean_rows
+    except Exception:
+        pass
+    return report
+
 def _execute_apply(report, user, guard, file_type, apply_changes):
     """
     Shared apply + live refresh logic.
@@ -656,6 +710,7 @@ def _execute_apply(report, user, guard, file_type, apply_changes):
     3. Update inline grid session state (live refresh — no full reload flicker)
     4. Show toast + success inline, no blocking message
     """
+    report = _dedupe_report_changes(report)
     with st.spinner("Applying changes..."):
         result = apply_changes(report, user=user, dry_run=False)
 
@@ -965,6 +1020,23 @@ def _handle_add_upload(uploaded, file_type: str, cfg: dict):
     if df.empty:
         st.warning("⚠️ No data rows found after removing example row.")
         return
+
+    try:
+        from modules.loaders.loader_contract import (
+            build_loader_contract_report,
+            render_loader_contract_panel,
+        )
+        _contract_report = build_loader_contract_report(file_type, df)
+        _contract_ok = render_loader_contract_panel(
+            st,
+            _contract_report,
+            require_ack=True,
+            key=f"smart_loader_contract_add_{file_type}_{uploaded.name}",
+        )
+        if not _contract_ok:
+            st.stop()
+    except Exception as _contract_ex:
+        st.warning(f"Loader contract check unavailable: {_contract_ex}")
 
     # Preview
     st.markdown("### 📋 Preview — New Records to Add")
@@ -1276,13 +1348,12 @@ def _validate_approved_changes(report, file_type: str) -> list:
                     f"[{', '.join(_ALLOWED_VALS[field])}]"
                 )
 
-        # 6. Dedup — same (entity, field) approved twice
+        # 6. Dedup — same (entity, field) approved twice.
+        # Duplicates are collapsed before commit, so this is not a blocking
+        # validation error. Keep tracking only to avoid repeated work.
         _key = (change.entity_key, field)
         if _key in _seen:
-            errors.append(
-                f"⚠️ '{field}' on '{rec}' appears more than once in approved changes — "
-                f"only one value will be applied"
-            )
+            continue
         _seen.add(_key)
 
     return errors
@@ -1518,6 +1589,7 @@ def apply_grid_edits_to_report(report, edited_df, user: str = "system"):
         ))
 
     report.changes = _accepted
+    report = _dedupe_report_changes(report)
 
     import logging
     _log = logging.getLogger(__name__)
@@ -1582,9 +1654,10 @@ def render_side_by_side_diff(report) -> None:
     """
     Excel-style side-by-side diff grid.
     Columns: Record | Field | DB Value | Uploaded Value | Change
-    - 🔴 Highlighted rows = changed values
+    - Highlighted rows = changed values
     - Filter: show only changes
     - Group: by record
+    """
 
 
     # Risk colour helper
@@ -1676,6 +1749,7 @@ def render_side_by_side_diff(report) -> None:
     return _combined
 
 
+def _render_side_by_side_diff(report):
     """
     Excel-style side-by-side diff grid.
     Columns: Record | Field | DB Value | Uploaded Value | Change
@@ -2275,4 +2349,3 @@ def _render_main_groups():
                 st.rerun()
             except Exception as e:
                 st.error(f"Add failed: {e}")
-

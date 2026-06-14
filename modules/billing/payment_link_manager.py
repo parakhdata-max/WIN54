@@ -32,10 +32,12 @@ Flow
 """
 
 from __future__ import annotations
-import os, random, string, datetime, urllib.parse
+import os, random, string, datetime, urllib.parse, logging
 from typing import Optional, List
 
 import streamlit as st
+
+log = logging.getLogger(__name__)
 
 # ── DB helpers ────────────────────────────────────────────────────────────
 def _q(sql: str, params: dict | None = None) -> list:
@@ -44,7 +46,7 @@ def _q(sql: str, params: dict | None = None) -> list:
 
 def _fc(v) -> str:
     try:    return f"₹{float(v):,.2f}"
-    except: return "₹0.00"
+    except (TypeError, ValueError): return "₹0.00"
 
 def _fd(v) -> str:
     if not v: return "—"
@@ -52,7 +54,9 @@ def _fd(v) -> str:
         if hasattr(v, "strftime"):
             return v.strftime("%d %b %Y")
         return str(v)[:10]
-    except: return str(v)
+    except Exception as e:
+        log.debug("Payment link date format fallback: %s", e)
+        return str(v)
 
 # ── Style constants ───────────────────────────────────────────────────────
 _CARD = "background:#1e293b;border-radius:10px;padding:12px 16px"
@@ -316,8 +320,10 @@ def render_payment_link_panel(order: dict, all_lines: list):
         mobile = str((_pm[0].get("mob") if _pm else None) or "")
 
     # Expire stale links
-    try: expire_stale_links()
-    except: pass
+    try:
+        expire_stale_links()
+    except Exception as e:
+        log.warning("Could not expire stale payment links: %s", e)
 
     # ── Compute balance ───────────────────────────────────────────────────
     from modules.billing.payment_manager import _compute_order_total, _q as _pmq
@@ -405,7 +411,9 @@ def render_payment_link_panel(order: dict, all_lines: list):
                         from modules.security.roles import current_user_name
                         _by = current_user_name()
                         if not isinstance(_by, str): _by = getattr(_by,"name","staff")
-                    except: _by = "staff"
+                    except Exception as e:
+                        log.warning("Could not resolve payment confirmer: %s", e)
+                        _by = "staff"
                     confirm_payment(token, _by)
                     st.success("✅ Payment confirmed and recorded!")
                     st.rerun()
@@ -452,7 +460,9 @@ def render_payment_link_panel(order: dict, all_lines: list):
                             from modules.security.roles import current_user_name
                             _by = current_user_name()
                             if not isinstance(_by, str): _by = getattr(_by,"name","staff")
-                        except: _by = "staff"
+                        except Exception as e:
+                            log.warning("Could not resolve payment-link creator: %s", e)
+                            _by = "staff"
                         result = create_payment_link(
                             order_id     = order_id,
                             order_no     = order_no,
@@ -580,7 +590,9 @@ def _render_active_link(active: dict, order: dict,
                     _by = current_user_name()
                     if not isinstance(_by, str):
                         _by = getattr(_by, "name", "staff")
-                except: _by = "staff"
+                except Exception as e:
+                    log.warning("Could not resolve staff user for payment confirmation: %s", e)
+                    _by = "staff"
                 try:
                     confirm_payment(token, _by)
                     st.success("✅ Payment confirmed and recorded!")
@@ -677,6 +689,11 @@ def _render_new_link_form(order_id, order_no, party_name, mobile,
     with st.form(key=f"plm_form_{order_id[:8]}"):
         cf1, cf2 = st.columns([1, 1])
         with cf1:
+            try:
+                from modules.wa_contact_tools import lookup_mobile
+                mobile = lookup_mobile(party_name, order_id=order_id, fallback=mobile)
+            except Exception:
+                pass
             lnk_mobile = st.text_input("📱 Customer Mobile",
                                         value=mobile, placeholder="10-digit mobile")
         with cf2:
@@ -698,7 +715,9 @@ def _render_new_link_form(order_id, order_no, party_name, mobile,
                     _by = current_user_name()
                     if not isinstance(_by, str):
                         _by = getattr(_by, "name", "staff")
-                except: _by = "staff"
+                except Exception as e:
+                    log.warning("Could not resolve staff user for payment link: %s", e)
+                    _by = "staff"
                 result = create_payment_link(
                     order_id     = order_id,
                     order_no     = order_no,
@@ -709,6 +728,11 @@ def _render_new_link_form(order_id, order_no, party_name, mobile,
                     expiry_hours = lnk_expiry,
                     created_by   = _by,
                 )
+                try:
+                    from modules.wa_contact_tools import save_mobile
+                    save_mobile(party_name, lnk_mobile.strip(), order_id=order_id)
+                except Exception:
+                    pass
                 st.success(f"✅ Payment link generated! Token: `{result['token']}`")
                 st.code(result["url"])
                 st.link_button(
@@ -830,7 +854,8 @@ def render_payment_page(token: str):
                 _q("UPDATE payment_links SET status='EXPIRED' WHERE token=%(t)s", {"t": token})
                 st.error("⏰ This payment link has expired.")
                 return
-        except: pass
+        except Exception as e:
+            log.warning("Could not evaluate payment link expiry: %s", e)
 
     # ── Order card ────────────────────────────────────────────────────────
     st.markdown(f"""
@@ -978,7 +1003,9 @@ def render_pending_claims_dashboard():
                         _by = current_user_name()
                         if not isinstance(_by, str):
                             _by = getattr(_by, "name", "staff")
-                    except: _by = "staff"
+                    except Exception as e:
+                        log.warning("Could not resolve staff user for dashboard confirmation: %s", e)
+                        _by = "staff"
                     try:
                         confirm_payment(c["token"], _by)
                         st.success("✅ Confirmed!")

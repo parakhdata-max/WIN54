@@ -146,12 +146,12 @@ def render_price_suggestions():
                ON s.product_id = ol.product_id
               AND s.purchase_rate IS NOT NULL
               AND s.purchase_rate > 0
-        WHERE o.created_at >= NOW() - INTERVAL '%s days'
+        WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
           AND COALESCE(ol.is_deleted, FALSE) = FALSE
         GROUP BY p.product_name, ol.product_id, p.brand, p.main_group
         ORDER BY billing_total DESC
         LIMIT 80
-    """, (period,))
+    """, {"period": period})
 
     if not data:
         st.info(

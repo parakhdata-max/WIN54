@@ -201,7 +201,7 @@ def _fetch_line_depth(line_id: str) -> LineDepth:
         """SELECT so.id, so.status, so.po_type
            FROM supplier_order_items soi
            JOIN supplier_orders so ON so.id = soi.supplier_order_id
-           WHERE soi.customer_line_id = %(l)s::uuid
+           WHERE soi.customer_line_id::text = %(l)s
              AND so.status NOT IN ('CANCELLED','DRAFT')
            ORDER BY so.created_at DESC LIMIT 1""",
         {"l": line_id}
@@ -778,8 +778,7 @@ def _execute_backstep(job_id: str, from_stage: str, to_stage: str,
                 run_write(
                     """UPDATE order_lines SET
                        lens_params = (COALESCE(lens_params, '{}')::jsonb
-                                      - 'colour_final_photo'),
-                       updated_at = NOW()
+                                      - 'colour_final_photo')
                        FROM job_master jm
                        WHERE order_lines.id = jm.order_line_id
                          AND jm.id = %(j)s::uuid""",

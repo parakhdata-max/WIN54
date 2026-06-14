@@ -18,6 +18,8 @@ DB TRUTH (from db_schema_registry.py):
 import streamlit as st
 import uuid
 import logging
+import traceback
+import json
 from datetime import date, timedelta
 from typing import Optional, List, Dict
 
@@ -48,6 +50,332 @@ INDIAN_STATES = [
 GST_RATES = ["0","5","12","18","28"]
 
 
+ADMIN_DB_ENTITIES = {
+    "Parties / Customers": {
+        "table": "parties",
+        "pk": "id",
+        "search": ["party_name", "mobile", "gstin", "party_type", "billing_preference",
+                   "doc_preference", "area", "city", "contact_person"],
+        "default_cols": [
+            "party_name", "party_type", "mobile", "gstin",
+            "billing_preference", "doc_preference", "credit_limit", "credit_days",
+            "preferred_courier_name", "is_active",
+        ],
+        "editable": [
+            "party_name", "party_type", "mobile", "alt_mobile", "email",
+            "contact_person", "area", "city", "state_name", "pincode",
+            "gstin", "pan_no", "state_code",
+            "billing_preference", "doc_preference", "credit_limit", "credit_days",
+            "opening_balance", "balance_type", "preferred_courier_name",
+            "notes", "is_active",
+        ],
+        "dropdowns": {
+            "party_type":         ["", "Supplier","Retail","Wholesale","Doctor","Optician","Fitter"],
+            "doc_preference":     ["", "C", "I"],
+            "billing_preference": ["", "CHALLAN", "DIRECT_INVOICE"],
+            "balance_type":       ["Dr", "Cr"],
+            "is_active":          [True, False],
+        },
+        "identity": ["party_name"],
+        "tax": ["gstin", "pan_no", "state_code"],
+        "help": {
+            "doc_preference":     "C = Challan first, I = Invoice direct",
+            "billing_preference": "Default document sent to this party",
+            "credit_limit":       "Max outstanding allowed in ₹",
+        },
+    },
+    "Patients": {
+        "table": "patients",
+        "pk": "id",
+        "search": ["master_name", "mobile", "barcode", "email"],
+        "default_cols": ["master_name", "mobile", "age", "gender", "barcode", "is_active"],
+        "editable": ["master_name", "mobile", "alt_mobile", "email",
+                     "age", "gender", "barcode", "address", "city", "pincode", "notes", "is_active"],
+        "dropdowns": {
+            "gender": ["", "Male", "Female", "Other"],
+            "is_active": [True, False],
+        },
+        "identity": ["master_name"],
+        "tax": [],
+    },
+    "Products (All)": {
+        "table": "products",
+        "pk": "id",
+        "search": ["product_code", "product_name", "brand", "main_group", "category", "barcode", "sku_code", "hsn_code"],
+        "default_cols": [
+            "product_code", "product_name", "brand", "main_group", "category", "unit",
+            "gst_percent", "barcode", "sku_code", "hsn_code", "is_active",
+        ],
+        "editable": [
+            "product_code", "product_name", "brand", "main_group", "category", "material",
+            "index_value", "coating", "colour", "unit", "gst_percent", "barcode",
+            "sku_code", "hsn_code", "box_size", "allow_loose", "min_stock_qty",
+            "base_curve", "diameter", "replacement_schedule", "company_product_name",
+            "normal_procurement_discount_pct", "scheme_procurement_discount_pct",
+            "discount_percent", "is_gst_exempt", "online_active", "is_active",
+        ],
+        "dropdowns": {"is_active": [True, False], "gst_percent": [0, 5, 12, 18, 28]},
+        "identity": ["product_name", "brand"],
+        "tax": ["gst_percent", "hsn_code", "is_gst_exempt"],
+        "filter_cols": ["main_group", "brand", "category", "unit", "gst_percent", "is_active"],
+    },
+    "Frames": {
+        "table": "inventory_stock",
+        "pk": "id",
+        "fixed_filter_sql": (
+            "product_id IN ("
+            "SELECT id FROM products "
+            "WHERE LOWER(COALESCE(main_group::text,'')) LIKE '%frame%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%frame%' "
+            "OR LOWER(COALESCE(main_group::text,'')) LIKE '%sunglass%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%sunglass%'"
+            ")"
+        ),
+        "display_exprs": {
+            "product_name": "(SELECT p.product_name FROM products p WHERE p.id = inventory_stock.product_id)",
+            "brand": "(SELECT p.brand FROM products p WHERE p.id = inventory_stock.product_id)",
+            "main_group": "(SELECT p.main_group FROM products p WHERE p.id = inventory_stock.product_id)",
+        },
+        "search": ["product_name", "brand", "barcode", "product_barcode", "item_code", "batch_no", "location", "bin_no", "model"],
+        "default_cols": [
+            "product_name", "brand", "item_code", "batch_no", "barcode", "product_barcode",
+            "quantity", "mrp", "selling_price", "purchase_rate", "location",
+            "bin_no", "model", "colour", "shape", "frame_type", "is_active",
+        ],
+        "editable": [
+            "barcode", "product_barcode", "item_code", "batch_no",
+            "quantity", "mrp", "selling_price", "purchase_rate", "purchase_price",
+            "allocated_qty", "reserved_qty", "location", "bin_no", "model",
+            "size_a", "size_b", "dbl", "temple_length",
+            "base_material", "finish", "colour", "colour_mix", "temple_colour",
+            "shape", "gender", "frame_type", "frame_seq", "image_path", "is_active",
+        ],
+        "dropdowns": {"is_active": [True, False]},
+        "identity": ["barcode", "product_barcode", "item_code", "batch_no"],
+        "tax": [],
+        "filter_cols": ["product_name", "brand", "model", "location", "bin_no", "colour", "shape", "frame_type"],
+        "labels": {
+            "item_code": "Scan Code / Item Code",
+            "batch_no": "Batch No",
+            "barcode": "Barcode",
+            "product_barcode": "Product Barcode",
+            "quantity": "Qty",
+            "purchase_rate": "Purchase Price",
+            "mrp": "MRP",
+        },
+        "help": {
+            "product_barcode": "Product-level barcode if available.",
+            "barcode": "Actual stock/barcode scan code.",
+            "item_code": "FOR SCANNING: universal code used by Retail/Wholesale/Bulk punching, stock search and future loaders.",
+            "batch_no": "NOT FOR SCANNING. Batch/lot number only, mainly for contact lenses/solutions/expiry tracking.",
+            "quantity": "Physical frame quantity.",
+            "mrp": "Sticker MRP. Changing this affects future sticker prints.",
+            "selling_price": "Optional selling price override if used separately from MRP.",
+        },
+        "scan_note": "Scanning rule: put the printed barcode/SKU in inventory_stock.item_code (shown here as Scan Code / Item Code). Do not put frame scan codes in Batch No.",
+    },
+    "Old Frame Master": {
+        "table": "frames",
+        "pk": "id",
+        "search": ["product_name", "model", "brand", "sku_code", "colour", "shape", "location", "frame_group"],
+        "default_cols": [
+            "sku_code", "brand", "product_name", "model", "qty",
+            "mrp", "selling_price", "cost_price", "location",
+            "size_a", "size_b", "dbl", "temple_length",
+            "colour", "shape", "frame_type", "is_active",
+        ],
+        "editable": [
+            "sku_code", "brand", "product_name", "model",
+            "qty", "mrp", "selling_price", "cost_price",
+            "location", "frame_group", "size_a", "size_b", "dbl", "temple_length",
+            "base_material", "finish", "colour", "colour_mix", "temple_colour",
+            "shape", "gender", "frame_type", "frame_seq", "image_path", "is_active",
+        ],
+        "dropdowns": {"is_active": [True, False]},
+        "identity": ["sku_code", "model", "brand"],
+        "tax": [],
+        "filter_cols": ["brand", "model", "location", "frame_group", "colour", "shape", "frame_type"],
+    },
+    "Lenses": {
+        "table": "products",
+        "pk": "id",
+        "fixed_filter_sql": (
+            "(LOWER(COALESCE(main_group::text,'')) LIKE '%lens%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%lens%' "
+            "OR LOWER(COALESCE(product_name::text,'')) LIKE '%lens%' "
+            "OR LOWER(COALESCE(main_group::text,'')) LIKE '%ophthalmic%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%ophthalmic%')"
+        ),
+        "search": ["product_code", "product_name", "brand", "main_group", "category", "barcode", "sku_code", "hsn_code"],
+        "default_cols": [
+            "product_name", "brand", "main_group", "category", "material",
+            "index_value", "coating", "colour", "unit", "gst_percent", "sku_code", "barcode", "is_active",
+        ],
+        "editable": [
+            "product_code", "product_name", "brand", "main_group", "category",
+            "material", "index_value", "coating", "colour", "unit",
+            "gst_percent", "barcode", "sku_code", "hsn_code", "min_stock_qty",
+            "base_curve", "diameter", "normal_procurement_discount_pct",
+            "scheme_procurement_discount_pct", "discount_percent", "is_gst_exempt", "is_active",
+        ],
+        "dropdowns": {"is_active": [True, False], "gst_percent": [0, 5, 12, 18, 28]},
+        "identity": ["product_name", "brand"],
+        "tax": ["gst_percent", "hsn_code", "is_gst_exempt"],
+        "filter_cols": ["brand", "category", "material", "index_value", "coating", "colour", "gst_percent", "is_active"],
+    },
+    "Contact Lenses": {
+        "table": "products",
+        "pk": "id",
+        "fixed_filter_sql": (
+            "(LOWER(COALESCE(main_group::text,'')) LIKE '%contact%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%contact%' "
+            "OR LOWER(COALESCE(product_name::text,'')) LIKE '%contact%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%toric%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%spherical%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%multifocal%')"
+        ),
+        "search": ["product_code", "product_name", "brand", "main_group", "category", "barcode", "sku_code", "hsn_code"],
+        "default_cols": [
+            "product_name", "brand", "main_group", "category", "unit",
+            "gst_percent", "barcode", "sku_code", "box_size", "base_curve", "diameter", "is_active",
+        ],
+        "editable": [
+            "product_code", "product_name", "brand", "main_group", "category", "unit",
+            "gst_percent", "barcode", "sku_code", "hsn_code", "box_size", "allow_loose",
+            "base_curve", "diameter", "dk_value", "dk_t_value", "water_content",
+            "ct_value", "modulus", "replacement_schedule", "company_product_name",
+            "normal_procurement_discount_pct", "scheme_procurement_discount_pct",
+            "discount_percent", "is_gst_exempt", "is_active",
+        ],
+        "dropdowns": {"is_active": [True, False], "gst_percent": [0, 5, 12, 18, 28]},
+        "identity": ["product_name", "brand"],
+        "tax": ["gst_percent", "hsn_code", "is_gst_exempt"],
+        "filter_cols": ["brand", "category", "box_size", "base_curve", "diameter", "gst_percent", "is_active"],
+    },
+    "Solutions": {
+        "table": "products",
+        "pk": "id",
+        "fixed_filter_sql": (
+            "(LOWER(COALESCE(main_group::text,'')) LIKE '%solution%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%solution%' "
+            "OR LOWER(COALESCE(product_name::text,'')) LIKE '%solution%' "
+            "OR LOWER(COALESCE(product_name::text,'')) LIKE '%multipurpose%' "
+            "OR LOWER(COALESCE(product_name::text,'')) LIKE '%lens care%' "
+            "OR LOWER(COALESCE(product_name::text,'')) LIKE '%cleaning%' "
+            "OR LOWER(COALESCE(product_name::text,'')) LIKE '%eye drop%')"
+        ),
+        "search": ["product_code", "product_name", "brand", "main_group", "category", "barcode", "sku_code", "hsn_code"],
+        "default_cols": [
+            "product_name", "brand", "main_group", "category", "unit",
+            "gst_percent", "barcode", "sku_code", "box_size", "is_active",
+        ],
+        "editable": [
+            "product_code", "product_name", "brand", "main_group", "category", "unit",
+            "gst_percent", "barcode", "sku_code", "hsn_code", "box_size", "allow_loose",
+            "company_product_name", "normal_procurement_discount_pct",
+            "scheme_procurement_discount_pct", "discount_percent", "is_gst_exempt", "is_active",
+        ],
+        "dropdowns": {"is_active": [True, False], "gst_percent": [0, 5, 12, 18, 28]},
+        "identity": ["product_name", "brand"],
+        "tax": ["gst_percent", "hsn_code", "is_gst_exempt"],
+        "filter_cols": ["brand", "category", "unit", "gst_percent", "is_active"],
+    },
+    "Frame Stock / Barcodes": {
+        "table": "inventory_stock",
+        "pk": "id",
+        "fixed_filter_sql": (
+            "product_id IN ("
+            "SELECT id FROM products "
+            "WHERE LOWER(COALESCE(main_group::text,'')) LIKE '%frame%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%frame%' "
+            "OR LOWER(COALESCE(main_group::text,'')) LIKE '%sunglass%' "
+            "OR LOWER(COALESCE(category::text,'')) LIKE '%sunglass%'"
+            ")"
+        ),
+        "search": ["barcode", "product_barcode", "item_code", "batch_no", "location", "bin_no", "model"],
+        "default_cols": [
+            "product_id", "barcode", "product_barcode", "item_code", "batch_no",
+            "quantity", "mrp", "selling_price", "location", "bin_no", "model",
+            "colour", "shape", "frame_type",
+        ],
+        "editable": [
+            "barcode", "product_barcode", "item_code", "batch_no",
+            "mrp", "selling_price", "purchase_rate", "purchase_price",
+            "quantity", "allocated_qty", "reserved_qty", "location", "bin_no",
+            "model", "colour", "shape", "size_a", "size_b", "dbl", "temple_length",
+            "frame_type", "gender", "is_active",
+        ],
+        "dropdowns": {"is_active": [True, False]},
+        "identity": ["barcode", "product_barcode", "item_code", "batch_no"],
+        "tax": [],
+        "labels": {
+            "item_code": "Scan Code / Item Code",
+            "batch_no": "Batch No",
+            "barcode": "Barcode",
+            "product_barcode": "Product Barcode",
+        },
+        "help": {
+            "item_code": "FOR SCANNING: universal code used by Retail/Wholesale/Bulk punching and stock search.",
+            "batch_no": "NOT FOR SCANNING. Use only true batch/lot number where applicable.",
+        },
+        "scan_note": "Scanning rule: Scan Code / Item Code = inventory_stock.item_code. Batch No is not used for frame scanning.",
+    },
+    "Inventory / Stock": {
+        "table": "inventory_stock",
+        "pk": "id",
+        "search": ["barcode", "product_barcode", "item_code", "batch_no", "location", "bin_no", "model"],
+        "default_cols": [
+            "product_id", "barcode", "product_barcode", "item_code", "batch_no",
+            "quantity", "mrp", "selling_price", "location", "bin_no", "model",
+        ],
+        "editable": [
+            "barcode", "product_barcode", "item_code", "batch_no", "expiry_date",
+            "mrp", "selling_price", "purchase_rate", "purchase_price",
+            "quantity", "allocated_qty", "reserved_qty", "location", "bin_no",
+            "model", "colour", "shape", "size_a", "size_b", "dbl", "temple_length",
+            "frame_type", "gender", "is_active",
+        ],
+        "dropdowns": {"is_active": [True, False]},
+        "identity": ["barcode", "product_barcode", "item_code", "batch_no"],
+        "tax": [],
+        "labels": {
+            "item_code": "Scan Code / Item Code",
+            "batch_no": "Batch No",
+            "barcode": "Barcode",
+            "product_barcode": "Product Barcode",
+        },
+        "help": {
+            "item_code": "FOR SCANNING: universal code used by Retail/Wholesale/Bulk punching and stock search.",
+            "batch_no": "NOT FOR SCANNING. Use for batch/lot/expiry only, especially contact lenses and solutions.",
+        },
+        "scan_note": "Scanning rule: enter scanner-readable item codes in inventory_stock.item_code. Keep batch_no for real batch/lot numbers.",
+    },
+    "Service Master": {
+        "table": "service_types",
+        "pk": "id",
+        "search": ["service_code", "service_group", "service_name"],
+        "default_cols": [
+            "service_code", "service_group", "service_name",
+            "retail_price", "wholesale_price", "gst_percent",
+            "production_route", "is_active",
+        ],
+        "editable": [
+            "service_code", "service_group", "service_name",
+            "retail_price", "wholesale_price", "gst_percent",
+            "production_route", "sort_order", "is_active", "notes",
+        ],
+        "dropdowns": {
+            "service_group":    ["COURIER","FITTING","COLOURING","CONSULTATION","EYE_TESTING","MISC","OTHER"],
+            "production_route": ["", "FITTING", "COLOURING"],
+            "gst_percent":      [0, 5, 12, 18, 28],
+            "is_active":        [True, False],
+        },
+        "identity": ["service_name"],
+        "tax": ["gst_percent"],
+    },
+}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RAW DB
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,7 +383,7 @@ GST_RATES = ["0","5","12","18","28"]
 def _q(sql, params=None):
     try:
         from modules.sql_adapter import run_query
-        return run_query(sql, params or {}) or []
+        return run_query(sql, params) or []
     except Exception as e:
         logger.error(f"[CRM:q] {e}")
         return []
@@ -64,7 +392,7 @@ def _w(sql, params=None):
     """Returns None on success, error string on failure."""
     try:
         from modules.sql_adapter import run_write
-        run_write(sql, params or {})
+        run_write(sql, params)
         return None
     except Exception as e:
         logger.error(f"[CRM:w] {e}")
@@ -76,37 +404,40 @@ def _w(sql, params=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bootstrap():
-    # Re-run if tables are missing even if session says we already booted
-    if st.session_state.get("_crm_boot3"):
-        # Quick sanity check — if crm_leads is missing, clear the boot flag so we re-run
-        try:
-            from modules.sql_adapter import run_query as _rqb
-            _rqb("SELECT 1 FROM crm_leads LIMIT 0", {})
-        except Exception:
-            st.session_state.pop("_crm_boot3", None)
-            _bust()
     if st.session_state.get("_crm_boot3"):
         return
-    ddls = [
-        # Extended parties columns (ALTER — safe if column already exists)
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS gstin          VARCHAR(15)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS pan_no         VARCHAR(10)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS tan_no         VARCHAR(10)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS cin_no         VARCHAR(21)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS gst_rate       NUMERIC(5,2) DEFAULT 0",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS state_code     VARCHAR(2)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS state_name     VARCHAR(80)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS pincode        VARCHAR(6)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS email          VARCHAR(120)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS alt_mobile     VARCHAR(15)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS contact_person VARCHAR(100)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS credit_limit   NUMERIC(12,2) DEFAULT 0",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS credit_days    INTEGER DEFAULT 0",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS opening_balance NUMERIC(12,2) DEFAULT 0",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS balance_type   VARCHAR(10) DEFAULT 'Dr'",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS tally_group    VARCHAR(80)",
-        "ALTER TABLE parties ADD COLUMN IF NOT EXISTS notes          TEXT",
-        # CRM tables
+
+    required_party_cols = {
+        "gstin": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS gstin VARCHAR(15)",
+        "pan_no": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS pan_no VARCHAR(10)",
+        "tan_no": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS tan_no VARCHAR(10)",
+        "cin_no": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS cin_no VARCHAR(21)",
+        "gst_rate": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS gst_rate NUMERIC(5,2) DEFAULT 0",
+        "state_code": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS state_code VARCHAR(2)",
+        "state_name": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS state_name VARCHAR(80)",
+        "pincode": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS pincode VARCHAR(6)",
+        "email": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS email VARCHAR(120)",
+        "alt_mobile": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS alt_mobile VARCHAR(15)",
+        "contact_person": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS contact_person VARCHAR(100)",
+        "credit_limit": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(12,2) DEFAULT 0",
+        "credit_days": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS credit_days INTEGER DEFAULT 0",
+        "opening_balance": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS opening_balance NUMERIC(12,2) DEFAULT 0",
+        "balance_type": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS balance_type VARCHAR(10) DEFAULT 'Dr'",
+        "tally_group": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS tally_group VARCHAR(80)",
+        "notes": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS notes TEXT",
+        "preferred_courier_provider_id": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS preferred_courier_provider_id UUID",
+        "preferred_courier_name": "ALTER TABLE parties ADD COLUMN IF NOT EXISTS preferred_courier_name TEXT",
+    }
+    existing = {
+        r.get("column_name")
+        for r in _q(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='parties'",
+            {},
+        )
+    }
+    ddls = [ddl for col, ddl in required_party_cols.items() if col not in existing]
+    ddls += [
         """CREATE TABLE IF NOT EXISTS crm_leads (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             party_id UUID, lead_source VARCHAR(80), stage VARCHAR(40) DEFAULT 'NEW',
@@ -227,8 +558,710 @@ def fetch_touchpoints(pid):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAVE PARTY — writes is_active (boolean), NEVER status
+# ADMIN DB REVIEW / BULK EDIT
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _db_columns(table: str) -> List[Dict]:
+    return _cached(f"dbcols_{table}", lambda: _q("""
+            SELECT column_name, data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%(t)s
+            ORDER BY ordinal_position
+        """, {"t": table}))
+
+
+def _safe_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _coerce_editor_value(value, data_type: str):
+    if value is None:
+        return None
+    if isinstance(value, float) and str(value) == "nan":
+        return None
+    text = str(value)
+    if text.strip() == "":
+        return None
+    dt = str(data_type or "").lower()
+    if "bool" in dt:
+        if isinstance(value, bool):
+            return value
+        return text.strip().lower() in ("true", "1", "yes", "y", "active")
+    if any(k in dt for k in ("integer", "numeric", "double", "real")):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    return value
+
+
+def _admin_col_expr(cfg: Dict, col: str) -> str:
+    display_exprs = cfg.get("display_exprs") or {}
+    if col in display_exprs:
+        return str(display_exprs[col])
+    return _safe_ident(col)
+
+
+def _admin_db_distinct_values(cfg: Dict, col: str, limit: int = 200) -> List[str]:
+    table = cfg["table"]
+    expr = _admin_col_expr(cfg, col)
+    where = []
+    fixed_filter = (cfg.get("fixed_filter_sql") or "").strip()
+    if fixed_filter:
+        where.append(fixed_filter.replace("%", "%%"))
+    sql = f"SELECT DISTINCT {expr}::text AS v FROM {_safe_ident(table)}"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY 1 NULLS LAST LIMIT {int(limit or 200)}"
+    return [str(r.get("v") or "") for r in (_q(sql, {}) or []) if str(r.get("v") or "").strip()]
+
+
+def _admin_db_fetch_rows(cfg: Dict, columns: List[str], search: str, limit: int, filters: Dict = None) -> List[Dict]:
+    table = cfg["table"]
+    pk = cfg["pk"]
+    display_exprs = cfg.get("display_exprs") or {}
+    real_cols = {r["column_name"] for r in _db_columns(table)}
+    select_cols = [pk] + [c for c in columns if c != pk]
+    select_bits = []
+    for col in select_cols:
+        if col in display_exprs:
+            select_bits.append(f"{display_exprs[col]} AS {_safe_ident(col)}")
+        elif col in real_cols:
+            select_bits.append(_safe_ident(col))
+    sql = "SELECT " + ", ".join(select_bits) + f" FROM {_safe_ident(table)}"
+    params = {"lim": int(limit or 50)}
+    where = []
+    fixed_filter = (cfg.get("fixed_filter_sql") or "").strip()
+    if fixed_filter:
+        where.append(fixed_filter.replace("%", "%%"))
+    if search.strip():
+        params["s"] = f"%{search.strip().lower()}%"
+        search_cols = [c for c in cfg.get("search", []) if c in real_cols or c in display_exprs]
+        if search_cols:
+            where.append("(" + " OR ".join(f"LOWER(COALESCE({_admin_col_expr(cfg, c)}::text,'')) LIKE %(s)s" for c in search_cols) + ")")
+    for i, (col, spec) in enumerate((filters or {}).items()):
+        mode = "exact"
+        val = spec
+        if isinstance(spec, dict):
+            val = spec.get("value")
+            mode = spec.get("mode") or "exact"
+        if not str(val or "").strip():
+            continue
+        key = f"f{i}"
+        params[key] = f"%{str(val).lower()}%" if mode == "contains" else str(val)
+        if mode == "contains":
+            where.append(f"LOWER(COALESCE({_admin_col_expr(cfg, col)}::text,'')) LIKE %({key})s")
+        else:
+            where.append(f"COALESCE({_admin_col_expr(cfg, col)}::text,'') = %({key})s")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    order_col = next((c for c in cfg.get("default_cols", []) if c in select_cols and c not in display_exprs), pk)
+    sql += f" ORDER BY {_safe_ident(order_col)} NULLS LAST LIMIT %(lim)s"
+    return _q(sql, params)
+
+
+def _ensure_audit_log():
+    """Create crm_audit_log table if not exists — idempotent."""
+    if st.session_state.get("_crm_audit_log_ready"):
+        return
+    _w("""
+        CREATE TABLE IF NOT EXISTS crm_audit_log (
+            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            changed_at  TIMESTAMPTZ DEFAULT NOW(),
+            changed_by  TEXT DEFAULT 'admin',
+            action      TEXT NOT NULL,          -- UPDATE / INSERT
+            tbl         TEXT NOT NULL,
+            row_id      TEXT,
+            col_name    TEXT,
+            old_value   TEXT,
+            new_value   TEXT,
+            entity_name TEXT                    -- human-readable label e.g. party_name
+        )
+    """)
+    _w("CREATE INDEX IF NOT EXISTS idx_cal_tbl_row ON crm_audit_log(tbl, row_id, changed_at DESC)")
+    _w("CREATE INDEX IF NOT EXISTS idx_cal_changed  ON crm_audit_log(changed_at DESC)")
+    st.session_state["_crm_audit_log_ready"] = True
+
+
+def _write_audit_log(action: str, table: str, row_id: str,
+                     changes: Dict, old_values: Dict = None,
+                     entity_name: str = "", changed_by: str = "admin") -> None:
+    """Write one audit log row per changed column."""
+    try:
+        _ensure_audit_log()
+        for col, new_val in changes.items():
+            old_val = (old_values or {}).get(col)
+            if str(old_val or "") == str(new_val or ""):
+                continue  # skip unchanged
+            _w("""
+                INSERT INTO crm_audit_log
+                    (action, tbl, row_id, col_name, old_value, new_value, entity_name, changed_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (action, table, str(row_id), col,
+                  str(old_val) if old_val is not None else None,
+                  str(new_val) if new_val is not None else None,
+                  entity_name or "", changed_by))
+    except Exception as e:
+        pass  # audit log failure must never block the actual save
+
+
+def _fetch_audit_log(table: str = None, row_id: str = None,
+                     limit: int = 100) -> List[Dict]:
+    where, params = [], []
+    if table:
+        where.append("tbl = %s"); params.append(table)
+    if row_id:
+        where.append("row_id = %s"); params.append(row_id)
+    sql = "SELECT * FROM crm_audit_log"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY changed_at DESC LIMIT %s"
+    params.append(limit)
+    return _q(sql, params) or []
+
+
+def _revert_audit_entry(log_id: str) -> Optional[str]:
+    """Revert a single audit log entry by restoring old_value."""
+    rows = _q("SELECT * FROM crm_audit_log WHERE id = %s::uuid", (log_id,))
+    if not rows:
+        return "Log entry not found."
+    r = rows[0]
+    if r.get("action") == "INSERT":
+        return "Insert revert not supported — deactivate the row instead."
+    if r.get("old_value") is None:
+        return "No previous value recorded — cannot revert."
+    try:
+        col_types = {r["col_name"]: "text"}
+        err = _admin_db_update_row(
+            str(r["tbl"]), "id", str(r["row_id"]),
+            {str(r["col_name"]): r["old_value"]}, col_types
+        )
+        if err:
+            return str(err)
+        # Log the revert itself
+        _write_audit_log(
+            "REVERT", str(r["tbl"]), str(r["row_id"]),
+            {str(r["col_name"]): r["old_value"]},
+            {str(r["col_name"]): r["new_value"]},
+            entity_name=str(r.get("entity_name") or ""),
+            changed_by="admin (revert)"
+        )
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def _admin_db_update_row(table: str, pk: str, row_id, changes: Dict, col_types: Dict,
+                          old_values: Dict = None, entity_name: str = "") -> Optional[str]:
+    if not changes:
+        return None
+    sets = []
+    params = {"id": row_id}
+    for i, (col, value) in enumerate(changes.items()):
+        key = f"v{i}"
+        sets.append(f"{_safe_ident(col)}=%({key})s")
+        params[key] = _coerce_editor_value(value, col_types.get(col, "text"))
+    sql = f"UPDATE {_safe_ident(table)} SET " + ", ".join(sets)
+    if "updated_at" in col_types and "updated_at" not in changes:
+        sql += ", updated_at=NOW()"
+    sql += f" WHERE {_safe_ident(pk)}=%(id)s::uuid"
+    err = _w(sql, params)
+    if not err:
+        _write_audit_log("UPDATE", table, str(row_id), changes,
+                         old_values or {}, entity_name)
+    return err
+
+
+def _admin_db_insert_row(table: str, values: Dict, col_types: Dict,
+                          entity_name: str = "") -> Optional[str]:
+    clean = {
+        k: v for k, v in (values or {}).items()
+        if k in col_types and str(v or "").strip() != ""
+    }
+    if not clean:
+        return "No values entered for new row."
+    if "id" in col_types and not clean.get("id"):
+        clean["id"] = str(uuid.uuid4())
+    row_id = clean.get("id", "new")
+    cols = list(clean.keys())
+    params = {}
+    placeholders = []
+    for i, col in enumerate(cols):
+        key = f"v{i}"
+        params[key] = _coerce_editor_value(clean[col], col_types.get(col, "text"))
+        placeholders.append(f"%({key})s" + ("::uuid" if col == "id" else ""))
+    sql = (
+        f"INSERT INTO {_safe_ident(table)} ("
+        + ", ".join(_safe_ident(c) for c in cols)
+        + ") VALUES ("
+        + ", ".join(placeholders)
+        + ")"
+    )
+    err = _w(sql, params)
+    if not err:
+        _write_audit_log("INSERT", table, str(row_id), clean, {}, entity_name)
+    return err
+
+
+def _table_columns_set(table: str) -> set:
+    return {r["column_name"] for r in _db_columns(table)}
+
+
+def _cascade_party_name(row_id: str, old_name: str, new_name: str) -> Dict:
+    """Optional historical rename for party/customer display names."""
+    result = {"updated": 0, "errors": []}
+    if not row_id or not old_name or old_name == new_name:
+        return result
+    updates = [
+        ("orders", "party_name", "party_id"),
+        ("orders", "customer_name", "party_id"),
+        ("challans", "party_name", "party_id"),
+        ("invoices", "party_name", "party_id"),
+        ("payments", "party_name", "party_id"),
+        ("party_ledger", "party_name", "party_id"),
+    ]
+    for table, name_col, id_col in updates:
+        try:
+            cols = _table_columns_set(table)
+            if name_col not in cols or id_col not in cols:
+                continue
+            _w(
+                f"UPDATE {_safe_ident(table)} SET {_safe_ident(name_col)}=%(new)s "
+                f"WHERE {_safe_ident(id_col)}=%(id)s::uuid",
+                {"new": new_name, "id": row_id},
+            )
+            result["updated"] += 1
+        except Exception:
+            result["errors"].append(table)
+    return result
+
+
+def _render_admin_db_editor():
+    st.markdown("### 🧠 Admin DB Review / Bulk Edit")
+    st.caption("Practical correction desk for masters. Search, tick rows, bulk-set one column, add missing master rows, and protect GST/legal history.")
+
+    entity = st.selectbox("Reference", list(ADMIN_DB_ENTITIES.keys()), key="crm_db_entity")
+    cfg = ADMIN_DB_ENTITIES[entity]
+    table = cfg["table"]
+    pk = cfg["pk"]
+    fixed_filter = (cfg.get("fixed_filter_sql") or "").strip()
+    db_cols = _db_columns(table)
+
+    # ── Table not found — try fallback names ──────────────────────────────────
+    if not db_cols:
+        fallbacks = {"inventory_stock": ["product_stock","blank_inventory","stock_items"]}
+        for alt in fallbacks.get(table, []):
+            db_cols = _db_columns(alt)
+            if db_cols:
+                table = alt
+                break
+    if not db_cols:
+        st.error(f"Table `{table}` not found in DB. Check that this module's schema has been migrated.")
+        st.caption("Tables tried: " + table + " + fallbacks")
+        return
+
+    col_types = {r["column_name"]: r["data_type"] for r in db_cols}
+    all_cols = [r["column_name"] for r in db_cols]
+    display_exprs = cfg.get("display_exprs") or {}
+    display_cols = list(display_exprs.keys())
+    real_editable_cols = [c for c in cfg.get("editable", []) if c in all_cols and c != pk]
+    editable_cols = display_cols + real_editable_cols
+    default_cols = [c for c in cfg.get("default_cols", []) if c in editable_cols]
+    help_map = cfg.get("help", {})
+    label_map = cfg.get("labels", {})
+
+    t1, t2 = st.columns([3, 1])
+    search = t1.text_input(
+        "🔍 Search / jump",
+        key=f"crm_db_search_{table}",
+        placeholder="party name, mobile, GSTIN, product, barcode, SKU, doc preference…",
+    )
+    limit = t2.number_input("Rows", min_value=5, max_value=500, value=50, step=25, key=f"crm_db_limit_{table}")
+
+    if fixed_filter:
+        st.caption(f"Filtered view: showing only {entity}")
+    if cfg.get("scan_note"):
+        st.info(cfg["scan_note"])
+
+    c1, c2 = st.columns([3, 1])
+    show_all_cols = c2.checkbox(
+        "Show all",
+        value=False,
+        key=f"crm_db_show_all_{table}_{entity}",
+        help="Show all editable columns without opening the column dropdown.",
+    )
+    chosen_cols = c1.multiselect(
+        "Columns to show / edit",
+        editable_cols,
+        default=editable_cols if show_all_cols else (default_cols or editable_cols[:8]),
+        key=f"crm_db_cols_{table}",
+        format_func=lambda c: label_map.get(c, c),
+        help="Select which columns to display and edit in the grid below.",
+    )
+    quick_col_text = c2.text_input(
+        "Quick-add column",
+        value="",
+        key=f"crm_db_quick_col_{table}_{entity}",
+        placeholder="type column name",
+        help="Type a column name or part of it. This avoids long dropdown collapse.",
+    )
+    quick_col = ""
+    if quick_col_text.strip():
+        q = quick_col_text.strip().lower()
+        quick_col = next((c for c in editable_cols if c.lower() == q or label_map.get(c, "").lower() == q), "")
+        if not quick_col:
+            matches = [c for c in editable_cols if q in c.lower() or q in label_map.get(c, "").lower()]
+            if len(matches) == 1:
+                quick_col = matches[0]
+            elif matches:
+                st.caption("Matches: " + ", ".join(label_map.get(m, m) for m in matches[:12]))
+    if quick_col and quick_col not in chosen_cols:
+        chosen_cols = chosen_cols + [quick_col]
+
+    filter_cols = [c for c in cfg.get("filter_cols", []) if c in editable_cols]
+    active_filters = {}
+    if filter_cols:
+        with st.expander("🔎 Excel-style filters", expanded=True):
+            fcols = st.columns(min(4, max(1, len(filter_cols))))
+            for i, fcol in enumerate(filter_cols):
+                vals = _admin_db_distinct_values(cfg, fcol)
+                if len(vals) <= 80:
+                    picked = fcols[i % len(fcols)].selectbox(
+                        fcol,
+                        [""] + vals,
+                        key=f"crm_db_filter_{table}_{entity}_{fcol}",
+                    )
+                else:
+                    picked = fcols[i % len(fcols)].text_input(
+                        f"{fcol} contains",
+                        key=f"crm_db_filter_{table}_{entity}_{fcol}",
+                    )
+                if picked:
+                    active_filters[fcol] = {"value": picked, "mode": "exact" if len(vals) <= 80 else "contains"}
+
+    # Column help tooltips
+    if help_map and chosen_cols:
+        tips = {c: v for c, v in help_map.items() if c in chosen_cols}
+        if tips:
+            with st.expander("💡 Column hints", expanded=False):
+                for col, tip in tips.items():
+                    st.caption(f"`{col}` — {tip}")
+
+    with st.expander("📋 All DB columns for this table", expanded=False):
+        st.dataframe(
+            [{"column": r["column_name"], "type": r["data_type"],
+              "nullable": r.get("is_nullable",""), "default": r.get("column_default","")}
+             for r in db_cols],
+            use_container_width=True, hide_index=True,
+        )
+
+    with st.expander("➕ Add new master row", expanded=False):
+        st.warning("Add only true master data — parties, products, services. Transactions belong in their own screens.")
+        add_cols = st.multiselect(
+            "Fields for new row",
+            real_editable_cols,
+            default=[c for c in default_cols if c in real_editable_cols][:8],
+            key=f"crm_db_add_cols_{table}_{entity}",
+        )
+        new_values = {}
+        if add_cols:
+            add_grid = st.columns(2)
+            for i, col in enumerate(add_cols):
+                opts = cfg.get("dropdowns", {}).get(col)
+                tip  = help_map.get(col, "")
+                label = f"{col} — {tip}" if tip else col
+                if opts:
+                    new_values[col] = add_grid[i % 2].selectbox(label, opts, key=f"crm_db_new_{table}_{entity}_{col}")
+                else:
+                    new_values[col] = add_grid[i % 2].text_input(label, key=f"crm_db_new_{table}_{entity}_{col}")
+        add_confirm = st.checkbox(
+            "I confirm this new master row is required",
+            key=f"crm_db_add_confirm_{table}_{entity}",
+        )
+        if st.button("➕ Save New Master Row", key=f"crm_db_add_btn_{table}_{entity}", use_container_width=True):
+            if not add_confirm:
+                st.error("Tick confirmation before adding a master row.")
+            else:
+                err = _admin_db_insert_row(table, new_values, col_types)
+                if err:
+                    st.error(err)
+                else:
+                    st.success("New master row saved.")
+                    _bust()
+                    st.rerun()
+
+    if not chosen_cols:
+        st.info("Select at least one column.")
+        return
+    rows = _admin_db_fetch_rows(cfg, chosen_cols, search, int(limit), active_filters)
+    if not rows:
+        st.info("No matching rows. Try a different search term or increase Rows limit.")
+        return
+
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    display_cols = [pk] + [c for c in chosen_cols if c in df.columns]
+    df = df[display_cols]
+    df.insert(0, "Apply", False)
+
+    column_config = {
+        "Apply": st.column_config.CheckboxColumn("✅", help="Tick rows for bulk-set."),
+        pk: st.column_config.TextColumn(pk, disabled=True),
+    }
+    for col in display_cols:
+        if col in df.columns:
+            column_config[col] = st.column_config.TextColumn(label_map.get(col, col), disabled=True)
+    for col, options in cfg.get("dropdowns", {}).items():
+        if col in df.columns:
+            column_config[col] = st.column_config.SelectboxColumn(
+                label_map.get(col, col), options=options, help=help_map.get(col, ""))
+    for col in df.columns:
+        if col not in column_config and col != "Apply":
+            column_config[col] = st.column_config.TextColumn(label_map.get(col, col), help=help_map.get(col, ""))
+
+    risky_cols    = [c for c in chosen_cols if c in cfg.get("tax", [])]
+    identity_cols = [c for c in chosen_cols if c in cfg.get("identity", [])]
+
+    if risky_cols:
+        st.error(
+            f"🔴 TAX / GST / COMPLIANCE FIELDS SELECTED: {', '.join(risky_cols)}\n\n"
+            "Changing these can break GST filing, GSTR reports, portal-matched documents "
+            "and old statutory records. Changes apply to the master row only — "
+            "old documents are NOT updated automatically."
+        )
+    if identity_cols:
+        st.warning(
+            f"⚠️ Identity fields selected: {', '.join(identity_cols)}. "
+            "Use cascade option below only for spelling correction of the same entity."
+        )
+
+    with st.expander("⚡ Bulk fill — set one column for all ticked rows", expanded=True):
+        b1, b2 = st.columns([1, 2])
+        bulk_col = b1.selectbox(
+            "Column to bulk-set",
+            [""] + [c for c in chosen_cols if c in real_editable_cols],
+            key=f"crm_db_bulk_col_{table}_{entity}",
+            help="Choose a column then set the value. Applies to all ticked rows.",
+        )
+        bulk_value = ""
+        if bulk_col:
+            opts = cfg.get("dropdowns", {}).get(bulk_col)
+            tip  = help_map.get(bulk_col, "")
+            if opts:
+                bulk_value = b2.selectbox(
+                    f"Value{' — ' + tip if tip else ''}",
+                    opts, key=f"crm_db_bulk_val_sel_{table}_{entity}_{bulk_col}")
+            else:
+                bulk_value = b2.text_input(
+                    f"Value{' — ' + tip if tip else ''}",
+                    key=f"crm_db_bulk_val_txt_{table}_{entity}_{bulk_col}")
+        st.caption("Example: tick wholesale parties → set `doc_preference` = C → bulk-set.")
+
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key=f"crm_db_editor_{table}_{'_'.join(chosen_cols)}",
+        column_config=column_config,
+    )
+
+    # ── Excel export of current view ──────────────────────────────────────────
+    _excel_download(
+        rows,
+        filename=f"{entity.replace(' ','_').replace('/','_')}_{search or 'all'}.xlsx",
+        label=f"⬇ Export {len(rows)} rows to Excel",
+    )
+
+    cascade_names = False
+    if table == "parties" and "party_name" in chosen_cols:
+        cascade_names = st.checkbox(
+            "Also update old orders/challans/invoices/payments/party ledger with changed party name",
+            value=False,
+            key="crm_db_cascade_party_name",
+            help="Use only for spelling correction of same party. Do not use for GST/legal entity change.",
+        )
+        st.error(
+            "🔴 If GSTIN/legal entity changed, do NOT cascade old documents. Old GST documents should remain exactly as filed."
+        )
+
+    confirm = st.checkbox(
+        "I understand the impact and want to save these DB changes",
+        key=f"crm_db_confirm_{table}_{entity}",
+    )
+
+    a1, a2 = st.columns(2)
+    if a1.button("⚡ Bulk Set Ticked Rows", use_container_width=True, key=f"crm_db_bulk_save_{table}_{entity}"):
+        if not confirm:
+            st.error("Tick confirmation before saving.")
+            return
+        if not bulk_col:
+            st.error("Choose a column to bulk-set.")
+            return
+        if bulk_col in cfg.get("tax", []):
+            st.error("🔴 GST/tax/legal fields are blocked from bulk-set. Edit one row at a time after review.")
+            return
+        selected = [r for r in edited.to_dict("records") if bool(r.get("Apply"))]
+        if not selected:
+            st.error("Tick at least one row in the Apply column.")
+            return
+        saved = 0
+        errors = []
+        old_by_id = {str(r[pk]): r for r in rows}
+        for rec in selected:
+            row_id = str(rec.get(pk) or "")
+            old = old_by_id.get(row_id, {})
+            e_name = str(old.get(cfg["identity"][0], row_id)) if cfg.get("identity") else row_id
+            err = _admin_db_update_row(table, pk, row_id, {bulk_col: bulk_value},
+                                        col_types, old, e_name)
+            if err:
+                errors.append(f"{row_id}: {err}")
+            else:
+                saved += 1
+        for e in errors[:10]:
+            st.error(e)
+        if saved:
+            st.success(f"Bulk-updated {saved} row(s). Changes logged to Audit Log.")
+            _bust()
+            st.rerun()
+
+    if a2.button("💾 Save Edited Cells", type="primary", use_container_width=True, key=f"crm_db_save_{table}_{entity}"):
+        if not confirm:
+            st.error("Tick confirmation before saving.")
+            return
+        old_by_id = {str(r[pk]): r for r in rows}
+        saved = 0
+        errors = []
+        for rec in edited.to_dict("records"):
+            row_id = str(rec.get(pk) or "")
+            old = old_by_id.get(row_id) or {}
+            e_name = str(old.get(cfg["identity"][0], row_id)) if cfg.get("identity") else row_id
+            changes = {}
+            for col in chosen_cols:
+                if col == "Apply":
+                    continue
+                if col not in real_editable_cols:
+                    continue
+                if col not in rec:
+                    continue
+                old_val = old.get(col)
+                new_val = rec.get(col)
+                if str(old_val or "") != str(new_val or ""):
+                    changes[col] = new_val
+            if not changes:
+                continue
+            err = _admin_db_update_row(table, pk, row_id, changes, col_types, old, e_name)
+            if err:
+                errors.append(f"{row_id}: {err}")
+                continue
+            if table == "parties" and cascade_names and "party_name" in changes:
+                cascade = _cascade_party_name(row_id, str(old.get("party_name") or ""), str(changes.get("party_name") or ""))
+                if cascade.get("errors"):
+                    st.warning(f"Party name saved, but cascade skipped/failed in: {', '.join(cascade['errors'])}")
+            saved += 1
+        if errors:
+            for e in errors[:10]:
+                st.error(e)
+        if saved:
+            st.success(f"Saved {saved} row(s). Changes logged to Audit Log.")
+            _bust()
+            st.rerun()
+
+    st.markdown("---")
+
+    # ── Audit Log ─────────────────────────────────────────────────────────────
+    with st.expander("🕐 Audit Log — recent changes to this table", expanded=False):
+        _ensure_audit_log()
+        log_rows = _fetch_audit_log(table=table, limit=50)
+        if not log_rows:
+            st.caption("No changes recorded yet for this table.")
+        else:
+            import pandas as pd
+            log_df = pd.DataFrame(log_rows)[[
+                "changed_at","action","entity_name","col_name",
+                "old_value","new_value","changed_by"
+            ]]
+            log_df["changed_at"] = log_df["changed_at"].astype(str).str[:16]
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
+            _excel_download(log_rows, f"audit_{table}.xlsx", "⬇ Export Audit Log")
+
+            st.markdown("**↩ Revert a change**")
+            revert_id = st.text_input(
+                "Paste log entry ID to revert",
+                key=f"revert_id_{table}",
+                placeholder="UUID from audit log id column",
+                help="Opens the row ID from the audit log and restores old_value"
+            )
+            if st.button("↩ Revert this change", key=f"revert_btn_{table}",
+                         type="secondary", disabled=not revert_id.strip()):
+                err = _revert_audit_entry(revert_id.strip())
+                if err:
+                    st.error(f"Revert failed: {err}")
+                else:
+                    st.success("✅ Value restored to previous. Check table above.")
+                    _bust()
+                    st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STANDALONE AUDIT LOG TAB (shown as separate CRM tab)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tab_audit_log():
+    st.markdown("### 🕐 Change Audit Log")
+    st.caption("Every add / edit made through Admin DB Editor is recorded here. Revert any single change.")
+
+    _ensure_audit_log()
+
+    f1, f2, f3 = st.columns([2, 2, 1])
+    tbl_filter = f1.selectbox(
+        "Table", ["All"] + sorted({cfg["table"] for cfg in ADMIN_DB_ENTITIES.values()}),
+        key="al_tbl"
+    )
+    action_filter = f2.selectbox("Action", ["All", "UPDATE", "INSERT", "REVERT"], key="al_action")
+    limit = f3.number_input("Rows", 20, 500, 100, 20, key="al_limit")
+
+    tbl = None if tbl_filter == "All" else tbl_filter
+    log_rows = _fetch_audit_log(table=tbl, limit=int(limit))
+
+    if action_filter != "All":
+        log_rows = [r for r in log_rows if r.get("action") == action_filter]
+
+    if not log_rows:
+        st.info("No changes recorded yet.")
+        return
+
+    import pandas as pd
+    log_df = pd.DataFrame(log_rows)
+    show_cols = [c for c in [
+        "changed_at","action","tbl","entity_name","col_name",
+        "old_value","new_value","changed_by","id"
+    ] if c in log_df.columns]
+    log_df["changed_at"] = log_df["changed_at"].astype(str).str[:16]
+    st.dataframe(log_df[show_cols], use_container_width=True, hide_index=True)
+
+    ec1, ec2 = st.columns([3, 1])
+    with ec2:
+        _excel_download(log_rows, "crm_audit_log.xlsx", "⬇ Export")
+
+    st.markdown("---")
+    st.markdown("**↩ Revert a single change**")
+    st.caption("Copy the `id` (UUID) from the log above and paste below.")
+
+    rc1, rc2 = st.columns([3, 1])
+    revert_id = rc1.text_input(
+        "Log entry ID",
+        key="al_revert_id",
+        placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    )
+    if rc2.button("↩ Revert", type="primary", key="al_revert_btn",
+                  disabled=not revert_id.strip()):
+        err = _revert_audit_entry(revert_id.strip())
+        if err:
+            st.error(f"❌ {err}")
+        else:
+            st.success("✅ Value restored to previous state.")
+            st.rerun()
 
 def save_party(data: Dict):
     """
@@ -269,6 +1302,8 @@ def save_party(data: Dict):
         "notes":     (data.get("notes") or "").strip() or None,
         "is_active": is_active,
         "bp":        (data.get("billing_preference") or "CHALLAN").upper(),
+        "pcid":      (data.get("preferred_courier_provider_id") or "").strip() or None,
+        "pcname":    (data.get("preferred_courier_name") or "").strip() or None,
     }
 
     sql = """
@@ -278,14 +1313,16 @@ def save_party(data: Dict):
             state_name, state_code,
             gstin, pan_no, tan_no, cin_no, gst_rate,
             credit_limit, credit_days, opening_balance, balance_type,
-            tally_group, notes, is_active, billing_preference, created_at
+            tally_group, notes, is_active, billing_preference,
+            preferred_courier_provider_id, preferred_courier_name, created_at
         ) VALUES (
             %(pid)s, %(name)s, %(ptype)s, %(mobile)s, %(alt_mob)s, %(email)s,
             %(contact)s, %(address)s, %(city)s, %(area)s, %(pincode)s,
             %(state_name)s, %(state_code)s,
             %(gstin)s, %(pan_no)s, %(tan_no)s, %(cin_no)s, %(gst_rate)s,
             %(cl)s, %(cd)s, %(ob)s, %(bt)s,
-            %(tally_grp)s, %(notes)s, %(is_active)s, %(bp)s, NOW()
+            %(tally_grp)s, %(notes)s, %(is_active)s, %(bp)s,
+            NULLIF(%(pcid)s,'')::uuid, %(pcname)s, NOW()
         )
         ON CONFLICT (id) DO UPDATE SET
             party_name=%(name)s, party_type=%(ptype)s, mobile=%(mobile)s,
@@ -298,7 +1335,9 @@ def save_party(data: Dict):
             credit_limit=%(cl)s, credit_days=%(cd)s,
             opening_balance=%(ob)s, balance_type=%(bt)s,
             tally_group=%(tally_grp)s, notes=%(notes)s, is_active=%(is_active)s,
-            billing_preference=%(bp)s
+            billing_preference=%(bp)s,
+            preferred_courier_provider_id=NULLIF(%(pcid)s,'')::uuid,
+            preferred_courier_name=%(pcname)s
     """
     err = _w(sql, p)
     if err:
@@ -496,6 +1535,33 @@ def _party_form(key: str, existing: Dict = None, compact: bool = False):
                          "DIRECT_INVOICE: wholesale parties only — challan + invoice created in one step.",
                     key=f"billing_pref_{_k}",
                 )
+            try:
+                from modules.backoffice.service_master import fetch_providers
+                _couriers = fetch_providers("COURIER", active_only=True)
+            except Exception:
+                _couriers = []
+            _pc_ids = [""] + [str(c["id"]) for c in _couriers]
+            _pc_labels = ["— No preferred courier —"] + [
+                f"{c['provider_name']} · {'GST' if c.get('gst_registered') else 'Non-GST'}"
+                for c in _couriers
+            ]
+            _pc_cur = str(ex.get("preferred_courier_provider_id") or "")
+            _pc_idx = _pc_ids.index(_pc_cur) if _pc_cur in _pc_ids else 0
+            _pc_sel = st.selectbox(
+                "Preferred Courier",
+                range(len(_pc_labels)),
+                index=_pc_idx,
+                format_func=lambda i: _pc_labels[i],
+                help="Default courier shown in Dispatch. Staff can change it with warning.",
+                key=f"preferred_courier_{_k}",
+            )
+            preferred_courier_provider_id = _pc_ids[int(_pc_sel)]
+            preferred_courier_name = ""
+            if preferred_courier_provider_id:
+                preferred_courier_name = next(
+                    (c["provider_name"] for c in _couriers if str(c["id"]) == preferred_courier_provider_id),
+                    "",
+                )
             with bp2:
                 st.markdown(
                     "<div style='background:#0f172a;border:1px solid #1e293b;"
@@ -509,6 +1575,8 @@ def _party_form(key: str, existing: Dict = None, compact: bool = False):
                 )
         else:
             billing_pref = ex.get("billing_preference") or "CHALLAN"
+            preferred_courier_provider_id = ex.get("preferred_courier_provider_id") or ""
+            preferred_courier_name = ex.get("preferred_courier_name") or ""
 
         submitted = st.form_submit_button("💾 Save", type="primary", use_container_width=True)
 
@@ -540,6 +1608,8 @@ def _party_form(key: str, existing: Dict = None, compact: bool = False):
             "notes":          notes,
             "is_active":      is_active,
             "billing_preference": billing_pref,
+            "preferred_courier_provider_id": preferred_courier_provider_id,
+            "preferred_courier_name": preferred_courier_name,
         }
     return False, {}
 
@@ -656,6 +1726,180 @@ def _tab_suppliers():
 # TAB: PARTY MASTER
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _render_party_scheme_panel(party_id: str, party_name: str):
+    """Show and maintain Scheme Center assignments from the party side."""
+    rows = _q("""
+        SELECT
+            s.id::text AS scheme_id,
+            s.scheme_name,
+            COALESCE(s.scheme_scope,'SUPPLIER') AS scheme_scope,
+            COALESCE(s.supplier_name,'') AS supplier_name,
+            COALESCE(s.assignment_mode,'ALL_DEALERS') AS assignment_mode,
+            s.party_id::text AS direct_party_id,
+            s.starts_on::text AS starts_on,
+            s.ends_on::text AS ends_on,
+            COALESCE(s.active,TRUE) AS scheme_active,
+            COALESCE(a.active,FALSE) AS assigned,
+            (
+                SELECT COUNT(*)
+                FROM supplier_party_scheme_assignments ax
+                WHERE ax.scheme_id=s.id
+                  AND COALESCE(ax.active,TRUE)=TRUE
+            ) AS assigned_count
+        FROM supplier_party_schemes s
+        LEFT JOIN supplier_party_scheme_assignments a
+               ON a.scheme_id=s.id
+              AND a.party_id=%(pid)s::uuid
+        WHERE COALESCE(s.active,TRUE)=TRUE
+        ORDER BY s.ends_on DESC, s.scheme_name
+        LIMIT 100
+    """, {"pid": party_id})
+    if not rows:
+        st.caption("No schemes configured yet.")
+        return
+
+    selected_scheme_ids = []
+    st.caption("All-dealer schemes are included automatically. Dealer-specific ticks stay synchronized with Pricing & Discount Admin.")
+    for row in rows:
+        mode = (row.get("assignment_mode") or "ALL_DEALERS").upper()
+        assigned_count = int(row.get("assigned_count") or 0)
+        is_all_dealers = mode == "ALL_DEALERS" and not assigned_count and not row.get("direct_party_id")
+        direct_match = str(row.get("direct_party_id") or "") == str(party_id)
+        checked = bool(is_all_dealers or direct_match or row.get("assigned"))
+        disabled = bool(is_all_dealers)
+        label = (
+            f"{row.get('scheme_name')} · {row.get('scheme_scope')} · "
+            f"{row.get('supplier_name') or 'Any supplier'} · "
+            f"{row.get('starts_on')} to {row.get('ends_on')}"
+        )
+        val = st.checkbox(
+            label,
+            value=checked,
+            disabled=disabled,
+            key=f"crm_party_scheme_{party_id}_{row['scheme_id']}",
+        )
+        if val and not disabled:
+            selected_scheme_ids.append(row["scheme_id"])
+
+    if st.button("💾 Save scheme ticks", key=f"crm_party_scheme_save_{party_id}"):
+        try:
+            selected = set(selected_scheme_ids)
+            for row in rows:
+                sid = row["scheme_id"]
+                mode = (row.get("assignment_mode") or "ALL_DEALERS").upper()
+                assigned_count = int(row.get("assigned_count") or 0)
+                is_all_dealers = mode == "ALL_DEALERS" and not assigned_count and not row.get("direct_party_id")
+                if is_all_dealers:
+                    continue
+                if sid in selected:
+                    _w("""
+                        INSERT INTO supplier_party_scheme_assignments (
+                            scheme_id, party_id, party_name, starts_on, ends_on,
+                            active, assigned_source, assigned_by, assigned_at, notes
+                        ) VALUES (
+                            %(sid)s::uuid, %(pid)s::uuid, %(pname)s,
+                            %(st)s::date, %(en)s::date,
+                            TRUE, 'PARTY_MASTER', COALESCE(current_user,'system'), NOW(),
+                            'Saved from CRM Party Master'
+                        )
+                        ON CONFLICT (scheme_id, party_id) DO UPDATE
+                        SET party_name=EXCLUDED.party_name,
+                            starts_on=EXCLUDED.starts_on,
+                            ends_on=EXCLUDED.ends_on,
+                            active=TRUE,
+                            assigned_source='PARTY_MASTER',
+                            assigned_by=COALESCE(current_user,'system'),
+                            assigned_at=NOW()
+                    """, {
+                        "sid": sid,
+                        "pid": party_id,
+                        "pname": party_name,
+                        "st": row.get("starts_on"),
+                        "en": row.get("ends_on"),
+                    })
+                    _w("""
+                        UPDATE supplier_party_schemes
+                        SET assignment_mode='SELECTED_DEALERS',
+                            party_id=NULL,
+                            party_name='',
+                            updated_at=NOW()
+                        WHERE id=%(sid)s::uuid
+                          AND COALESCE(assignment_mode,'ALL_DEALERS') <> 'ALL_DEALERS'
+                    """, {"sid": sid})
+                else:
+                    _w("""
+                        UPDATE supplier_party_scheme_assignments
+                        SET active=FALSE,
+                            assigned_source='PARTY_MASTER',
+                            assigned_by=COALESCE(current_user,'system'),
+                            assigned_at=NOW()
+                        WHERE scheme_id=%(sid)s::uuid
+                          AND party_id=%(pid)s::uuid
+                    """, {"sid": sid, "pid": party_id})
+                    _w("""
+                        UPDATE supplier_party_schemes
+                        SET party_id=NULL,
+                            party_name='',
+                            assignment_mode='SELECTED_DEALERS',
+                            updated_at=NOW()
+                        WHERE id=%(sid)s::uuid
+                          AND party_id=%(pid)s::uuid
+                    """, {"sid": sid, "pid": party_id})
+            st.success("Scheme ticks saved for this party.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not save scheme ticks: {exc}")
+
+def _party_usage_counts(party_ids: list) -> dict:
+    """Return {party_id: {orders, challans, invoices}} for the given party ids."""
+    if not party_ids:
+        return {}
+    try:
+        id_list = list({str(x) for x in party_ids if x})
+        placeholders = ",".join(["%s::uuid"] * len(id_list))
+        rows = _q(f"""
+            SELECT p.party_id::text AS party_id,
+                   COUNT(DISTINCT o.id)  FILTER (WHERE o.id IS NOT NULL) AS orders,
+                   COUNT(DISTINCT ch.id) FILTER (WHERE ch.id IS NOT NULL) AS challans,
+                   COUNT(DISTINCT inv.id) FILTER (WHERE inv.id IS NOT NULL) AS invoices
+            FROM (SELECT unnest(ARRAY[{placeholders}]::uuid[]) AS party_id) p
+            LEFT JOIN orders   o   ON o.party_id   = p.party_id
+                                  AND COALESCE(o.is_deleted,FALSE) = FALSE
+            LEFT JOIN challans ch  ON ch.party_id  = p.party_id
+                                  AND COALESCE(ch.is_deleted,FALSE) = FALSE
+            LEFT JOIN invoices inv ON inv.party_id  = p.party_id
+                                  AND COALESCE(inv.is_deleted,FALSE) = FALSE
+            GROUP BY p.party_id
+        """, id_list) or []
+        return {r["party_id"]: r for r in rows}
+    except Exception:
+        return {}
+
+
+def _excel_download(data: list, filename: str, label: str = "⬇ Download Excel"):
+    """Render a Streamlit download button that exports data as Excel."""
+    if not data:
+        return
+    try:
+        import io
+        import pandas as pd
+        buf = io.BytesIO()
+        pd.DataFrame(data).to_excel(buf, index=False, engine="openpyxl")
+        buf.seek(0)
+        st.download_button(
+            label=label,
+            data=buf.getvalue(),
+            file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"xl_dl_{filename}_{len(data)}",
+        )
+    except ImportError:
+        st.caption("Install openpyxl for Excel export: `pip install openpyxl`")
+    except Exception as e:
+        st.caption(f"Export error: {e}")
+
+
 def _tab_party_master():
     st.markdown("### 🗂️ Party Master")
 
@@ -710,9 +1954,28 @@ def _tab_party_master():
     pcols = st.columns(min(len(counts), 6))
     for i, (t, c) in enumerate(sorted(counts.items())):
         pcols[i % len(pcols)].metric(t, c)
+
+    # ── Excel export ─────────────────────────────────────────────────────────
+    ec1, ec2 = st.columns([3, 1])
+    with ec2:
+        _excel_download(
+            [{k: v for k, v in p.items() if k != "id"} for p in parties],
+            filename=f"parties_{search or type_filter or 'all'}.xlsx",
+            label="⬇ Export Excel",
+        )
+
     st.markdown("---")
 
+    # ── Usage counts (batch fetch for all visible parties) ───────────────────
+    usage = _party_usage_counts([p["id"] for p in parties])
+
     for p in parties:
+        pid  = str(p["id"])
+        u    = usage.get(pid, {})
+        n_ord  = int(u.get("orders",   0))
+        n_ch   = int(u.get("challans", 0))
+        n_inv  = int(u.get("invoices", 0))
+
         with st.container(border=True):
             c1, c2, c3, c4, c5 = st.columns([4, 2, 2, 2, 1])
             dot = "🟢" if p.get("is_active") else "🔴"
@@ -723,6 +1986,16 @@ def _tab_party_master():
                             unsafe_allow_html=True)
                 if p.get("contact_person"):
                     st.caption(f"👤 {p['contact_person']}")
+                # ── Usage counter ────────────────────────────────────────
+                if n_ord or n_ch or n_inv:
+                    parts = []
+                    if n_ord: parts.append(f"📦 {n_ord} orders")
+                    if n_ch:  parts.append(f"📄 {n_ch} challans")
+                    if n_inv: parts.append(f"🧾 {n_inv} invoices")
+                    st.caption("  ·  ".join(parts))
+                else:
+                    if not p.get("is_active"):
+                        st.caption("⚠️ No transactions — safe to deactivate")
             with c2:
                 if p.get("mobile"):  st.caption(f"📱 {p['mobile']}")
                 if p.get("email"):   st.caption(f"📧 {p['email']}")
@@ -734,10 +2007,31 @@ def _tab_party_master():
             with c4:
                 if p.get("credit_limit"):
                     st.caption(f"💳 ₹{float(p['credit_limit']):,.0f} / {p.get('credit_days',0)}d")
+                # ── Jump buttons ──────────────────────────────────────────
+                if n_ord:
+                    if st.button("📦 Orders", key=f"jump_ord_{pid}",
+                                 help="Open this party's orders in Backoffice"):
+                        st.session_state["bo_party_filter"]   = p.get("party_name","")
+                        st.session_state["global_nav_target"] = "backoffice"
+                        st.rerun()
+                if n_inv or n_ch:
+                    if st.button("🧾 Billing", key=f"jump_inv_{pid}",
+                                 help="Open this party's invoices/challans in Billing"):
+                        st.session_state["billing_party_filter"] = p.get("party_name","")
+                        st.session_state["global_nav_target"]    = "billing"
+                        st.rerun()
             with c5:
-                if st.button("✏️", key=f"pme_{p['id']}"):
-                    st.session_state["pm_edit"] = str(p["id"])
+                if st.button("✏️", key=f"pme_{pid}"):
+                    st.session_state["pm_edit"] = pid
                     st.rerun()
+            scheme_key = f"pm_show_schemes_{pid}"
+            if st.button("🧠 Schemes", key=f"pm_scheme_btn_{pid}", use_container_width=True):
+                st.session_state[scheme_key] = not bool(st.session_state.get(scheme_key))
+                st.rerun()
+            if st.session_state.get(scheme_key):
+                with st.container(border=True):
+                    st.caption("Scheme ticks are loaded only after opening this panel, keeping CRM fast.")
+                    _render_party_scheme_panel(pid, p.get("party_name", ""))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -896,42 +2190,74 @@ def _tab_contacts():
         st.info("No contacts found."); return
     st.caption(f"{len(parties)} contact(s)")
 
-    for p in parties:
-        mob   = p.get("mobile") or "—"
-        label = f"{p.get('party_name','')}  |  {p.get('party_type','')}  |  📱 {mob}"
-        with st.expander(label):
-            dc1, dc2 = st.columns([2, 3])
-            with dc1:
-                for field, val in [
-                    ("City",    p.get("city")), ("Area",  p.get("area")),
-                    ("Email",   p.get("email")), ("GSTIN", p.get("gstin")),
-                    ("Credit Limit", f"₹{float(p['credit_limit']):,.0f}" if p.get("credit_limit") else None),
-                    ("Credit Days",  str(p.get("credit_days","")) if p.get("credit_days") else None),
-                ]:
-                    if val: st.markdown(f"**{field}:** {val}")
-            with dc2:
-                tps = fetch_touchpoints(str(p["id"]))
-                st.markdown("**Touchpoints**")
-                if tps:
-                    for tp in tps[:5]:
-                        icon = {"NOTE":"📝","CALL":"📞","VISIT":"🚗",
-                                "EMAIL":"📧","WHATSAPP":"💬"}.get(tp.get("type",""), "•")
-                        ts   = str(tp.get("created_at",""))[:16]
-                        st.caption(f"{icon} {ts} — {(tp.get('summary') or '')[:80]}")
-                else:
-                    st.caption("No touchpoints yet.")
-                with st.form(f"tp_{p['id']}"):
-                    t1, t2 = st.columns([1, 3])
-                    with t1:
-                        tp_type = st.selectbox("",
-                            ["NOTE","CALL","VISIT","EMAIL","WHATSAPP"],
-                            key=f"tpt_{p['id']}", label_visibility="collapsed")
-                    with t2:
-                        tp_text = st.text_input("", key=f"tps_{p['id']}",
-                            label_visibility="collapsed", placeholder="Enter note…")
-                    if st.form_submit_button("📝 Log"):
-                        log_touchpoint(str(p["id"]), tp_type, tp_text, _user())
-                        st.rerun()
+    def _contact_label(p):
+        mob = p.get("mobile") or "—"
+        return f"{p.get('party_name','')} | {p.get('party_type','')} | {mob}"
+
+    labels = [_contact_label(p) for p in parties]
+    selected_label = st.selectbox(
+        "Select contact",
+        labels,
+        key="cb_contact_sel",
+        help="Select one contact to load touchpoints. This keeps CRM fast.",
+    )
+    p = parties[labels.index(selected_label)] if selected_label in labels else parties[0]
+
+    summary_rows = [
+        {
+            "Party": x.get("party_name", ""),
+            "Type": x.get("party_type", ""),
+            "Mobile": x.get("mobile", ""),
+            "City": x.get("city", ""),
+            "GSTIN": x.get("gstin", ""),
+            "Contact": x.get("contact_person", ""),
+        }
+        for x in parties[:100]
+    ]
+    st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown(f"#### {p.get('party_name','')}")
+    dc1, dc2 = st.columns([2, 3])
+    with dc1:
+        for field, val in [
+            ("City",    p.get("city")), ("Area",  p.get("area")),
+            ("Email",   p.get("email")), ("GSTIN", p.get("gstin")),
+            ("Credit Limit", f"₹{float(p['credit_limit']):,.0f}" if p.get("credit_limit") else None),
+            ("Credit Days",  str(p.get("credit_days","")) if p.get("credit_days") else None),
+        ]:
+            if val:
+                st.markdown(f"**{field}:** {val}")
+    with dc2:
+        tps = fetch_touchpoints(str(p["id"]))
+        st.markdown("**Touchpoints**")
+        if tps:
+            for tp in tps[:8]:
+                icon = {"NOTE":"📝","CALL":"📞","VISIT":"🚗",
+                        "EMAIL":"📧","WHATSAPP":"💬"}.get(tp.get("type",""), "•")
+                ts   = str(tp.get("created_at",""))[:16]
+                st.caption(f"{icon} {ts} — {(tp.get('summary') or '')[:100]}")
+        else:
+            st.caption("No touchpoints yet.")
+        with st.form(f"tp_{p['id']}"):
+            t1, t2 = st.columns([1, 3])
+            with t1:
+                tp_type = st.selectbox(
+                    "Touchpoint type",
+                    ["NOTE","CALL","VISIT","EMAIL","WHATSAPP"],
+                    key=f"tpt_{p['id']}",
+                    label_visibility="collapsed",
+                )
+            with t2:
+                tp_text = st.text_input(
+                    "Touchpoint note",
+                    key=f"tps_{p['id']}",
+                    label_visibility="collapsed",
+                    placeholder="Enter note…",
+                )
+            if st.form_submit_button("📝 Log"):
+                log_touchpoint(str(p["id"]), tp_type, tp_text, _user())
+                st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -949,6 +2275,16 @@ def _render_metrics():
               delta_color="inverse")
 
 
+def _safe_crm_tab(label, fn):
+    try:
+        fn()
+    except Exception as e:
+        logger.exception("[CRM:%s] tab render failed", label)
+        st.error(f"{label} tab blocked: {e}")
+        with st.expander("Technical details for support", expanded=False):
+            st.code(traceback.format_exc())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY
 # ─────────────────────────────────────────────────────────────────────────────
@@ -958,28 +2294,41 @@ def render_crm_module():
     st.subheader("🤝 CRM — Customer & Supplier Relationship Manager")
 
     with st.expander("🔌 Diagnostics", expanded=False):
-        ca, cb = st.columns(2)
-        with ca:
-            try:
-                from modules.sql_adapter import get_connection
-                c = get_connection(); c.close()
-                st.success("✅ DB connected")
-            except Exception as e:
-                st.error(f"❌ DB: {e}")
-        with cb:
-            cols = _q("SELECT column_name FROM information_schema.columns "
-                      "WHERE table_name='parties' AND table_schema='public'", {})
-            col_names = sorted(r.get("column_name","") for r in cols)
-            st.caption("parties cols: " + ", ".join(col_names))
+        if st.button("Run CRM diagnostics", key="crm_run_diagnostics"):
+            ca, cb = st.columns(2)
+            with ca:
+                try:
+                    from modules.sql_adapter import get_connection
+                    c = get_connection(); c.close()
+                    st.success("✅ DB connected")
+                except Exception as e:
+                    st.error(f"❌ DB: {e}")
+            with cb:
+                cols = _q("SELECT column_name FROM information_schema.columns "
+                          "WHERE table_name='parties' AND table_schema='public'", {})
+                col_names = sorted(r.get("column_name","") for r in cols)
+                st.caption("parties cols: " + ", ".join(col_names))
         if st.button("🔄 Clear Cache"):
             _bust(); st.rerun()
 
     _render_metrics()
     st.markdown("---")
 
-    tabs = st.tabs(["🏭 Suppliers","🗂️ Party Master","🎯 Leads","📅 Follow-Ups","📋 Contacts"])
-    with tabs[0]: _tab_suppliers()
-    with tabs[1]: _tab_party_master()
-    with tabs[2]: _tab_leads()
-    with tabs[3]: _tab_followups()
-    with tabs[4]: _tab_contacts()
+    crm_views = {
+        "🏭 Suppliers": ("Suppliers", _tab_suppliers),
+        "🗂️ Party Master": ("Party Master", _tab_party_master),
+        "🎯 Leads": ("Leads", _tab_leads),
+        "📅 Follow-Ups": ("Follow-Ups", _tab_followups),
+        "📋 Contacts": ("Contacts", _tab_contacts),
+        "🧠 Admin DB Editor": ("Admin DB Editor", _render_admin_db_editor),
+        "🕐 Audit Log": ("Audit Log", _tab_audit_log),
+    }
+    active = st.radio(
+        "CRM View",
+        list(crm_views.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="crm_active_view",
+    )
+    label, fn = crm_views[active]
+    _safe_crm_tab(label, fn)

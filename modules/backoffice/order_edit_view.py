@@ -50,6 +50,73 @@ def _write(sql, params):
         return False
 
 
+def _resolve_order_id(order_ref: str) -> str:
+    try:
+        from modules.sql_adapter import resolve_order_uuid
+        return resolve_order_uuid(order_ref) or ""
+    except Exception:
+        return ""
+
+
+def _refresh_order_total(order_id: str) -> None:
+    """Keep order header value in sync after inline line edits/deletes."""
+    order_id = _resolve_order_id(order_id)
+    if not order_id:
+        return
+    _write("""
+        UPDATE orders
+           SET total_value = CASE
+                   WHEN UPPER(COALESCE(order_type,'')) = 'RETAIL' THEN
+                       ROUND(COALESCE((
+                           SELECT SUM(COALESCE(NULLIF(billing_total,0), total_price, 0))
+                             FROM order_lines
+                            WHERE order_id = %(oid)s::uuid
+                              AND COALESCE(is_deleted, FALSE) = FALSE
+                       ), 0), 0)
+                   ELSE
+                       COALESCE((
+                           SELECT SUM(COALESCE(NULLIF(billing_total,0), total_price, 0))
+                             FROM order_lines
+                            WHERE order_id = %(oid)s::uuid
+                              AND COALESCE(is_deleted, FALSE) = FALSE
+                       ), 0)
+               END,
+               updated_at = NOW()
+         WHERE id = %(oid)s::uuid
+    """, {"oid": order_id})
+
+
+def _sync_pricing_after_edit(order_id: str) -> None:
+    """Run final pricing stack after Orders-page edits before refreshing totals."""
+    order_id = _resolve_order_id(order_id)
+    if not order_id:
+        return
+    try:
+        rows = _rq(
+            "SELECT id::text AS id, order_no, order_type, party_id::text AS party_id, "
+            "party_name, patient_name FROM orders WHERE id=%(oid)s::uuid LIMIT 1",
+            {"oid": order_id},
+        ) or []
+        if not rows:
+            _refresh_order_total(order_id)
+            return
+        order = dict(rows[0])
+        order["lines"] = _load_lines(order_id)
+        from modules.backoffice.backoffice_helpers import refresh_order_pricing_rules
+        refresh_order_pricing_rules(order, persist=True)
+    except Exception:
+        _refresh_order_total(order_id)
+
+
+def _safe_json_text(value) -> str:
+    """JSONB text safe for DB writes; removes NaN/Infinity from nested params."""
+    try:
+        from modules.core.json_sanitizer import sanitize_json
+        return json.dumps(sanitize_json(value or {}))
+    except Exception:
+        return json.dumps(value or {})
+
+
 def _fmt_date(dt) -> str:
     if not dt:
         return "—"
@@ -78,9 +145,16 @@ def _is_editable(status: str, order_type: str = "", is_converted: bool = False,
     # They are editable unless genuinely converted (is_converted + linked_retail_no).
     if str(order_type).upper() == "CONSULTATION":
         return not (is_converted and bool(linked_retail_no))
-    # UNDER_REVIEW and PENDING are editable; CONFIRMED onwards are locked
+    try:
+        from modules.settings.shop_master import get_order_action_statuses
+        return str(status).upper() in get_order_action_statuses("edit")
+    except Exception:
+        pass
+    # UNDER_REVIEW and PENDING are editable; HOLD/CREDIT_HOLD require release first.
     return str(status).upper() not in (
-        "CONFIRMED", "BILLED", "DISPATCHED", "DELIVERED", "CLOSED", "CANCELLED"
+        "HOLD", "CREDIT_HOLD", "PENDING_PAYMENT",
+        "CONFIRMED", "IN_PRODUCTION", "READY", "READY_TO_BILL", "READY_FOR_BILLING",
+        "BILLED", "CHALLANED", "INVOICED", "DISPATCHED", "DELIVERED", "CLOSED", "CANCELLED"
     )
 
 
@@ -112,9 +186,14 @@ def _render_pipeline_lock(order: dict):
 
 # ── Load orders ───────────────────────────────────────────────────────────────
 
+def _digits_only(value: str) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
 def _load_orders(search: str, status_filter: str,
                  from_date: datetime.date, to_date: datetime.date,
-                 order_type: str) -> List[Dict]:
+                 order_type: str, patient_filter: str = "",
+                 mobile_filter: str = "", doc_filter: str = "") -> List[Dict]:
     # ── Ensure optional columns exist before querying ─────────────────────
     # is_converted and linked_retail_no are added lazily during consultation
     # conversion. If they don't exist yet the SELECT below will throw a
@@ -162,13 +241,41 @@ def _load_orders(search: str, status_filter: str,
             )""")
         params["s"] = f"%{search}%"
 
+    if doc_filter:
+        where.append("""(
+            o.order_no ILIKE %(doc)s
+            OR COALESCE(o.display_order_no::text,'') ILIKE %(doc)s
+        )""")
+        params["doc"] = f"%{doc_filter}%"
+
+    if patient_filter:
+        where.append("""(
+            o.patient_name ILIKE %(patient)s
+            OR o.party_name ILIKE %(patient)s
+        )""")
+        params["patient"] = f"%{patient_filter}%"
+
+    _mob_digits = _digits_only(mobile_filter)
+    if _mob_digits:
+        where.append("""(
+            regexp_replace(COALESCE(o.patient_mobile,''), '\\D', '', 'g') ILIKE %(mobile)s
+            OR EXISTS (
+                SELECT 1 FROM patients p
+                WHERE p.id = o.party_id::uuid
+                  AND regexp_replace(COALESCE(p.mobile,''), '\\D', '', 'g') ILIKE %(mobile)s
+            )
+        )""")
+        params["mobile"] = f"%{_mob_digits}%"
+
     rows = _rq(f"""
         SELECT
             o.id, o.order_no, o.display_order_no,
             o.patient_name, o.party_name,
+            o.patient_mobile, o.party_id::text AS party_id,
+            o.customer_order_no,
             o.order_type, o.status, o.created_at,
-            COALESCE(o.is_converted, false)   AS is_converted,
-            o.linked_retail_no,
+            (COALESCE(o.is_converted, false) OR linked_bill.linked_order_no IS NOT NULL) AS is_converted,
+            COALESCE(NULLIF(o.linked_retail_no,''), linked_bill.linked_order_no, '') AS linked_retail_no,
             COUNT(ol.id) AS line_count,
             COALESCE(
                 NULLIF(SUM(
@@ -179,7 +286,7 @@ def _load_orders(search: str, status_filter: str,
                              AND COALESCE(inv2.selling_price, 0) > 0
                              AND ABS(ol.unit_price - COALESCE(inv2.selling_price, 0)) < 0.5
                         THEN (ol.unit_price / COALESCE(p2.box_size,1)) * COALESCE(ol.quantity,0)
-                        ELSE COALESCE(ol.total_price, 0)
+                        ELSE COALESCE(ol.billing_total, ol.total_price, 0)
                     END
                 ), 0),
                 o.total_value,
@@ -202,11 +309,21 @@ def _load_orders(search: str, status_filter: str,
             ORDER BY is3.updated_at DESC NULLS LAST
             LIMIT 1
         ) inv2 ON true
+        LEFT JOIN LATERAL (
+            SELECT o2.order_no AS linked_order_no
+            FROM orders o2
+            WHERE o2.customer_order_no = o.id::text
+              AND UPPER(COALESCE(o2.order_type,'')) IN ('RETAIL','WHOLESALE')
+              AND COALESCE(o2.is_deleted, FALSE) = FALSE
+            ORDER BY o2.created_at DESC NULLS LAST
+            LIMIT 1
+        ) linked_bill ON TRUE
         WHERE {' AND '.join(where)}
         GROUP BY o.id, o.order_no, o.display_order_no,
-                 o.patient_name, o.party_name,
+                 o.patient_name, o.party_name, o.patient_mobile,
+                 o.party_id, o.customer_order_no,
                  o.order_type, o.status, o.created_at,
-                 o.is_converted, o.linked_retail_no
+                 o.is_converted, o.linked_retail_no, linked_bill.linked_order_no
         ORDER BY o.created_at DESC
         LIMIT 100
     """, params)
@@ -216,12 +333,20 @@ def _load_orders(search: str, status_filter: str,
 # ── Load lines for one order ──────────────────────────────────────────────────
 
 def _load_lines(order_id: str) -> List[Dict]:
+    order_id = _resolve_order_id(order_id)
+    if not order_id:
+        return []
     rows = _rq("""
         SELECT
             ol.id AS line_id, ol.product_id,
             ol.eye_side, ol.sph, ol.cyl, ol.axis, ol.add_power,
             ol.quantity, ol.unit_price, ol.total_price,
+            COALESCE(ol.billing_total, ol.total_price, 0) AS billing_total,
+            COALESCE(ol.discount_percent, 0) AS discount_percent,
+            COALESCE(ol.discount_amount, 0)  AS discount_amount,
+            COALESCE(ol.applied_rule_ids, '') AS applied_rule_ids,
             ol.lens_params, ol.boxing_params, ol.status,
+            COALESCE(o.order_type, 'RETAIL') AS order_type,
             p.product_name, p.brand, p.main_group,
             COALESCE(p.unit, 'PCS')         AS unit,
             COALESCE(p.box_size, 1)         AS box_size,
@@ -238,6 +363,7 @@ def _load_lines(order_id: str) -> List[Dict]:
             COALESCE(ol.lens_params::jsonb->>'supplier_id', '')  AS supplier_id,
             COALESCE(ol.is_service_line, FALSE)         AS is_service_line
         FROM order_lines ol
+        LEFT JOIN orders o ON o.id = ol.order_id
         LEFT JOIN products p ON p.id = ol.product_id
         LEFT JOIN LATERAL (
             SELECT COALESCE(selling_price, 0) AS selling_price
@@ -405,7 +531,7 @@ def _preload_order_for_edit(order: dict, lines: list) -> dict:
         _box_sz = int(ln.get("box_size",1) or 1)
         _unit   = str(ln.get("unit","PCS") or "PCS").upper()
         _uprice_raw = float(ln.get("unit_price", 0) or 0)
-        _total_raw  = float(ln.get("total_price", 0) or 0)
+        _total_raw  = float(ln.get("billing_total") or ln.get("total_price", 0) or 0)
         # ── Price normalization guard ────────────────────────────────────────
         # order_lines.unit_price is stored as PCS price (normalized at save time
         # by the finalize engine). normalize_to_pcs_price() must NOT be called
@@ -426,8 +552,14 @@ def _preload_order_for_edit(order: dict, lines: list) -> dict:
         if _uprice == 0 and _qty > 0 and _total_raw > 0:
             _uprice = round(_total_raw / _qty, 4)
         _total  = round(_uprice * _qty, 2) if _uprice > 0 else _total_raw
-        _lp     = ln.get("lens_params") or {}
-        _bp     = ln.get("boxing_params") or {}
+        _lp     = _parse_lp(ln.get("lens_params"))
+        _bp     = _parse_lp(ln.get("boxing_params"))
+        _suggested = ln.get("suggested_allocation") or []
+        if isinstance(_suggested, str) and _suggested.strip():
+            try:
+                _suggested = json.loads(_suggested) or []
+            except Exception:
+                _suggested = []
         _cart.append({
             "line_id":            str(ln.get("line_id","")) or str(uuid.uuid4()),
             "provisional_order_id": f"EDIT-{_oid[:8]}",
@@ -444,8 +576,8 @@ def _preload_order_for_edit(order: dict, lines: list) -> dict:
             "cyl":                float(_cyl) if _cyl is not None else None,
             "axis":               int(_axis) if _axis is not None else None,
             "add_power":          float(_add) if _add is not None else None,
-            "lens_params":        _lp if isinstance(_lp, dict) else {},
-            "boxing_params":      _bp if isinstance(_bp, dict) else {},
+            "lens_params":        _lp,
+            "boxing_params":      _bp,
             "requested_qty":      _qty,
             "billing_qty":        _qty,
             "order_qty":          0,          # 0 = fully from stock/already ordered
@@ -453,11 +585,17 @@ def _preload_order_for_edit(order: dict, lines: list) -> dict:
             "unit":               str(ln.get("unit","PCS") or "PCS"),
             "box_size":           int(ln.get("box_size",1) or 1),
             "allow_loose":        bool(ln.get("allow_loose",False)),
-            "batch_allocation":   [],
+            "batch_allocation":   list(_suggested) if isinstance(_suggested, list) else [],
+            "suggested_allocation": list(_suggested) if isinstance(_suggested, list) else [],
             "unit_price":         _uprice,
             "total_price":        round(_uprice * _qty, 2) if _uprice > 0 else _total,
+            "billing_total":      round(float(ln.get("billing_total") or _total), 2),
             "gst_percent":        float(ln.get("gst_percent",0) or 0),
             "gst_amount":         float(ln.get("gst_amount",0) or 0),
+            "discount_percent":   float(ln.get("discount_percent",0) or 0),
+            "discount_amount":    float(ln.get("discount_amount",0) or 0),
+            "applied_rule_ids":   str(ln.get("applied_rule_ids") or ""),
+            "allocated_qty":      int(ln.get("allocated_qty") or 0),
             "status":             str(ln.get("status","") or ""),
             "created_at":         _dt.datetime.now().isoformat(),
         })
@@ -502,6 +640,26 @@ def _preload_order_for_edit(order: dict, lines: list) -> dict:
                 "axis": _cl.get("axis"),
                 "add":  _cl.get("add_power"),
             }
+
+    # Existing order lines are the source of truth while editing an order.
+    # Patient-visit RX can be stale or blank, especially for orders created
+    # directly from punching. Prefer saved order-line powers so edit screens
+    # reopen with the same R/L powers that were billed/produced.
+    if _rx_r_from_lines or _rx_l_from_lines:
+        def _rxv(_rx: dict, _key: str):
+            _v = _rx.get(_key) if _rx else None
+            return _v if _v is not None else 0
+
+        _rxd = {
+            "sph_r": _rxv(_rx_r_from_lines, "sph"),
+            "cyl_r": _rxv(_rx_r_from_lines, "cyl"),
+            "ax_r":  _rxv(_rx_r_from_lines, "axis"),
+            "add_r": _rxv(_rx_r_from_lines, "add"),
+            "sph_l": _rxv(_rx_l_from_lines, "sph"),
+            "cyl_l": _rxv(_rx_l_from_lines, "cyl"),
+            "ax_l":  _rxv(_rx_l_from_lines, "axis"),
+            "add_l": _rxv(_rx_l_from_lines, "add"),
+        }
 
     return {
         "success":        True,
@@ -557,39 +715,62 @@ def _render_orders_tab(tab_otype: str):
 
     # ── Filters ───────────────────────────────────────────────────────────
     if tab_otype == "RX":
-        fc1, fc2, fc3, fc4 = st.columns([2, 1.5, 1.2, 1.2])
+        fc1, fc2, fc3, fc4 = st.columns([1.4, 1.6, 1.3, 1.2])
         with fc1:
-            search = st.text_input("🔍 Search", placeholder="Order no / patient / party…",
-                                   label_visibility="collapsed", key="oev_search_rx")
+            doc_search = st.text_input("Order No", placeholder="Order / bill no",
+                                       label_visibility="collapsed", key="oev_doc_rx")
         with fc2:
+            patient_search = st.text_input("Patient / Party", placeholder="Patient / party",
+                                           label_visibility="collapsed", key="oev_patient_rx")
+        with fc3:
+            mobile_search = st.text_input("Mobile", placeholder="Mobile",
+                                          label_visibility="collapsed", key="oev_mobile_rx")
+        with fc4:
             status_f = st.selectbox(
                 "Status", ["All", "PENDING", "UNDER_REVIEW", "CONFIRMED", "IN_PRODUCTION",
                            "READY", "READY_FOR_BILLING", "BILLED", "CLOSED"],
                 label_visibility="collapsed", key="oev_status_rx")
-        with fc3:
+        fd1, fd2, fd3 = st.columns([1.6, 1.2, 1.2])
+        with fd1:
+            search = st.text_input("Search", placeholder="Any search",
+                                   label_visibility="collapsed", key="oev_search_rx")
+        with fd2:
             from_d = st.date_input("From", value=datetime.date.today() - datetime.timedelta(days=30),
                                    label_visibility="collapsed", key="oev_from_rx")
-        with fc4:
+        with fd3:
             to_d = st.date_input("To", value=datetime.date.today(),
                                  label_visibility="collapsed", key="oev_to_rx")
         # RX tab shows RETAIL + WHOLESALE
-        orders_r = _load_orders(search, status_f, from_d, to_d, "RETAIL")
-        orders_w = _load_orders(search, status_f, from_d, to_d, "WHOLESALE")
+        orders_r = _load_orders(search, status_f, from_d, to_d, "RETAIL",
+                                patient_search, mobile_search, doc_search)
+        orders_w = _load_orders(search, status_f, from_d, to_d, "WHOLESALE",
+                                patient_search, mobile_search, doc_search)
         orders = orders_r + orders_w
         orders.sort(key=lambda o: str(o.get("created_at","")), reverse=True)
     else:
-        fc1, fc2, fc3 = st.columns([2, 1.2, 1.2])
+        fc1, fc2, fc3 = st.columns([1.4, 1.8, 1.3])
         with fc1:
-            search = st.text_input("🔍 Search", placeholder="Order no / patient…",
-                                   label_visibility="collapsed", key="oev_search_cons")
+            doc_search = st.text_input("Consult No", placeholder="Consult no",
+                                       label_visibility="collapsed", key="oev_doc_cons")
         with fc2:
+            patient_search = st.text_input("Patient", placeholder="Patient",
+                                           label_visibility="collapsed", key="oev_patient_cons")
+        with fc3:
+            mobile_search = st.text_input("Mobile", placeholder="Mobile",
+                                          label_visibility="collapsed", key="oev_mobile_cons")
+        fd1, fd2, fd3 = st.columns([1.6, 1.2, 1.2])
+        with fd1:
+            search = st.text_input("Search", placeholder="Any search",
+                                   label_visibility="collapsed", key="oev_search_cons")
+        with fd2:
             from_d = st.date_input("From", value=datetime.date.today() - datetime.timedelta(days=30),
                                    label_visibility="collapsed", key="oev_from_cons")
-        with fc3:
+        with fd3:
             to_d = st.date_input("To", value=datetime.date.today(),
                                  label_visibility="collapsed", key="oev_to_cons")
         status_f = "All"
-        orders = _load_orders(search, status_f, from_d, to_d, "CONSULTATION")
+        orders = _load_orders(search, status_f, from_d, to_d, "CONSULTATION",
+                              patient_search, mobile_search, doc_search)
 
     # For RX tab filter out consultations (consultations show in their own tab)
     if tab_otype == "RX":
@@ -674,8 +855,12 @@ def _render_orders_tab(tab_otype: str):
 
         with rcols[0]:
             if _is_converted_consult:
-                st.markdown("<div style='color:#334155;text-align:center;padding:6px 0'>🔒</div>",
-                            unsafe_allow_html=True)
+                if st.button("🔒", key=f"oev_lock_{_oid}",
+                             width='stretch',
+                             help="View locked consultation documents"):
+                    st.session_state[_open_key] = None if _is_open else _oid
+                    st.session_state["_oev_land_on_consult"] = True
+                    st.rerun()
             else:
                 _arrow = "▼" if _is_open else ("✏️" if _edit else "▶")
                 if st.button(_arrow, key=f"oev_arr_{_oid}",
@@ -714,21 +899,22 @@ def _render_orders_tab(tab_otype: str):
                     st.rerun()
 
         with rcols[2]:
-            _tc = {"RETAIL": "#0891b2", "WHOLESALE": "#8b5cf6"}.get(_otype, "#64748b")
+            _tc = {"RETAIL": "#0891b2", "WHOLESALE": "#8b5cf6",
+                   "CONSULTATION": "#10b981"}.get(_otype, "#64748b")
             st.markdown(
                 f"<div style='padding:4px 2px'>"
                 f"<div style='color:#e2e8f0;font-size:0.82rem;font-weight:600'>{_name}</div>"
-                f"<span style='background:{_tc}22;color:{_tc};padding:1px 6px;"
-                f"border-radius:6px;font-size:0.6rem;font-weight:700'>{_otype}</span>"
+                f"<span style='background:{_tc}33;color:{_tc};padding:1px 6px;"
+                f"border-radius:6px;font-size:0.62rem;font-weight:700'>{_otype}</span>"
                 f"</div>",
                 unsafe_allow_html=True)
 
         with rcols[3]:
-            st.markdown(f"<div style='color:#94a3b8;font-size:0.75rem;padding:6px 2px'>{_date}</div>",
+            st.markdown(f"<div style='color:#cbd5e1;font-size:0.75rem;padding:6px 2px'>{_date}</div>",
                         unsafe_allow_html=True)
 
         with rcols[4]:
-            _lc_color = "#ef4444" if _lc == 0 else "#94a3b8"
+            _lc_color = "#ef4444" if _lc == 0 else "#cbd5e1"
             st.markdown(f"<div style='color:{_lc_color};text-align:center;padding:6px 2px;font-size:0.82rem'>{_lc}</div>",
                         unsafe_allow_html=True)
 
@@ -739,29 +925,34 @@ def _render_orders_tab(tab_otype: str):
         with rcols[6]:
             if _is_converted_consult:
                 st.markdown(
-                    "<span style='background:#33415522;color:#475569;padding:2px 7px;"
-                    "border-radius:8px;font-size:0.62rem;font-weight:700'>"
-                    "🔄 CONVERTED</span>",
+                    "<span style='background:#312e81;color:#a5b4fc;padding:2px 8px;"
+                    "border-radius:8px;font-size:0.65rem;font-weight:700'>"
+                    "🔄 ORDERED</span>",
                     unsafe_allow_html=True)
             elif _is_consult_row and not _is_converted_consult:
-                # Unconverted consultation — show OPEN not 🔒 CLOSED
                 st.markdown(
-                    "<span style='background:#10b98122;color:#10b981;padding:2px 7px;"
-                    "border-radius:8px;font-size:0.62rem;font-weight:700'>"
+                    "<span style='background:#065f46;color:#34d399;padding:2px 8px;"
+                    "border-radius:8px;font-size:0.65rem;font-weight:700'>"
                     "🩺 OPEN</span>",
                     unsafe_allow_html=True)
             else:
-                _edit_badge = "✏️ " if _edit else "🔒 "
+                # Bright, readable status badge
+                _is_locked_status = _status in ("CONFIRMED","BILLED","DISPATCHED",
+                                                 "DELIVERED","CLOSED","CANCELLED","IN_PRODUCTION")
+                _badge_bg   = f"{_sc}33"
+                _badge_text = _sc
+                _edit_icon  = "🔒 " if _is_locked_status else "✏️ "
                 st.markdown(
-                    f"<span style='background:{_sc}22;color:{_sc};padding:2px 7px;"
-                    f"border-radius:8px;font-size:0.62rem;font-weight:700'>"
-                    f"{_edit_badge}{_status}</span>",
+                    f"<span style='background:{_badge_bg};color:{_badge_text};"
+                    f"padding:2px 8px;border-radius:8px;"
+                    f"font-size:0.65rem;font-weight:700;white-space:nowrap'>"
+                    f"{_edit_icon}{_status}</span>",
                     unsafe_allow_html=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
         # ── Inline edit panel — blocked for converted consultations ───
-        if _is_open and not _is_converted_consult:
+        if _is_open:
             with st.container():
                 st.markdown(
                     "<div style='background:#0b1628;border:1px solid #1e3a5f;"
@@ -1336,40 +1527,67 @@ def _render_order_edit_panel(order: Dict, editable: bool):
     # genuinely converted (is_converted=True + linked_retail_no set).
     # Non-consultation orders follow the normal RETAIL_EDIT_LOCKED_AFTER rules.
     if not _is_consult_panel and _cur_st in RETAIL_EDIT_LOCKED_AFTER:
-        # ── Smart pipeline-aware lock banner ─────────────────────────────
-        # Shows exactly what pipeline depth the order is at and what must
-        # be done first, instead of a generic "order is locked" message.
-        _render_pipeline_lock(order)
-        _in_stage = _cur_st in STAGE_RELEASE_ALLOWED_FROM
-        if _in_stage:
-            st.markdown(
-                "<div style='background:#0f172a;border:1px solid #3b82f6;border-radius:6px;"
-                "padding:8px 14px;margin-top:6px;font-size:0.78rem;color:#93c5fd'>"
-                "💡 Tip: Use <b>🔓 Release for Edit</b> in the Backoffice order list "
-                "to move this order back to CONFIRMED — but only after resolving the "
-                "pipeline items shown above.</div>",
-                unsafe_allow_html=True,
-            )
+        # ── Order confirmed in backoffice — fully locked ──────────────────
+        _lock_color = {"CONFIRMED":"#6366f1","BILLED":"#10b981",
+                       "DISPATCHED":"#3b82f6","DELIVERED":"#22c55e"}.get(_cur_st,"#64748b")
+        st.markdown(
+            f"<div style='background:#0a0f1a;border:2px solid {_lock_color}44;"
+            f"border-left:4px solid {_lock_color};border-radius:8px;"
+            f"padding:12px 16px;margin-bottom:10px'>"
+            f"<div style='color:{_lock_color};font-weight:800;font-size:0.88rem'>"
+            f"🔒 Order {_cur_st} — No further edits</div>"
+            f"<div style='color:#94a3b8;font-size:0.78rem;margin-top:4px'>"
+            f"This order has been confirmed in backoffice. "
+            f"To make changes, raise a Credit/Debit Note or contact the backoffice team."
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
         return
     _oid      = str(order.get("id") or "")
     _ono      = order.get("display_order_no") or order.get("order_no") or "—"
-    _name     = order.get("patient_name") or order.get("party_name") or "—"
+    _patient  = str(order.get("patient_name") or "").strip()
+    _party    = str(order.get("party_name") or "").strip()
+    # For wholesale: party is the retailer; for retail: patient is the customer
+    _name_main  = _patient or _party or "—"
+    _name_sub   = _party if (_patient and _party and _patient != _party) else ""
     _status   = str(order.get("status") or "PENDING")
     _is_consult = str(order.get("order_type","")).upper() == "CONSULTATION"
-    # Use order_no for consultation (display_order_no is just a sequence number)
     if _is_consult:
         _ono = order.get("order_no") or _ono
+
+    if _is_consult and _is_genuinely_converted:
+        _linked_no = str(order.get("linked_retail_no") or "").strip()
+        _linked_txt = f" Full billing order: {_linked_no}." if _linked_no else ""
+        st.markdown(
+            "<div style='background:#111827;border:2px solid #4f46e544;"
+            "border-left:4px solid #6366f1;border-radius:8px;"
+            "padding:12px 16px;margin-bottom:10px'>"
+            "<div style='color:#a5b4fc;font-weight:800;font-size:0.9rem'>"
+            "🔒 Consultation shifted to Full Billing</div>"
+            "<div style='color:#cbd5e1;font-size:0.8rem;margin-top:4px'>"
+            f"{_ono} has already been changed to full billing.{_linked_txt} "
+            "No edits or RX changes are allowed from Orders now."
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
 
     _status_colour = "#fcd34d" if editable else "#6366f1"
     _status_label  = "✏️ EDITABLE" if editable else "🔒 CONFIRMED"
     st.markdown(
-        f"<div style='display:flex;justify-content:space-between;"
-        f"align-items:center;margin-bottom:12px'>"
-        f"<div><span style='color:#60a5fa;font-size:1rem;font-weight:800'>{_ono}</span>"
-        f"<span style='color:#94a3b8;font-size:0.78rem;margin-left:10px'>{_name}</span></div>"
-        f"<div style='color:{_status_colour};font-size:0.75rem;font-weight:700'>"
-        f"{_status_label}</div>"
-        f"</div>",
+        f"<div style='background:#0f172a;border:1px solid #1e3a5f;"
+        f"border-radius:8px;padding:10px 14px;margin-bottom:10px'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:flex-start'>"
+        f"<div>"
+        f"<span style='color:#60a5fa;font-size:1rem;font-weight:800'>{_ono}</span>"
+        f"<br><span style='color:#e2e8f0;font-size:0.9rem;font-weight:700'>{_name_main}</span>"
+        + (f"<br><span style='color:#94a3b8;font-size:0.75rem'>🏪 {_name_sub}</span>" if _name_sub else "")
+        + f"</div>"
+        f"<div style='text-align:right'>"
+        f"<span style='color:{_status_colour};font-size:0.75rem;font-weight:700'>"
+        f"{_status_label}</span>"
+        f"<br><span style='color:#475569;font-size:0.7rem'>{_status}</span>"
+        f"</div>"
+        f"</div></div>",
         unsafe_allow_html=True)
 
     # ── Edit Order button ─────────────────────────────────────────────────
@@ -1388,28 +1606,24 @@ def _render_order_edit_panel(order: Dict, editable: bool):
                 unsafe_allow_html=True
             )
         else:
-            # ── CONSULT panel: Edit Powers + Convert to Billing ───────────
-            st.markdown(
-                "<div style='background:#0f172a;border:1px solid #3b82f622;"
-                "border-radius:6px;padding:8px 12px;margin-bottom:8px'>"
-                "<span style='color:#94a3b8;font-size:0.78rem'>"
-                "🩺 Consultation order — choose an action below</span>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-
-            # ── Consultation details summary ───────────────────────────────
+            # ── CONSULTATION — single clean action panel ──────────────────
             _c_fee  = float(order.get("total_value") or 0)
             _c_mode = order.get("payment_mode") or "—"
             _c_date = str(order.get("created_at",""))[:10]
+
             st.markdown(
-                f"<div style='color:#64748b;font-size:0.78rem;margin-bottom:8px'>"
-                f"Date: {_c_date} &nbsp;·&nbsp; Fee: ₹{_c_fee:.0f} &nbsp;·&nbsp; Mode: {_c_mode}"
-                f"</div>",
+                f"<div style='background:#0a1628;border:1px solid #1e3a5f;"
+                f"border-radius:8px;padding:10px 14px;margin-bottom:10px'>"
+                f"<div style='color:#60a5fa;font-weight:700;font-size:0.85rem'>"
+                f"🩺 Consultation — {_c_date}</div>"
+                f"<div style='color:#94a3b8;font-size:0.75rem;margin-top:3px'>"
+                f"Fee: <b style='color:#10b981'>₹{_c_fee:.0f}</b>"
+                f"&nbsp;·&nbsp;Mode: {_c_mode}"
+                f"</div></div>",
                 unsafe_allow_html=True,
             )
 
-            # ── Fetch power BEFORE buttons so Open Consultation carries it ──
+            # Fetch power before buttons
             _rx_r = {}; _rx_l = {}
             try:
                 from modules.sql_adapter import run_query as _rq_pre
@@ -1417,27 +1631,19 @@ def _render_order_edit_panel(order: Dict, editable: bool):
                 _visit_id_pre = str(order.get("customer_order_no","") or "").strip()
                 _pid_pre      = str(order.get("party_id") or "").strip()
                 _pname_pre    = str(order.get("patient_name","") or "")
-
-                # Priority 1: exact visit_id from customer_order_no
-                # Accept both 36-char UUID (with dashes) and 32-char (without)
                 if _visit_id_pre and len(_visit_id_pre) >= 32:
                     _rx_rows_pre = _rq_pre("""
                         SELECT right_sph, right_cyl, right_axis, right_add,
                                left_sph,  left_cyl,  left_axis,  left_add
                         FROM patient_visits WHERE id=%s::uuid LIMIT 1
                     """, (_visit_id_pre,)) or []
-
-                # Priority 2: latest visit for patient
                 if not _rx_rows_pre and _pid_pre and len(_pid_pre) > 10:
                     _rx_rows_pre = _rq_pre("""
                         SELECT right_sph, right_cyl, right_axis, right_add,
                                left_sph,  left_cyl,  left_axis,  left_add
-                        FROM patient_visits
-                        WHERE patient_id=%s::uuid
-                        ORDER BY visit_date DESC, created_at DESC LIMIT 1
+                        FROM patient_visits WHERE patient_id=%s::uuid
+                        ORDER BY visit_date DESC LIMIT 1
                     """, (_pid_pre,)) or []
-
-                # Priority 3: name match
                 if not _rx_rows_pre and _pname_pre and _pname_pre != "—":
                     _rx_rows_pre = _rq_pre("""
                         SELECT pv.right_sph, pv.right_cyl, pv.right_axis, pv.right_add,
@@ -1447,153 +1653,173 @@ def _render_order_edit_panel(order: Dict, editable: bool):
                         WHERE pt.master_name ILIKE %s
                         ORDER BY pv.visit_date DESC LIMIT 1
                     """, (_pname_pre,)) or []
-
                 if _rx_rows_pre:
                     _rx = _rx_rows_pre[0]
-                    _rx_r = {"sph": _rx.get("right_sph"), "cyl": _rx.get("right_cyl"),
-                             "axis": _rx.get("right_axis"), "add": _rx.get("right_add")}
-                    _rx_l = {"sph": _rx.get("left_sph"),  "cyl": _rx.get("left_cyl"),
-                             "axis": _rx.get("left_axis"),  "add": _rx.get("left_add")}
+                    _rx_r = {"sph":_rx.get("right_sph"),"cyl":_rx.get("right_cyl"),
+                             "axis":_rx.get("right_axis"),"add":_rx.get("right_add")}
+                    _rx_l = {"sph":_rx.get("left_sph"), "cyl":_rx.get("left_cyl"),
+                             "axis":_rx.get("left_axis"),"add":_rx.get("left_add")}
             except Exception:
                 pass
 
-            _ce1, _ce2 = st.columns(2)
+            # ── SINGLE ACTION: Open Consultation ─────────────────────────
+            if _is_genuinely_converted:
+                st.info("Billing/RX is locked. Clinical notes and print options are still available below.")
+            elif st.button(
+                "✏️ Open Consultation",
+                key=f"edit_consult_{_oid[:8]}",
+                type="primary",
+                use_container_width=True,
+                help="Open to view/edit powers, then convert to a Retail Order when ready",
+            ):
+                _pid_ec  = str(order.get("party_id") or "")
+                _mob_ec  = str(order.get("patient_mobile","") or "")
+                _name_ec = str(order.get("patient_name","") or "")
+                _vid_ec  = str(order.get("customer_order_no","") or "")
+                if not _pid_ec:
+                    _mob_ec = ""
 
-            # ── Single consultation edit button (merged Open + Edit Powers) ──
-            with _ce1:
-                if st.button("✏️ Edit Consultation",
-                             key=f"edit_consult_{_oid[:8]}",
-                             type="primary",
-                             use_container_width=True,
-                             help="Open this consultation to edit powers, view history, collect payment"):
-                    _pid_ec  = str(order.get("party_id") or "")
-                    _mob_ec  = str(order.get("patient_mobile","") or "")
-                    _name_ec = str(order.get("patient_name","") or "")
-                    _vid_ec  = str(order.get("customer_order_no","") or "")
+                # If mobile blank on order (old consultations saved before mobile-fix),
+                # fetch from patients table so header never shows blank.
+                if not _mob_ec and _pid_ec and len(_pid_ec) > 10:
+                    try:
+                        from modules.sql_adapter import run_query as _rq_mob_ec
+                        _mob_ec_row = _rq_mob_ec(
+                            "SELECT COALESCE(mobile,'') AS m FROM patients WHERE id=%s::uuid LIMIT 1",
+                            (_pid_ec,)
+                        ) or []
+                        if _mob_ec_row:
+                            _mob_ec = str(_mob_ec_row[0].get("m","") or "").strip()
+                    except Exception:
+                        pass
 
-                    # Set retail_ keys directly — fastest, no bridge race
-                    if _pid_ec and len(_pid_ec) > 10:
-                        st.session_state["retail_patient_id"]     = _pid_ec
-                    st.session_state["retail_patient_name"]       = _name_ec
-                    st.session_state["retail_patient_mobile"]     = _mob_ec
+                if _pid_ec and len(_pid_ec) > 10:
+                    st.session_state["retail_patient_id"]     = _pid_ec
+                st.session_state["retail_patient_name"]       = _name_ec
+                st.session_state["retail_patient_mobile"]     = _mob_ec
+                if _mob_ec:
                     st.session_state["consult_wa_mobile_display"] = _mob_ec
-
-                    # RX from pre-fetched values (fetched before buttons rendered)
-                    if _rx_r:
-                        st.session_state["retail_old_rx_r"] = dict(_rx_r)
-                        st.session_state["retail_new_rx_r"] = dict(_rx_r)
-                    if _rx_l:
-                        st.session_state["retail_old_rx_l"] = dict(_rx_l)
-                        st.session_state["retail_new_rx_l"] = dict(_rx_l)
-
-                    # Edit mode flags — prevent reset, force consultation mode
-                    st.session_state["_erp_mode"]                 = "CONSULT_EDIT"
-                    st.session_state["_editing_consult_order_id"] = _oid
-                    st.session_state["_erp_visit_id"]             = _vid_ec
-                    st.session_state["_erp_order_id"]             = _oid
-                    st.session_state["_erp_patient_id"]           = _pid_ec
-                    st.session_state["_erp_patient_name"]         = _name_ec
-                    st.session_state["_erp_patient_mob"]          = _mob_ec
-                    st.session_state["_erp_rx_r"]                 = dict(_rx_r) if _rx_r else {}
-                    st.session_state["_erp_rx_l"]                 = dict(_rx_l) if _rx_l else {}
-
-                    # Prefill bridge (consumed by retail_punching _cp_bridge)
-                    st.session_state["_consult_prefill"] = {
-                        "patient_id":       _pid_ec,
-                        "patient_name":     _name_ec,
-                        "patient_mobile":   _mob_ec,
-                        "mobile":           _mob_ec,
-                        "consult_order_id": _oid,
-                        "rx_r": dict(_rx_r) if _rx_r else {},
-                        "rx_l": dict(_rx_l) if _rx_l else {},
-                        "order_lines":      [],
-                        "consult_fee":      float(order.get("total_value") or 0),
-                    }
-
-                    # Force consultation mode — clear stale radio key
-                    st.session_state["_visit_mode_default"]    = 1
-                    st.session_state["_force_consultation_tab"] = True
-                    st.session_state.pop("retail_visit_mode", None)
-
-                    st.session_state["_sidebar_page"] = "🛍️  Retail Order"
-                    st.rerun()
-
-            # Button 2: Convert to Billing (existing flow)
-            with _ce2:
-                _is_already_converted = bool(order.get("is_converted")) and bool(order.get("linked_retail_no"))
-                if _is_already_converted:
-                    st.markdown(
-                        "<span style='color:#6366f1;font-size:0.82rem'>"
-                        "🔄 Already converted to order</span>",
-                        unsafe_allow_html=True
-                    )
                 else:
-                    if st.button("🛍️ Convert to Billing Order",
-                                 key=f"conv_consult_{_oid[:8]}",
-                                 use_container_width=True):
-                        try:
-                            from modules.consultation import convert_consultation_to_billing
-                            _result = convert_consultation_to_billing(_oid)
-                            if _result and "error" not in _result:
-                                st.session_state["_order_edit_prefill"] = _result
-                                st.session_state["_erp_mode"]           = "CONSULT_BILLING"
-                                # Force FULL BILLING mode — clear consultation flags
-                                st.session_state["_visit_mode_default"] = 0
-                                st.session_state.pop("retail_visit_mode", None)
-                                st.session_state.pop("_editing_consult_order_id", None)
-                                st.session_state.pop("_force_consultation_tab", None)
-                                st.session_state["_sidebar_page"]       = "🛍️  Retail Order"
-                                st.rerun()
-                            elif _result:
-                                st.error(_result.get("error","Conversion failed"))
-                        except Exception as _cv_err:
-                            st.error(f"Convert failed: {_cv_err}")
+                    st.session_state.pop("consult_wa_mobile_display", None)
 
-    elif _otype_up in ("RETAIL","WHOLESALE"):
-        # ── RETAIL / WHOLESALE edit button ───────────────────────────────
-        st.markdown(
-            "<div style='background:#1e3a5f;border-radius:8px;padding:10px 14px;"
-            "margin-bottom:10px;border-left:4px solid #f97316'>"
-            "<span style='color:#fbbf24;font-size:0.72rem;font-weight:700;"
-            "text-transform:uppercase;letter-spacing:.06em'>✏️ Edit this order</span>"
-            "<br><span style='color:#94a3b8;font-size:0.78rem'>"
-            "Opens in punching screen — change products, power, qty, advance. "
-            "All changes are logged with your user ID and timestamp.</span>"
-            "</div>",
-            unsafe_allow_html=True
-        )
-        _oe_guard_ok = str(order.get("status","")).upper() != "CANCELLED"
-        try:
-            from modules.core.order_guard import OrderGuard as _OG
-            _oe_guard_ok = _OG(order).can_edit
-        except Exception:
-            pass
+                if _rx_r:
+                    st.session_state["retail_old_rx_r"] = dict(_rx_r)
+                    st.session_state["retail_new_rx_r"] = dict(_rx_r)
+                if _rx_l:
+                    st.session_state["retail_old_rx_l"] = dict(_rx_l)
+                    st.session_state["retail_new_rx_l"] = dict(_rx_l)
 
-        if not _oe_guard_ok:
-            st.markdown(
-                "<div style='background:#1a1a1a;border:1px solid #334155;"
-                "border-radius:8px;padding:8px 14px;color:#475569;font-size:0.8rem'>"
-                "🔒 This order cannot be edited — it is cancelled or in a locked stage.</div>",
-                unsafe_allow_html=True
-            )
-        elif st.button("✏️ Open in Punching Screen to Edit",
-                     key=f"edit_order_{_oid[:8]}",
-                     type="primary",
-                     width='stretch',
-                     help="Opens in Retail/Wholesale Punching with all lines pre-loaded"):
-            _lines_for_edit = _load_lines(_oid)
-            _edit_result = _preload_order_for_edit(order, _lines_for_edit)
-            if "error" in _edit_result:
-                st.error(_edit_result["error"])
-            else:
-                st.session_state["_erp_mode"]     = "BILL_EDIT"
-                st.session_state["_erp_order_id"] = _oid
-                st.session_state["_erp_order_no"] = _ono
-                st.session_state["_order_edit_prefill"] = _edit_result
-                st.session_state["_sidebar_page"]       = _edit_result["sidebar_page"]
+                st.session_state["_erp_mode"]                  = "CONSULT_EDIT"
+                st.session_state["_editing_consult_order_id"]  = _oid
+                st.session_state["_erp_visit_id"]              = _vid_ec
+                st.session_state["_erp_order_id"]              = _oid
+                st.session_state["_erp_patient_id"]            = _pid_ec
+                st.session_state["_erp_patient_name"]          = _name_ec
+                st.session_state["_erp_patient_mob"]           = _mob_ec
+                st.session_state["_erp_rx_r"]                  = dict(_rx_r) if _rx_r else {}
+                st.session_state["_erp_rx_l"]                  = dict(_rx_l) if _rx_l else {}
+
+                # Populate flat retail_* RX keys so clinical_exam/consultation
+                # pre-fills power fields correctly on load
+                if _rx_r:
+                    st.session_state["retail_right_sph"]  = _rx_r.get("sph") or 0
+                    st.session_state["retail_right_cyl"]  = _rx_r.get("cyl") or 0
+                    st.session_state["retail_right_axis"] = _rx_r.get("axis") or 0
+                    st.session_state["retail_right_add"]  = _rx_r.get("add") or 0
+                if _rx_l:
+                    st.session_state["retail_left_sph"]   = _rx_l.get("sph") or 0
+                    st.session_state["retail_left_cyl"]   = _rx_l.get("cyl") or 0
+                    st.session_state["retail_left_axis"]  = _rx_l.get("axis") or 0
+                    st.session_state["retail_left_add"]   = _rx_l.get("add") or 0
+
+                # Force Consultation tab — NEVER full billing
+                # Do NOT set _force_full_billing_mode or _erp_mode="CONSULT_BILLING".
+                # Those are only set when staff explicitly clicks "Open Full Billing"
+                # from inside the consultation screen.
+                st.session_state["_visit_mode_default"]         = 1
+                st.session_state["_force_consultation_tab"]     = True
+                st.session_state.pop("_force_full_billing_mode", None)
+                st.session_state.pop("retail_visit_mode", None)   # cleared so _visit_mode_default=1 wins
+                st.session_state["_sidebar_page"]               = "🛍️  Retail Order"
                 st.rerun()
 
+            # Note: Convert to Billing happens FROM within the consultation screen
+            # via the explicit "🛍️ Open Full Billing for this patient" button.
+            st.caption(
+                "💡 Open → review/edit power → click '🛍️ Open Full Billing' "
+                "inside the consultation screen to create a Retail Order."
+            )
+
+    elif _otype_up in ("RETAIL","WHOLESALE"):
+        # ── RETAIL / WHOLESALE edit ───────────────────────────────────────
+        # No OrderGuard — staff can always open and edit orders that aren't
+        # CONFIRMED yet. CONFIRMED+ orders are already blocked by _is_editable
+        # in the pipeline lock section above, so they never reach here.
+        _is_cancelled = str(order.get("status","")).upper() == "CANCELLED"
+
+        if _is_cancelled:
+            st.markdown(
+                "<div style='background:#1a0000;border:1px solid #7f1d1d;"
+                "border-radius:8px;padding:8px 14px;color:#fca5a5;font-size:0.8rem'>"
+                "🚫 This order is cancelled — no further edits possible.</div>",
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                "<div style='background:#1e3a5f;border-radius:8px;padding:10px 14px;"
+                "margin-bottom:10px;border-left:4px solid #f97316'>"
+                "<span style='color:#fbbf24;font-size:0.72rem;font-weight:700;"
+                "text-transform:uppercase;letter-spacing:.06em'>✏️ Edit this order</span>"
+                "<br><span style='color:#94a3b8;font-size:0.78rem'>"
+                "Opens in punching screen — change products, power, qty, advance. "
+                "All changes are logged with your user ID and timestamp.</span>"
+                "</div>",
+                unsafe_allow_html=True
+            )
+            if st.button("✏️ Open in Punching Screen to Edit",
+                         key=f"edit_order_{_oid[:8]}",
+                         type="primary",
+                         width='stretch',
+                         help="Opens in Retail/Wholesale Punching with all lines pre-loaded"):
+                _lines_for_edit = _load_lines(_oid)
+                _edit_result = _preload_order_for_edit(order, _lines_for_edit)
+                if "error" in _edit_result:
+                    st.error(_edit_result["error"])
+                else:
+                    st.session_state["_erp_mode"]     = "BILL_EDIT"
+                    st.session_state["_erp_order_id"] = _oid
+                    st.session_state["_erp_order_no"] = _ono
+                    st.session_state["_order_edit_prefill"] = _edit_result
+                    st.session_state["_sidebar_page"]       = _edit_result["sidebar_page"]
+                    st.rerun()
+
         st.markdown("---")
+        try:
+            _latest_edit = _rq("""
+                SELECT changed_by_name, remarks,
+                       COALESCE(changed_at::text, '') AS changed_at
+                FROM order_status_history
+                WHERE order_id = %(oid)s::uuid
+                  AND from_status = 'EDIT_SOURCE'
+                ORDER BY changed_at DESC NULLS LAST
+                LIMIT 1
+            """, {"oid": _oid}) or []
+            if _latest_edit:
+                _eh = _latest_edit[0]
+                st.markdown(
+                    f"<div style='background:#1a0f00;border:1px solid #f97316;"
+                    f"border-radius:8px;padding:10px 14px;margin-bottom:10px'>"
+                    f"<div style='color:#f97316;font-size:.72rem;font-weight:800;"
+                    f"text-transform:uppercase;letter-spacing:.08em'>Last Edit</div>"
+                    f"<div style='color:#e2e8f0;font-size:.86rem;margin-top:3px'>"
+                    f"<b>{_eh.get('changed_by_name') or 'Staff'}</b>"
+                    f"<span style='color:#94a3b8;margin-left:8px'>{str(_eh.get('changed_at') or '')[:16]}</span>"
+                    f"</div><div style='color:#cbd5e1;font-size:.82rem;margin-top:4px'>"
+                    f"{_eh.get('remarks') or ''}</div></div>",
+                    unsafe_allow_html=True,
+                )
+        except Exception:
+            pass
         _render_cancel_panel(order, _oid, _ono, _status)
         st.markdown("---")
 
@@ -1743,6 +1969,30 @@ def _render_order_edit_panel(order: Dict, editable: bool):
             unsafe_allow_html=True
         )
 
+        if _is_genuinely_converted:
+            with st.expander("🩺 Modify clinical notes only", expanded=False):
+                st.caption("RX power and billing are locked. This section saves only clinical findings for the same visit.")
+                try:
+                    _pid_cl = str(order.get("party_id") or order.get("patient_id") or "")
+                    _vid_cl = str(order.get("customer_order_no") or "")
+                    if _pid_cl and len(_pid_cl) > 10:
+                        st.session_state["retail_patient_id"] = _pid_cl
+                        st.session_state["retail_patient_name"] = _pname
+                        st.session_state["retail_patient_mobile"] = "" if _pmob == "—" else _pmob
+                    if _vid_cl and len(_vid_cl) == 36:
+                        st.session_state["retail_selected_visit_id"] = _vid_cl
+                    from modules.clinical_exam import (
+                        load_clinical_examination as _load_clinical_oev,
+                        render_clinical_examination as _render_clinical_oev,
+                    )
+                    _clinical_ctx = f"{_pid_cl}:{_vid_cl}"
+                    if _pid_cl and len(_pid_cl) > 10 and st.session_state.get("_oev_clinical_ctx") != _clinical_ctx:
+                        _load_clinical_oev(_pid_cl, _vid_cl if len(_vid_cl) == 36 else None)
+                        st.session_state["_oev_clinical_ctx"] = _clinical_ctx
+                    _render_clinical_oev()
+                except Exception as _ce:
+                    st.error(f"Clinical edit unavailable: {_ce}")
+
         # ── Product lines if any ───────────────────────────────────────────
         try:
             from modules.sql_adapter import run_query as _rq_ol
@@ -1754,6 +2004,7 @@ def _render_order_edit_panel(order: Dict, editable: bool):
                 FROM   order_lines ol
                 LEFT JOIN products p ON p.id = ol.product_id
                 WHERE  ol.order_id = %s::uuid
+                  AND  COALESCE(ol.is_deleted, FALSE) = FALSE
                 ORDER  BY ol.eye_side
             """, (_oid,))
             if _ol:
@@ -1769,44 +2020,329 @@ def _render_order_edit_panel(order: Dict, editable: bool):
         except Exception:
             pass
 
-        # Print clinical report from order
-        if st.button("🖨️ Re-print Clinical Report",
-                     key=f"reprint_consult_{_oid[:8]}",
-                     width='content'):
-            try:
-                from modules.consultation import _print_clinical_report, _open_print_tab
-                from modules.settings.shop_master import get_unit_info
-                _si = get_unit_info("retail")
-                _addr = ", ".join(filter(None,[
-                    _si.get("shop_address",""), _si.get("shop_city",""),
-                    _si.get("shop_state","")
-                ]))
-                from modules.printing.patient_card_printer import get_patient_barcode
-                from modules.sql_adapter import run_query as _rq
-                _pid_rows = _rq(
-                    "SELECT id::text FROM patients WHERE master_name ILIKE %s LIMIT 1",
-                    (order.get("patient_name",""),)
-                ) or []
-                _pb = get_patient_barcode(_pid_rows[0]["id"]) if _pid_rows else ""
-                _print_clinical_report(
-                    name=order.get("patient_name",""),
-                    mobile=order.get("patient_mobile",""),
-                    date=_fmt_date(order.get("created_at")),
-                    shop=_si.get("shop_name","DV Optical"),
-                    addr=_addr,
-                    phone=_si.get("shop_phone",""),
-                    rx_r=("","","",""), rx_l=("","","",""),
-                    va_unaided=("",""), va_aided=("",""), va_near=("",""),
-                    fee=float(order.get("total_value",0)),
-                    pay_mode=order.get("payment_mode","Cash"),
-                    patient_barcode=_pb,
-                    footer=_si.get("print_footer",""),
-                )
-            except Exception as _pe:
-                st.error(f"Print error: {_pe}")
-        # ── Convert to billing order — blocked if already billed ──────────
+        # ── Print & WhatsApp actions ──────────────────────────────────────
+        _act_col1, _act_col2, _act_col3, _act_col4 = st.columns(4)
+        with _act_col1:
+            if st.button("🖨️ Re-print Clinical Report",
+                         key=f"reprint_consult_{_oid[:8]}",
+                         use_container_width=True):
+                try:
+                    from modules.consultation import _print_clinical_report
+                    from modules.settings.shop_master import get_unit_info
+                    _si   = get_unit_info("retail")
+                    _addr = ", ".join(filter(None, [
+                        _si.get("shop_address",""), _si.get("shop_address2",""),
+                        _si.get("shop_city",""), _si.get("shop_state",""),
+                    ]))
+                    # Barcode — prefer party_id, fallback name lookup
+                    _pb = ""
+                    try:
+                        from modules.printing.patient_card_printer import ensure_patient_id
+                        _pb_pid = str(order.get("party_id") or "")
+                        if _pb_pid and len(_pb_pid) > 10:
+                            _pb = ensure_patient_id(_pb_pid)
+                        elif _pname and _pname != "—":
+                            from modules.sql_adapter import run_query as _rq_pb
+                            _pb_row = _rq_pb(
+                                "SELECT id::text FROM patients WHERE master_name ILIKE %s LIMIT 1",
+                                (_pname,)
+                            ) or []
+                            if _pb_row:
+                                _pb = ensure_patient_id(_pb_row[0]["id"])
+                    except Exception:
+                        pass
+                    _clin = {}
+                    try:
+                        _vid_print = str(order.get("customer_order_no") or "")
+                        _pid_print = str(order.get("party_id") or order.get("patient_id") or "")
+                        if _pid_print and len(_pid_print) > 10:
+                            from modules.sql_adapter import run_query as _rq_clp
+                            _params_clp = {"pid": _pid_print}
+                            _sql_clp = "SELECT * FROM patient_clinicals WHERE patient_id=%(pid)s::uuid"
+                            if _vid_print and len(_vid_print) == 36:
+                                _sql_clp += " AND visit_id=%(vid)s::uuid"
+                                _params_clp["vid"] = _vid_print
+                            _sql_clp += " ORDER BY created_at DESC LIMIT 1"
+                            _clin_rows = _rq_clp(_sql_clp, _params_clp) or []
+                            _clin = dict(_clin_rows[0]) if _clin_rows else {}
+                    except Exception:
+                        _clin = {}
 
-        # Check if already billed
+                    # Build RX tuples from already-fetched _rx_r / _rx_l dicts
+                    def _rv(d, k): return d.get(k) if d.get(k) is not None else ""
+                    _print_clinical_report(
+                        name=_pname,
+                        mobile=_pmob,
+                        date=_pdate,
+                        shop=_si.get("shop_name", "DV Optical"),
+                        addr=_addr,
+                        phone=_si.get("shop_phone", ""),
+                        rx_r=(_rv(_rx_r,"sph"), _rv(_rx_r,"cyl"), _rv(_rx_r,"axis"), _rv(_rx_r,"add")),
+                        rx_l=(_rv(_rx_l,"sph"), _rv(_rx_l,"cyl"), _rv(_rx_l,"axis"), _rv(_rx_l,"add")),
+                        va_unaided=(_clin.get("va_distance_unaided_r",""), _clin.get("va_distance_unaided_l","")),
+                        va_aided=(_clin.get("va_distance_aided_r",""), _clin.get("va_distance_aided_l","")),
+                        va_near=(_clin.get("va_near_r",""), _clin.get("va_near_l","")),
+                        lids=_clin.get("sle_lids",""),
+                        conjunctiva=_clin.get("sle_conjunctiva",""),
+                        cornea=_clin.get("sle_cornea",""),
+                        ac=_clin.get("sle_ac",""),
+                        iris=_clin.get("sle_iris",""),
+                        lens=_clin.get("sle_lens",""),
+                        vitreous=_clin.get("sle_vitreous",""),
+                        fundus=_clin.get("sle_fundus",""),
+                        iop_r=_clin.get("iop_r",""),
+                        iop_l=_clin.get("iop_l",""),
+                        ortho_dist=_clin.get("ortho_cover_test_distance",""),
+                        ortho_near=_clin.get("ortho_cover_test_near",""),
+                        nystagmus=_clin.get("ortho_nystagmus",""),
+                        motility=_clin.get("ortho_ocular_motility",""),
+                        convergence=_clin.get("ortho_convergence",""),
+                        remarks=_clin.get("ortho_remarks",""),
+                        doctor_notes=_clin.get("doctor_notes",""),
+                        treatment_plan=_clin.get("treatment_plan",""),
+                        followup_advice=_clin.get("followup_advice",""),
+                        fee=float(order.get("total_value", 0)),
+                        pay_mode=order.get("payment_mode", "Cash"),
+                        patient_barcode=_pb,
+                        footer=_si.get("print_footer", ""),
+                    )
+                except Exception as _pe:
+                    st.error(f"Print error: {_pe}")
+
+        with _act_col2:
+            if st.button("🧾 Print Receipt",
+                         key=f"receipt_consult_{_oid[:8]}",
+                         use_container_width=True):
+                try:
+                    from modules.consultation import _print_consultation_receipt
+                    from modules.settings.shop_master import get_unit_info
+                    _si = get_unit_info("retail")
+                    _addr = ", ".join(filter(None, [
+                        _si.get("shop_address",""), _si.get("shop_address2",""),
+                        _si.get("shop_city",""), _si.get("shop_state",""),
+                    ]))
+                    def _rv(d, k): return d.get(k) if d.get(k) is not None else ""
+                    _print_consultation_receipt(
+                        order_no=order.get("order_no","—"),
+                        patient_name=_pname,
+                        mobile="" if _pmob == "—" else _pmob,
+                        consult_type="Consultation",
+                        fee=float(order.get("total_value") or 0),
+                        pay_mode=order.get("payment_mode", "Cash"),
+                        visit_date=_pdate,
+                        shop=_si.get("shop_name", "DV Optical"),
+                        addr=_addr,
+                        phone=_si.get("shop_phone", ""),
+                        rx_r=(_rv(_rx_r,"sph"), _rv(_rx_r,"cyl"), _rv(_rx_r,"axis"), _rv(_rx_r,"add")),
+                        rx_l=(_rv(_rx_l,"sph"), _rv(_rx_l,"cyl"), _rv(_rx_l,"axis"), _rv(_rx_l,"add")),
+                    )
+                except Exception as _re:
+                    st.error(f"Receipt print error: {_re}")
+
+        with _act_col3:
+            try:
+                from modules.printing.patient_card_printer import render_patient_card_buttons
+                _pid_card = str(order.get("party_id") or order.get("patient_id") or "")
+                if _pid_card and len(_pid_card) > 10:
+                    render_patient_card_buttons(
+                        patient_id=_pid_card,
+                        patient_name=_pname,
+                        mobile="" if _pmob == "—" else _pmob,
+                        rx_r=_rx_r,
+                        rx_l=_rx_l,
+                        visit_date=_pdate,
+                    )
+                else:
+                    st.button("🪪 Patient Card", disabled=True, use_container_width=True,
+                              key=f"pcard_consult_dis_{_oid[:8]}",
+                              help="No linked patient master")
+            except Exception as _pce:
+                st.caption(f"Patient card unavailable: {_pce}")
+
+        with _act_col4:
+            # WhatsApp — build message from DB data, then allow saving missing mobile.
+            try:
+                from modules.settings.shop_master import get_unit_info as _g
+                _ws = _g("retail")
+                _wstore = _ws.get("shop_name","Parakh Eye Care")
+                _wphone = _ws.get("shop_phone","")
+            except Exception:
+                _wstore, _wphone = "Parakh Eye Care", ""
+
+            def _wfmt(v):
+                try:
+                    f = float(v or 0)
+                    return f"{f:+.2f}" if f != 0 else "Plano"
+                except: return "—"
+            def _wax(v):
+                try: return f"{int(float(v or 0))}°"
+                except: return "—"
+
+            _wr = (f"R: SPH {_wfmt(_rx_r.get('sph'))} CYL {_wfmt(_rx_r.get('cyl'))} "
+                   f"AX {_wax(_rx_r.get('axis'))}" if _rx_r else "R: —")
+            _wl = (f"L: SPH {_wfmt(_rx_l.get('sph'))} CYL {_wfmt(_rx_l.get('cyl'))} "
+                   f"AX {_wax(_rx_l.get('axis'))}" if _rx_l else "L: —")
+            _c_ono = order.get("order_no","—")
+            _c_fee = float(order.get("total_value") or 0)
+            _wa_text = (
+                f"Thanks for visiting {_wstore}.\n\n"
+                f"Consultation ID: *{_c_ono}*\n"
+                f"Patient: *{_pname}*\n\n"
+                f"*Your Prescription:*\n{_wr}\n{_wl}\n\n"
+                + (f"Consultation fee: *₹{_c_fee:.0f}*\n\n" if _c_fee > 0 else "")
+                + "Your prescription is valid for one year from the date of examination."
+                + (f"\n\nStore our number: {_wphone}" if _wphone else "")
+            )
+            try:
+                from modules.wa_contact_tools import render_mobile_field
+                from modules.wa_hub import wa_link
+                _wa_mob = render_mobile_field(
+                    f"oev_consult_rx_{_oid[:8]}",
+                    name=_pname,
+                    mobile="" if _pmob == "—" else _pmob,
+                    order_id=_oid,
+                    label="WhatsApp mobile",
+                )
+                _wa_url = wa_link(_wa_mob, _wa_text)
+            except Exception:
+                import urllib.parse as _uparse
+                _wa_mob_raw = "".join(x for x in (_pmob or "") if x.isdigit())
+                if _wa_mob_raw.startswith("91") and len(_wa_mob_raw) == 12:
+                    _wa_mob_raw = _wa_mob_raw[2:]
+                elif _wa_mob_raw.startswith("0") and len(_wa_mob_raw) == 11:
+                    _wa_mob_raw = _wa_mob_raw[1:]
+                _wa_mob_e164 = ("91" + _wa_mob_raw) if (len(_wa_mob_raw) == 10 and _wa_mob_raw[0] in "6789") else ""
+                _wa_url = f"https://wa.me/{_wa_mob_e164}?text={_uparse.quote(_wa_text)}" if _wa_mob_e164 else ""
+            if _wa_url:
+                st.link_button("📲 WhatsApp RX", _wa_url, use_container_width=True)
+            else:
+                st.button("📲 WhatsApp RX", disabled=True,
+                          key=f"wa_consult_disabled_{_oid[:8]}",
+                          use_container_width=True,
+                          help="Enter and save a valid mobile number")
+
+        with st.expander("📄 Referral letter", expanded=False):
+            _ref_saved = ""
+            _ref_reason_saved = ""
+            try:
+                from modules.sql_adapter import run_query as _rq_ref_load
+                _ref_row = _rq_ref_load(
+                    "SELECT COALESCE(extra_data::json->>'referral','') AS referral, "
+                    "       COALESCE(extra_data::json->>'referral_reason','') AS reason "
+                    "FROM orders WHERE id=%(oid)s::uuid LIMIT 1",
+                    {"oid": _oid},
+                ) or []
+                if _ref_row:
+                    _ref_saved = str(_ref_row[0].get("referral") or "")
+                    _ref_reason_saved = str(_ref_row[0].get("reason") or "")
+            except Exception:
+                pass
+
+            _ref_to = st.text_input(
+                "Refer to",
+                value=_ref_saved,
+                placeholder="Doctor / hospital / specialist",
+                key=f"oev_ref_to_{_oid[:8]}",
+            ).strip()
+            _ref_reason = st.text_area(
+                "Reason for referral",
+                value=_ref_reason_saved,
+                placeholder="Reason that should appear on the referral letter",
+                key=f"oev_ref_reason_{_oid[:8]}",
+                height=90,
+            ).strip()
+
+            _ref_c1, _ref_c2 = st.columns(2)
+            with _ref_c1:
+                if st.button("💾 Save Referral", key=f"oev_ref_save_{_oid[:8]}", use_container_width=True):
+                    try:
+                        from modules.sql_adapter import run_write as _rw_ref_save
+                        import json as _json_ref_save
+                        _rw_ref_save(
+                            "UPDATE orders "
+                            "SET extra_data = COALESCE(extra_data,'{}'::jsonb) || %(payload)s::jsonb "
+                            "WHERE id=%(oid)s::uuid",
+                            {
+                                "oid": _oid,
+                                "payload": _json_ref_save.dumps({
+                                    "referral": _ref_to,
+                                    "referral_reason": _ref_reason,
+                                }),
+                            },
+                        )
+                        st.success("Referral saved.")
+                    except Exception as _rse:
+                        st.error(f"Referral save failed: {_rse}")
+
+            with _ref_c2:
+                if st.button("📄 Print Referral", key=f"oev_ref_print_{_oid[:8]}", use_container_width=True):
+                    if not _ref_to:
+                        st.warning("Enter referral doctor / hospital first.")
+                    else:
+                        try:
+                            from modules.consultation import _print_referral_letter
+                            from modules.settings.shop_master import get_unit_info
+                            _si = get_unit_info("retail")
+                            _addr = ", ".join(filter(None, [
+                                _si.get("shop_address",""), _si.get("shop_address2",""),
+                                _si.get("shop_city",""), _si.get("shop_state",""),
+                            ]))
+                            _clin = {}
+                            try:
+                                _vid_ref = str(order.get("customer_order_no") or "")
+                                _pid_ref = str(order.get("party_id") or order.get("patient_id") or "")
+                                if _pid_ref and len(_pid_ref) > 10:
+                                    from modules.sql_adapter import run_query as _rq_ref_clin
+                                    _params_ref = {"pid": _pid_ref}
+                                    _sql_ref = "SELECT * FROM patient_clinicals WHERE patient_id=%(pid)s::uuid"
+                                    if _vid_ref and len(_vid_ref) == 36:
+                                        _sql_ref += " AND visit_id=%(vid)s::uuid"
+                                        _params_ref["vid"] = _vid_ref
+                                    _sql_ref += " ORDER BY created_at DESC LIMIT 1"
+                                    _clin_rows_ref = _rq_ref_clin(_sql_ref, _params_ref) or []
+                                    _clin = dict(_clin_rows_ref[0]) if _clin_rows_ref else {}
+                            except Exception:
+                                _clin = {}
+
+                            _pb_ref = ""
+                            try:
+                                from modules.printing.patient_card_printer import ensure_patient_id
+                                _pid_ref_bc = str(order.get("party_id") or order.get("patient_id") or "")
+                                if _pid_ref_bc and len(_pid_ref_bc) > 10:
+                                    _pb_ref = ensure_patient_id(_pid_ref_bc)
+                            except Exception:
+                                pass
+
+                            def _rv(d, k): return d.get(k) if d.get(k) is not None else ""
+                            _print_referral_letter(
+                                name=_pname,
+                                mobile="" if _pmob == "—" else _pmob,
+                                date=_pdate,
+                                shop=_si.get("shop_name", "DV Optical"),
+                                addr=_addr,
+                                phone=_si.get("shop_phone", ""),
+                                rx_r=(_rv(_rx_r,"sph"), _rv(_rx_r,"cyl"), _rv(_rx_r,"axis"), _rv(_rx_r,"add")),
+                                rx_l=(_rv(_rx_l,"sph"), _rv(_rx_l,"cyl"), _rv(_rx_l,"axis"), _rv(_rx_l,"add")),
+                                va_unaided=(_clin.get("va_distance_unaided_r",""), _clin.get("va_distance_unaided_l","")),
+                                va_aided=(_clin.get("va_distance_aided_r",""), _clin.get("va_distance_aided_l","")),
+                                lids=_clin.get("sle_lids",""),
+                                cornea=_clin.get("sle_cornea",""),
+                                lens=_clin.get("sle_lens",""),
+                                fundus=_clin.get("sle_fundus",""),
+                                iop_r=_clin.get("iop_r",""),
+                                iop_l=_clin.get("iop_l",""),
+                                remarks=_clin.get("ortho_remarks","") or _clin.get("doctor_notes",""),
+                                referral=_ref_to,
+                                referral_reason=_ref_reason,
+                                patient_barcode=_pb_ref,
+                                footer=_si.get("print_footer", ""),
+                            )
+                        except Exception as _rpe:
+                            st.error(f"Referral print error: {_rpe}")
+
+        # ── Linked retail order (if consultation was used to create one) ───
+
+        # Check if a retail order was already raised from this consultation
         try:
             from modules.sql_adapter import run_query as _rq_cb
             # Tier 0: is_converted flag — add column if missing, then check
@@ -1843,68 +2379,43 @@ def _render_order_edit_panel(order: Dict, editable: bool):
 
         st.markdown("---")
 
+        # Show linked retail order if consultation was used to create one
         if _billed_check:
+            _linked_ono = _billed_check[0].get("order_no","—")
             st.markdown(
-                f"<div style='background:#f0fdf4;border:2px solid #22c55e;"
-                f"border-radius:8px;padding:10px 14px;text-align:center'>"
-                f"<div style='font-size:1rem;font-weight:900;color:#166534'>\u2705 Already Billed</div>"
-                f"<div style='font-size:0.82rem;color:#475569;margin-top:3px'>"
-                f"Converted to order <b>{_billed_check[0]['order_no']}</b></div>"
+                f"<div style='background:#0d2818;border:2px solid #22c55e;"
+                f"border-radius:8px;padding:12px 16px;margin-top:8px'>"
+                f"<div style='font-size:0.78rem;font-weight:800;color:#4ade80;"
+                f"text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px'>"
+                f"🔄 Converted to Full Billing</div>"
+                f"<div style='font-size:1rem;font-weight:700;color:#e2e8f0'>"
+                f"{_linked_ono}</div>"
+                f"<div style='font-size:0.72rem;color:#6ee7b7;margin-top:4px'>"
+                f"All further edits must be done through the Retail Order above.</div>"
                 f"</div>",
                 unsafe_allow_html=True
             )
-        else:
-            st.caption(
-                f"Consultation fee \u20b9{float(order.get('total_value',0)):.0f} "
-                f"will be added as a line item (GST exempt)."
-            )
-            if st.button("\u2795 Convert to Billing Order",
-                         key=f"bill_oev_{_oid[:8]}",
-                         type="primary",
-                         width='stretch',
-                         help="Pre-loads patient + RX + consultation fee into Retail Order"):
+            # Direct link to the retail order in Order View
+            if st.button(
+                f"📋 Open {_linked_ono}",
+                key=f"open_linked_{_oid[:8]}",
+                use_container_width=True,
+                type="secondary",
+            ):
+                # Open the linked retail order in order view
                 try:
-                    from modules.consultation import convert_consultation_to_billing
-                    import uuid, datetime as _bdt
-                    _br = convert_consultation_to_billing(_oid)
-                    if "error" in _br:
-                        if _br.get("already_billed"):
-                            st.session_state["_consult_already_billed"] = _br.get("billed_order_no","see Retail Orders")
-                            st.rerun()
-                        else:
-                            st.error(f"Error: {_br['error']}")
-                    else:
-                        _brxd = _br.get("rx",{})
-                        _bfee = float(_br.get("consult_fee",0) or 0)
-                        _blines = []
-                        if _bfee > 0 and _br.get("prod_id"):
-                            _blines = [{"line_id":str(uuid.uuid4()),"provisional_order_id":None,
-                                "product_id":_br["prod_id"],"product_name":_br.get("prod_name","Consultation Fee"),
-                                "brand":"Service","main_group":"Services","batch_no":"","eye_side":"SERVICE",
-                                "sph":None,"cyl":None,"axis":None,"add_power":None,
-                                "lens_params":{},"boxing_params":{},"requested_qty":1,"billing_qty":1,
-                                "order_qty":0,"display_qty":"1 SERVICE","batch_allocation":[],
-                                "unit_price":_bfee,"total_price":_bfee,"gst_percent":0.0,"gst_amount":0.0,
-                                "status":"Complete","created_at":_bdt.datetime.now().isoformat()}]
-                        st.session_state["_erp_mode"]         = "BILL_NEW"
-                        st.session_state["_erp_patient_id"]   = _br.get("patient_id","")
-                        st.session_state["_erp_patient_name"] = _br["patient_name"]
-                        st.session_state["_erp_patient_mob"]  = _br.get("patient_mobile","")
-                        st.session_state["_erp_consult_fee"]  = _bfee
-                        st.session_state["_erp_cart_lines"]   = _blines
-                        st.session_state["_erp_consult_oid"]  = _oid
-                        st.session_state["_erp_rx_r"] = {
-                            "sph":_brxd.get("sph_r",0),"cyl":_brxd.get("cyl_r",0),
-                            "axis":_brxd.get("ax_r",0),"add":_brxd.get("add_r",0)
-                        }
-                        st.session_state["_erp_rx_l"] = {
-                            "sph":_brxd.get("sph_l",0),"cyl":_brxd.get("cyl_l",0),
-                            "axis":_brxd.get("ax_l",0),"add":_brxd.get("add_l",0)
-                        }
-                        st.session_state["_sidebar_page"] = "🛍️  Retail Order"
+                    from modules.sql_adapter import run_query as _rq_lnk2
+                    _lnk_id_row = _rq_lnk2(
+                        "SELECT id::text FROM orders WHERE order_no=%s AND COALESCE(is_deleted,FALSE)=FALSE LIMIT 1",
+                        (_linked_ono,)
+                    ) or []
+                    if _lnk_id_row:
+                        _lnk_id = _lnk_id_row[0]["id"]
+                        st.session_state[f"oev_open_{_lnk_id}"] = _lnk_id
+                        st.session_state["_oev_land_on_consult"] = False
                         st.rerun()
-                except Exception as _bex:
-                    st.error(f"Error: {_bex}")
+                except Exception:
+                    pass
 
     if not lines and not _is_consult:
         st.warning("No lines found for this order.")
@@ -1920,6 +2431,23 @@ def _render_order_edit_panel(order: Dict, editable: bool):
             _pn   = ln.get("product_name") or "—"
             _br   = ln.get("brand") or ""
             _lp   = _parse_lp(ln.get("lens_params"))
+
+            # Build display name with coating/index suffix from lens_params
+            _disp_suffix = str(_lp.get("display_suffix") or "").strip()
+            _coating_disp = str(_lp.get("coating") or _lp.get("coating_type") or "").strip()
+            _index_disp   = str(_lp.get("lens_index") or _lp.get("index_value") or
+                                _lp.get("index") or "").strip()
+            if _disp_suffix:
+                # Use stored display suffix (e.g. "+ 1.50 UltraHC")
+                _pn_display = f"{_pn} {_disp_suffix}" if _disp_suffix not in _pn else _pn
+            elif _coating_disp or _index_disp:
+                _parts = []
+                if _index_disp: _parts.append(f"Idx {_index_disp}")
+                if _coating_disp: _parts.append(_coating_disp)
+                _pn_display = f"{_pn} ({' · '.join(_parts)})"
+            else:
+                _pn_display = _pn
+
             _colour = str(_lp.get("colour") or "")
             _colour = "" if _colour.lower() in ("none","no","") else _colour
             _fit    = bool(_lp.get("fitting_required"))
@@ -1942,14 +2470,24 @@ def _render_order_edit_panel(order: Dict, editable: bool):
                         unsafe_allow_html=True)
                 with _lc2:
                     st.markdown(
-                        f"<div style='color:#e2e8f0;font-weight:700'>{_pn}</div>"
+                        f"<div style='color:#e2e8f0;font-weight:700'>{_pn_display}</div>"
                         f"<div style='color:#64748b;font-size:0.7rem'>{_br}</div>",
                         unsafe_allow_html=True)
                     # Badges
                     _badges = []
-                    if _colour: _badges.append(f"🎨 {_colour}")
-                    if _fit:    _badges.append(f"🔧 {_lp.get('fitting_type','Fitting')}")
-                    if _instruct: _badges.append(f"📝 {_instruct[:30]}")
+                    _coating = str(_lp.get("coating") or _lp.get("coating_type") or "")
+                    _index   = str(_lp.get("lens_index") or _lp.get("index_value") or
+                                   _lp.get("index") or "")
+                    _thickness = str(_lp.get("thickness") or "")
+                    _frame   = str(_lp.get("frame_type") or "")
+                    if _coating:   _badges.append(f"🔬 {_coating}")
+                    if _index:     _badges.append(f"Idx {_index}")
+                    if _thickness and _thickness.lower() not in ("regular",""):
+                        _badges.append(f"Thick: {_thickness}")
+                    if _frame:     _badges.append(f"🖼️ {_frame}")
+                    if _colour:    _badges.append(f"🎨 {_colour}")
+                    if _fit:       _badges.append(f"🔧 {_lp.get('fitting_type','Fitting')}")
+                    if _instruct:  _badges.append(f"📝 {_instruct[:30]}")
                     if _badges:
                         st.caption(" · ".join(_badges))
                 with _lc3:
@@ -1959,20 +2497,44 @@ def _render_order_edit_panel(order: Dict, editable: bool):
                         f"{'&nbsp; ADD ' + _add if _add != '—' else ''}"
                         f"</div>",
                         unsafe_allow_html=True)
+                    # Pricing + discount
+                    _up   = float(ln.get("unit_price") or 0)
+                    _dp   = float(ln.get("discount_percent") or 0)
+                    _da   = float(ln.get("discount_amount") or 0)
+                    _tot  = float(ln.get("total_price") or 0)
+                    _gst  = float(ln.get("gst_amount") or 0)
+                    _grand= round(_tot + _gst, 2)
+                    _disc_str = (
+                        f"<span style='color:#f87171'>−₹{_da:.2f} ({_dp:.0f}%)</span>"
+                        if _da > 0 else ""
+                    )
+                    st.markdown(
+                        f"<div style='font-size:0.75rem;margin-top:4px'>"
+                        f"<span style='color:#94a3b8'>₹{_up:.2f}/pc</span>"
+                        + (f" {_disc_str}" if _disc_str else "")
+                        + f" → <b style='color:#10b981'>₹{_grand:.2f}</b>"
+                        f"</div>",
+                        unsafe_allow_html=True)
 
                 if editable:
-                    with st.expander(f"✏️ Edit RX / Lens Params", expanded=False):
-                        _render_line_edit_form(ln, _oid)
+                    if _otype_up in ("RETAIL", "WHOLESALE"):
+                        st.caption("✏️ Use 'Open in Punching Screen to Edit' above for product, power, qty, service, and line changes.")
+                    else:
+                        with st.expander("✏️ Edit RX / Lens Params", expanded=False):
+                            _render_line_edit_form(ln, _oid)
+                else:
+                    # Order confirmed — line is read-only, no edit path
+                    st.caption("🔒 Confirmed — line cannot be edited.")
 
     # ── Edit History — always visible ────────────────────────────────
     try:
         _hist = _rq("""
             SELECT changed_by_name, remarks,
-                   COALESCE(changed_at::text, created_at::text, '') AS changed_at
+                   COALESCE(changed_at::text, '') AS changed_at
             FROM order_status_history
             WHERE order_id = %(oid)s::uuid
               AND from_status = 'EDIT_SOURCE'
-            ORDER BY COALESCE(changed_at, created_at) DESC LIMIT 10
+            ORDER BY changed_at DESC NULLS LAST LIMIT 10
         """, {"oid": _oid}) or []
         if _hist:
             st.markdown(
@@ -2144,27 +2706,88 @@ def _render_confirm_order_block(order: Dict, lines: list, oid: str, ono: str):
                 st.rerun()
 
 
+
+
+def _infer_material_from_product_name(product_name: str, current_material: str = "") -> str:
+    """First-select material from product naming, but keep staff override editable."""
+    cur = str(current_material or "").strip()
+    if cur:
+        return cur
+    name = str(product_name or "").upper()
+    # Common shop naming: UV KT Clear / Photochromatic / Blue Block etc.
+    if "PHOTO" in name or "PGX" in name:
+        return "PHOTOCHROMATIC"
+    if "BLUE" in name or "BB" in name or "BLUECUT" in name or "BLUE CUT" in name:
+        return "BLUE BLOCK"
+    if "TINT" in name or "COLOUR" in name or "COLOR" in name:
+        return "TINTED"
+    if "CLEAR" in name or "UV" in name or "KT" in name or "KRYPTOK" in name:
+        return "CLEAR"
+    return cur
+
 def _render_line_edit_form(ln: Dict, order_id: str):
     _lid = str(ln.get("line_id") or "")
     _lp  = _parse_lp(ln.get("lens_params"))
+    _bp  = _parse_lp(ln.get("boxing_params"))
+    _inferred_material = _infer_material_from_product_name(
+        ln.get("product_name") or "",
+        _lp.get("material") or _lp.get("blank_material") or _lp.get("treatment") or "",
+    )
+
+    def _txt_val(v):
+        if v in (None, "", "None"):
+            return ""
+        try:
+            return f"{float(v):g}"
+        except Exception:
+            return str(v)
+
+    def _float_or_none(v):
+        txt = str(v or "").strip()
+        if not txt:
+            return None
+        try:
+            return float(txt)
+        except Exception:
+            return None
+
+    def _axis_or_none(v):
+        txt = str(v or "").strip()
+        if not txt:
+            return None
+        try:
+            ax = int(float(txt))
+            return min(max(ax, 0), 180)
+        except Exception:
+            return None
+
+    def _fmt_power_for_log(v):
+        try:
+            return f"{float(v):+.2f}"
+        except Exception:
+            return ""
 
     _ea, _eb, _ec, _ed = st.columns(4)
     with _ea:
-        _new_sph = st.number_input("SPH", step=0.25, format="%.2f",
-                                    value=float(ln.get("sph") or 0),
-                                    key=f"oev_sph_{_lid}")
+        _new_sph_raw = st.text_input("SPH", value=_txt_val(ln.get("sph")),
+                                     key=f"oev_sph_{_lid}")
     with _eb:
-        _new_cyl = st.number_input("CYL", step=0.25, format="%.2f",
-                                    value=float(ln.get("cyl") or 0),
-                                    key=f"oev_cyl_{_lid}")
+        _new_cyl_raw = st.text_input("CYL", value=_txt_val(ln.get("cyl")),
+                                     key=f"oev_cyl_{_lid}")
     with _ec:
-        _new_ax = st.number_input("AXIS", min_value=0, max_value=180, step=1,
-                                   value=int(ln.get("axis") or 0),
-                                   key=f"oev_ax_{_lid}")
+        _new_ax_raw = st.text_input("AXIS", value=_txt_val(ln.get("axis")),
+                                    key=f"oev_ax_{_lid}")
     with _ed:
-        _new_add = st.number_input("ADD", step=0.25, format="%.2f",
-                                    value=float(ln.get("add_power") or 0),
-                                    key=f"oev_add_{_lid}")
+        _new_add_raw = st.text_input("ADD", value=_txt_val(ln.get("add_power")),
+                                     key=f"oev_add_{_lid}")
+    _new_sph = _float_or_none(_new_sph_raw)
+    _new_cyl = _float_or_none(_new_cyl_raw)
+    _new_ax = _axis_or_none(_new_ax_raw)
+    _new_add = _float_or_none(_new_add_raw)
+    _new_sph_num = float(_new_sph or 0)
+    _new_cyl_num = float(_new_cyl or 0)
+    _new_ax_num = int(_new_ax or 0)
+    _new_add_num = float(_new_add or 0)
 
     # Lens params quick edits
     _COLOURS = ["None","Brown 25%","Brown 50%","Brown 75%","Grey 25%","Grey 50%",
@@ -2180,6 +2803,79 @@ def _render_line_edit_form(ln: Dict, order_id: str):
     _new_inst = st.text_area("Lab Instructions",
                               value=str(_lp.get("instructions") or ""),
                               height=60, key=f"oev_inst_{_lid}")
+
+    # Full lens + boxing parameters: text inputs allow backspace/blank edits.
+    st.markdown("**Lens Parameters**")
+    _l1, _l2, _l3, _l4 = st.columns(4)
+    with _l1:
+        _new_index = st.text_input(
+            "Index",
+            value=str(_lp.get("lens_index") or _lp.get("index") or ""),
+            key=f"oev_lp_index_{_lid}",
+        )
+    with _l2:
+        _new_coating = st.text_input(
+            "Coating",
+            value=str(_lp.get("coating") or ""),
+            key=f"oev_lp_coat_{_lid}",
+        )
+    with _l3:
+        _new_treatment = st.text_input(
+            "Material / Treatment",
+            value=str(_inferred_material or _lp.get("treatment") or ""),
+            key=f"oev_lp_treat_{_lid}",
+            help="Auto-selected from product name when blank (e.g. UV KT Clear → CLEAR). Staff can change it.",
+        )
+    with _l4:
+        _new_frame_type = st.text_input(
+            "Frame Type",
+            value=str(_lp.get("frame_type") or ""),
+            key=f"oev_lp_frame_{_lid}",
+        )
+
+    _l5, _l6, _l7, _l8 = st.columns(4)
+    with _l5:
+        _new_thickness = st.text_input(
+            "Thickness",
+            value=str(_lp.get("thickness") or ""),
+            key=f"oev_lp_thick_{_lid}",
+        )
+    with _l6:
+        _new_corridor = st.text_input(
+            "Corridor",
+            value=str(_lp.get("corridor") or ""),
+            key=f"oev_lp_corridor_{_lid}",
+        )
+    with _l7:
+        _new_diameter = st.text_input(
+            "Diameter",
+            value=str(_lp.get("diameter") or ""),
+            key=f"oev_lp_diameter_{_lid}",
+        )
+    with _l8:
+        _new_tinted = st.checkbox(
+            "Tinted",
+            value=bool(_lp.get("tinted")),
+            key=f"oev_lp_tinted_{_lid}",
+        )
+
+    st.markdown("**Frame / Boxing Measurements**")
+    _bvals = {}
+    _boxing_fields = [
+        ("a_box", "A"), ("b_box", "B"), ("ed", "ED"), ("ed_axis", "ED Axis"),
+        ("dbl", "DBL"), ("r_pd", "R PD"), ("l_pd", "L PD"), ("ipd", "IPD"),
+        ("fitting_ht_r", "Fit HT R"), ("fitting_ht_l", "Fit HT L"),
+        ("panto", "Panto"), ("tilt", "Tilt"), ("bvd", "BVD"),
+    ]
+    for _row_i in range(0, len(_boxing_fields), 4):
+        _cols = st.columns(4)
+        for _col, (_field, _label) in zip(_cols, _boxing_fields[_row_i:_row_i + 4]):
+            with _col:
+                _bvals[_field] = st.text_input(
+                    _label,
+                    value=_txt_val(_bp.get(_field)),
+                    key=f"oev_bp_{_field}_{_lid}",
+                )
 
     # ── Qty + Price edit ──────────────────────────────────────────────
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
@@ -2216,12 +2912,35 @@ def _render_line_edit_form(ln: Dict, order_id: str):
             _lp_new["colour"] = _new_col
             _lp_new["fitting_required"] = _new_fit
             _lp_new["instructions"] = _new_inst
+            for _k, _v in {
+                "lens_index": _new_index,
+                "index": _new_index,
+                "coating": _new_coating,
+                "treatment": _new_treatment,
+                "material": _new_treatment,
+                "frame_type": _new_frame_type,
+                "thickness": _new_thickness,
+                "corridor": _new_corridor,
+                "diameter": _new_diameter,
+            }.items():
+                if str(_v or "").strip():
+                    _lp_new[_k] = str(_v).strip()
+                else:
+                    _lp_new.pop(_k, None)
+            _lp_new["tinted"] = bool(_new_tinted)
+
+            _bp_new = {}
+            for _field, _label in _boxing_fields:
+                _num = _float_or_none(_bvals.get(_field))
+                if _num is not None:
+                    _bp_new[_field] = _num
 
             # Check if power changed — if so fetch fresh price from inventory
             _power_changed = (
-                float(_new_sph) != float(ln.get("sph") or 0) or
-                float(_new_cyl) != float(ln.get("cyl") or 0) or
-                int(_new_ax)    != int(ln.get("axis") or 0)
+                _new_sph_num != float(ln.get("sph") or 0) or
+                _new_cyl_num != float(ln.get("cyl") or 0) or
+                _new_ax_num  != int(ln.get("axis") or 0) or
+                abs(float(_new_add or 0) - float(ln.get("add_power") or 0)) > 0.001
             )
             _new_unit_price = None
             if _power_changed:
@@ -2250,12 +2969,13 @@ def _render_line_edit_form(ln: Dict, order_id: str):
             _price_up  = _new_unit_price if _new_unit_price else _new_price_input
             _disc_pct  = _new_disc_input
 
-            # ── Re-run discount engine on any edit (qty/price/product change) ──
+            # ── Re-run discount flow on any edit (qty/price/product change) ──
             # Slab rules depend on qty; brand/product rules depend on product.
-            # This ensures backoffice edits never leave stale discounts.
+            # Shared helper restamps discount + GST + net totals together.
             _edit_line = {}   # initialised here — populated inside try, read in _update_params
+            _edit_otype = str(ln.get("order_type") or "RETAIL").upper()
             try:
-                from modules.pricing.discount_engine import apply_discounts
+                from modules.pricing.discount_flow import apply_order_discounts
                 _edit_line = {
                     "product_id":   str(ln.get("product_id") or ""),
                     "brand":        str(ln.get("brand") or ""),
@@ -2264,7 +2984,9 @@ def _render_line_edit_form(ln: Dict, order_id: str):
                     "billing_qty":  _new_qty,
                     "quantity":     _new_qty,
                     "eye_side":     str(ln.get("eye_side") or ""),
-                    "sph": _new_sph, "cyl": _new_cyl,
+                    "gst_percent":  float(ln.get("gst_percent") or 0),
+                    "lens_params":  dict(_lp_new),
+                    "sph": _new_sph_num, "cyl": _new_cyl_num,
                 }
                 # Resolve party_id from order context
                 _edit_party_id = str(order_id)  # order_id is line's order_id here
@@ -2290,23 +3012,44 @@ def _render_line_edit_form(ln: Dict, order_id: str):
                                     (_pname,)
                                 ) or []
                                 if _pr: _edit_party_id = _pr[0].get("id","")
-                    apply_discounts([_edit_line], party_id=_edit_party_id, order_type=_edit_otype)
+                    apply_order_discounts([_edit_line], party_id=_edit_party_id, order_type=_edit_otype)
                     _disc_pct = float(_edit_line.get("discount_percent", _disc_pct))
                 except Exception:
                     pass  # keep user-entered discount if engine fails
             except Exception:
                 pass
 
-            _disc_amt  = round(_price_up * _new_qty * _disc_pct / 100, 2)
-            _net_price = round(_price_up * _new_qty - _disc_amt, 2)
-            _new_total = round(_price_up * _new_qty * (1 - _disc_pct/100), 2)
+            if not _edit_line:
+                _edit_line = {
+                    "unit_price": _price_up,
+                    "billing_qty": _new_qty,
+                    "quantity": _new_qty,
+                    "discount_percent": _disc_pct,
+                    "discount_amount": round(_price_up * _new_qty * _disc_pct / 100, 2),
+                    "gst_percent": float(ln.get("gst_percent") or 0),
+                    "lens_params": dict(_lp_new),
+                }
+                try:
+                    from modules.pricing.discount_flow import restamp_line_totals
+                    restamp_line_totals(_edit_line, _edit_otype)
+                except Exception:
+                    pass
+
+            _disc_pct  = float(_edit_line.get("discount_percent") or _disc_pct)
+            _disc_amt  = float(_edit_line.get("discount_amount") or 0)
+            _net_price = float(_edit_line.get("billing_total") or _edit_line.get("total_price") or 0)
+            _new_total = _net_price
+            _gst_amt   = float(_edit_line.get("gst_amount") or 0)
+            _lp_new    = dict(_edit_line.get("lens_params") or _lp_new)
 
             _update_fields = """
                 sph = %(sph)s, cyl = %(cyl)s,
                 axis = %(axis)s, add_power = %(add)s,
                 lens_params = %(lp)s::jsonb,
+                boxing_params = %(bp)s::jsonb,
                 quantity = %(qty)s,
                 unit_price = %(up)s,
+                gst_amount = %(ga)s,
                 discount_percent = %(dp)s,
                 discount_amount = %(da)s,
                 billing_total = %(bt)s,
@@ -2314,13 +3057,15 @@ def _render_line_edit_form(ln: Dict, order_id: str):
                 applied_rule_ids = %(ari)s
             """
             _update_params = {
-                "sph":  float(_new_sph),
-                "cyl":  float(_new_cyl),
-                "axis": int(_new_ax),
-                "add":  float(_new_add),
-                "lp":   json.dumps(_lp_new),
+                "sph":  float(_new_sph) if _new_sph is not None else None,
+                "cyl":  float(_new_cyl) if _new_cyl is not None else None,
+                "axis": int(_new_ax) if _new_ax is not None else None,
+                "add":  float(_new_add) if _new_add is not None else None,
+                "lp":   _safe_json_text(_lp_new),
+                "bp":   _safe_json_text(_bp_new),
                 "qty":  _new_qty,
                 "up":   _price_up,
+                "ga":   _gst_amt,
                 "dp":   _disc_pct,
                 "da":   _disc_amt,
                 "bt":   _net_price,
@@ -2333,7 +3078,24 @@ def _render_line_edit_form(ln: Dict, order_id: str):
                 f"UPDATE order_lines SET {_update_fields} WHERE id = %(lid)s::uuid",
                 _update_params
             )
-            if ok:
+            if ok is not False:   # None = success (PostgreSQL UPDATE returns None)
+                _sync_pricing_after_edit(order_id)
+                try:
+                    _write("""
+                        INSERT INTO order_status_history
+                            (order_id, from_status, to_status, changed_by_name, remarks)
+                        VALUES (%(oid)s::uuid, 'EDIT_SOURCE', 'EDIT_SOURCE', %(by)s, %(remarks)s)
+                    """, {
+                        "oid": order_id,
+                        "by": st.session_state.get("user_name", "Backoffice"),
+                        "remarks": (
+                            f"Line edited: {_lid[:8]} | SPH {_fmt_power_for_log(_new_sph)}, "
+                            f"CYL {_fmt_power_for_log(_new_cyl)}, AX {_new_ax or ''}, ADD {_fmt_power_for_log(_new_add)}, "
+                            f"Qty {_new_qty}, Total Rs {_new_total:,.2f}"
+                        ),
+                    })
+                except Exception:
+                    pass
                 if _power_changed and _new_unit_price:
                     st.success(f"✅ Line updated — price refreshed to ₹{_new_unit_price:,.2f} from inventory")
                 else:
@@ -2367,9 +3129,12 @@ def _render_line_edit_form(ln: Dict, order_id: str):
                               AND COALESCE(billed_qty, 0) = 0
                         """, {"lid": _lid})
                         st.session_state.pop(_del_key, None)
-                        if ok:
+                        if ok is not False:
+                            _sync_pricing_after_edit(order_id)
                             st.success("🗑️ Line removed")
                             st.rerun()
+                        else:
+                            st.error("❌ Delete failed — line may already be billed")
                 with _cn:
                     if st.button("❌ No", key=f"oev_del_no_{_lid}",
                                  width='stretch'):

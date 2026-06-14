@@ -106,12 +106,12 @@ def _load_velocity_data(period_days: int):
                 SUM(oi.quantity)::int                              AS units_sold,
                 (SUM(oi.quantity)::float / %(days)s)::float       AS velocity,
                 SUM(oi.quantity * oi.unit_price)::float           AS revenue
-            FROM order_items oi
-            JOIN products p ON p.product_id = oi.product_id
+            FROM order_lines oi
+            JOIN products p ON p.id = oi.product_id
             JOIN orders o ON o.id = oi.order_id
             WHERE o.created_at >= NOW() - INTERVAL '%(days)s days'
               AND o.status NOT IN ('CANCELLED')
-            GROUP BY p.product_id, p.product_name, p.brand, p.main_group
+            GROUP BY p.id, p.product_name, p.brand, p.main_group
             ORDER BY units_sold DESC
             LIMIT 50
         """.replace("'%(days)s days'", f"'{period_days} days'"), {"days": period_days})
@@ -129,25 +129,30 @@ def _load_velocity_data(period_days: int):
                 COALESCE(inv.current_stock, 0)::int               AS current_stock,
                 EXTRACT(DAY FROM NOW() - COALESCE(
                     (SELECT MAX(o.created_at)
-                     FROM order_items oi2
+                     FROM order_lines oi2
                      JOIN orders o ON o.id = oi2.order_id
-                     WHERE oi2.product_id = p.product_id
+                     WHERE oi2.product_id = p.id
                        AND o.status NOT IN ('CANCELLED')
                     ), NOW() - INTERVAL '999 days'
                 ))::int                                            AS days_no_sales,
-                COALESCE(inv.current_stock * p.avg_cost, 0)::float AS stock_value
+                COALESCE(inv.stock_value, 0)::float AS stock_value
             FROM products p
             LEFT JOIN (
-                SELECT product_id, SUM(quantity)::int AS current_stock
-                FROM inventory_batches WHERE status = 'ACTIVE'
+                SELECT
+                    product_id,
+                    SUM(quantity)::int AS current_stock,
+                    SUM(quantity * COALESCE(purchase_rate, purchase_price, 0)) AS stock_value
+                FROM inventory_stock
+                WHERE COALESCE(is_active, TRUE) = TRUE
                 GROUP BY product_id
-            ) inv ON inv.product_id = p.product_id
+            ) inv ON inv.product_id = p.id
             WHERE COALESCE(inv.current_stock, 0) > 0
+            GROUP BY p.id, p.product_name, p.brand, inv.current_stock, inv.stock_value
             HAVING EXTRACT(DAY FROM NOW() - COALESCE(
                 (SELECT MAX(o.created_at)
-                 FROM order_items oi3
+                 FROM order_lines oi3
                  JOIN orders o ON o.id = oi3.order_id
-                 WHERE oi3.product_id = p.product_id
+                 WHERE oi3.product_id = p.id
                    AND o.status NOT IN ('CANCELLED')
                 ), NOW() - INTERVAL '999 days'
             )) >= 60
@@ -162,8 +167,8 @@ def _load_velocity_data(period_days: int):
                 TO_CHAR(o.created_at, 'YYYY-MM') AS month,
                 p.main_group,
                 SUM(oi.quantity)::int             AS units_sold
-            FROM order_items oi
-            JOIN products p ON p.product_id = oi.product_id
+            FROM order_lines oi
+            JOIN products p ON p.id = oi.product_id
             JOIN orders o ON o.id = oi.order_id
             WHERE o.created_at >= NOW() - INTERVAL '12 months'
               AND o.status NOT IN ('CANCELLED')

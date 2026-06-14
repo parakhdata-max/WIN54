@@ -10,6 +10,9 @@ Data flow:
 
 import streamlit as st
 import pandas as pd
+import logging
+import re
+import json
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, date, timedelta
 import uuid as _uuid
@@ -19,6 +22,8 @@ from modules.core.price_qty_governor import (
     reverse_qty,
     PAIR_TO_PCS,
 )
+
+log = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -222,8 +227,15 @@ def _is_order_billing_ready(order_id: str) -> Tuple[bool, str]:
         SELECT ol.id, ol.quantity, ol.allocated_qty,
                COALESCE(ol.ready_qty,  0)  AS ready_qty,
                COALESCE(ol.billed_qty, 0)  AS billed_qty,
-               COALESCE(ol.lens_params->'manufacturing_route','STOCK') AS manufacturing_route,
-               COALESCE(ol.lens_params->'order_source','')             AS line_order_source,
+               COALESCE(
+                   NULLIF(ol.lens_params->>'manufacturing_route',''),
+                   NULLIF(ol.lens_params->>'production_route',''),
+                   NULLIF(ol.lens_params->>'fulfillment_route',''),
+                   NULLIF(ol.lens_params->>'stock_source',''),
+                   NULLIF(ol.lens_params->>'route',''),
+                   'STOCK'
+               ) AS manufacturing_route,
+               COALESCE(ol.lens_params->>'order_source','')             AS line_order_source,
                ol.status AS line_status,
                COALESCE(ol.is_service_line, FALSE) AS is_service_line,
                COALESCE(ol.eye_side, '')            AS eye_side,
@@ -260,18 +272,39 @@ def _is_order_billing_ready(order_id: str) -> Tuple[bool, str]:
             if alloc < qty:
                 return False, f"Stock not fully allocated ({alloc}/{qty})"
 
-        elif route in ("VENDOR", "EXTERNAL_LAB"):
+        elif route in ("VENDOR", "SUPPLIER", "EXTERNAL_LAB", "EXTERNAL"):
             rcv = _q("""
                 SELECT COALESCE(SUM(soi.received_qty),0) AS rcv,
                        COALESCE(SUM(soi.ordered_qty), 0) AS ord
                 FROM supplier_order_items soi
-                JOIN supplier_orders so ON so.id = soi.supplier_order_id
-                WHERE so.order_id = %(oid)s::uuid
-            """, {"oid": order_id})
+                WHERE soi.customer_line_id::text = %(lid)s
+            """, {"lid": str(ln["id"])})
             if rcv:
                 r, o = int(rcv[0]["rcv"] or 0), int(rcv[0]["ord"] or 0)
                 if o > 0 and r < o:
                     return False, f"Supplier delivery pending ({r}/{o})"
+            proc = _q("""
+                SELECT 1
+                FROM purchase_acknowledgements pa
+                WHERE pa.order_line_id = %(lid)s::uuid
+                  AND COALESCE(pa.purchase_price, 0) > 0
+                  AND COALESCE(pa.qty, pa.received_qty, 0) > 0
+                  AND COALESCE(pa.billing_status, '') IN
+                      ('PURCHASE_ACKED','PROCURED','READY_FOR_BILLING','LOCKED','INVOICED')
+                UNION ALL
+                SELECT 1
+                FROM procurement_order_items poi
+                JOIN procurement_receipts pr
+                  ON pr.procurement_order_id = poi.procurement_order_id
+                WHERE poi.order_line_id = %(lid)s::uuid
+                  AND COALESCE(poi.unit_price, 0) > 0
+                  AND COALESCE(poi.qty_received, 0) >= GREATEST(COALESCE(poi.qty_ordered, poi.qty_requested, 0), %(qty)s)
+                  AND COALESCE(poi.status, '') IN
+                      ('PROCURED','RECEIVED','INVOICED','PURCHASE_ACKED','READY','LOCKED')
+                LIMIT 1
+            """, {"lid": str(ln["id"]), "qty": qty})
+            if not proc:
+                return False, "Supplier/external purchase not procured — record purchase receipt before billing"
 
         elif route == "INHOUSE":
             jobs = _q("""
@@ -282,7 +315,7 @@ def _is_order_billing_ready(order_id: str) -> Tuple[bool, str]:
                 return False, "Job card not created yet"
             for j in jobs:
                 if not j.get("is_closed") and str(j.get("current_stage") or "").upper() \
-                        not in ("READY", "DISPATCHED", "CLOSED"):
+                        not in ("READY_TO_BILL", "READY_FOR_BILLING", "CLOSED"):
                     return False, f"Production not complete (stage: {j.get('current_stage')})"
 
     return True, "All lines complete"
@@ -338,7 +371,11 @@ def _calc_billing_totals(order_ids: list) -> dict:
 
     rows = _q("""
         SELECT o.order_no, o.order_type,
-               COALESCE(p.product_name, 'Service')           AS product_name,
+               COALESCE(p.product_name,
+                        ol.lens_params->>'service_display_name',
+                        ol.lens_params->>'display_product_name',
+                        ol.lens_params->>'service_description',
+                        'Service')                          AS product_name,
                GREATEST(COALESCE(p.box_size, 1), 1)          AS box_size,
                COALESCE(p.unit, 'PCS')                       AS unit,
                COALESCE(ol.quantity, 0)                      AS quantity,
@@ -406,7 +443,7 @@ def _calc_billing_totals(order_ids: list) -> dict:
 
 def _fmt_currency(v) -> str:
     try:    return f"₹{float(v):,.2f}"
-    except: return "₹0.00"
+    except (TypeError, ValueError): return "₹0.00"
 
 
 def _fmt_date(v) -> str:
@@ -415,11 +452,30 @@ def _fmt_date(v) -> str:
         if isinstance(v, (date, datetime)):
             return v.strftime("%d %b %Y")
         return datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%d %b %Y")
-    except:
+    except Exception as e:
+        log.debug("Challan date format fallback: %s", e)
         return str(v)[:10]
 
 
-def _fmt_qty(qty, box_size, unit) -> str:
+def _fmt_qty(qty, box_size, unit, lens_params=None, is_service_line=False, eye_side="") -> str:
+    if bool(is_service_line) or str(eye_side or "").upper() in ("S", "SERVICE") or str(unit or "").upper() == "SERVICE":
+        lp = lens_params or {}
+        if isinstance(lp, str):
+            try:
+                lp = json.loads(lp)
+            except Exception:
+                lp = {}
+        try:
+            factor = float((lp or {}).get("service_qty_factor") or 0)
+        except Exception:
+            factor = 0.0
+        if factor > 0:
+            if abs(factor - 0.5) < 0.001:
+                return "0.5 pair"
+            if abs(factor - 1.0) < 0.001:
+                return "1 pair"
+            return f"{factor:g} pair"
+        return "1 service"
     q = int(qty or 0)
     bs = int(box_size or 1)
     u = str(unit or "PCS").upper()
@@ -464,7 +520,104 @@ def _alloc_ch_no() -> str:
     return alloc_doc_number("CHALLAN")
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_challan_preview(challan_no: str):
+def _norm_challan_order_ids(raw) -> list[str]:
+    if isinstance(raw, list):
+        return [str(x) for x in raw if str(x or "").strip()]
+    if isinstance(raw, tuple):
+        return [str(x) for x in raw if str(x or "").strip()]
+    if isinstance(raw, str):
+        import re as _re_ch_oid
+        return [
+            x.strip().strip('"')
+            for x in _re_ch_oid.sub(r"[{}]", "", raw).split(",")
+            if x.strip()
+        ]
+    return [str(raw)] if raw else []
+
+
+def _create_invoice_from_challan_preview(ch: dict) -> tuple[bool, str]:
+    """Create a full invoice from the immutable challan snapshot."""
+    try:
+        from modules.billing.challan_invoice_manager import create_invoice
+        _inv_no = create_invoice(
+            challan_id=str(ch.get("id") or ""),
+            party_id=str(ch.get("party_id") or ""),
+            order_ids=_norm_challan_order_ids(ch.get("order_ids")),
+            total_amount=float(ch.get("total_amount") or 0),
+            total_tax=float(ch.get("total_tax") or 0),
+            due_days=0,
+            remarks=f"Converted from challan {ch.get('challan_no') or ''}".strip(),
+        )
+        if _inv_no:
+            return True, f"✅ Invoice {_inv_no} created from challan {ch.get('challan_no')}"
+        return False, "Invoice creation failed — no invoice number returned."
+    except Exception as _e:
+        log.exception("Challan preview invoice conversion failed")
+        return False, f"Invoice creation failed: {_e}"
+
+
+def _sync_invoice_payment_from_challan(invoice_id: str) -> bool:
+    """Attach challan payments to invoice and refresh invoice/challan statuses."""
+    if not invoice_id:
+        return False
+    try:
+        from modules.sql_adapter import run_write as _rw_sync_inv
+        _rw_sync_inv("""
+            UPDATE payments p
+            SET invoice_id = %(iid)s::uuid
+            FROM invoices i
+            WHERE i.id = %(iid)s::uuid
+              AND p.challan_id = i.challan_id
+              AND p.invoice_id IS NULL
+              AND COALESCE(p.is_deleted, FALSE) = FALSE
+        """, {"iid": str(invoice_id)})
+        _rw_sync_inv("""
+            UPDATE invoices i
+            SET amount_paid = COALESCE((
+                    SELECT SUM(p.amount)
+                    FROM payments p
+                    WHERE p.invoice_id = i.id
+                      AND COALESCE(p.is_deleted, FALSE) = FALSE
+                ), 0),
+                balance_due = GREATEST(COALESCE(i.grand_total,0) - COALESCE((
+                    SELECT SUM(p.amount)
+                    FROM payments p
+                    WHERE p.invoice_id = i.id
+                      AND COALESCE(p.is_deleted, FALSE) = FALSE
+                ), 0), 0),
+                payment_status = CASE
+                    WHEN GREATEST(COALESCE(i.grand_total,0) - COALESCE((
+                        SELECT SUM(p.amount)
+                        FROM payments p
+                        WHERE p.invoice_id = i.id
+                          AND COALESCE(p.is_deleted, FALSE) = FALSE
+                    ), 0), 0) <= 0.01 THEN 'PAID'
+                    WHEN COALESCE((
+                        SELECT SUM(p.amount)
+                        FROM payments p
+                        WHERE p.invoice_id = i.id
+                          AND COALESCE(p.is_deleted, FALSE) = FALSE
+                    ), 0) > 0 THEN 'PARTIAL'
+                    ELSE 'UNPAID'
+                END,
+                updated_at = NOW()
+            WHERE i.id = %(iid)s::uuid
+        """, {"iid": str(invoice_id)})
+        _rw_sync_inv("""
+            UPDATE challans c
+            SET status = 'INVOICED',
+                updated_at = NOW()
+            FROM invoices i
+            WHERE i.id = %(iid)s::uuid
+              AND c.id = i.challan_id
+              AND c.status NOT IN ('CANCELLED', 'VOID')
+        """, {"iid": str(invoice_id)})
+        return True
+    except Exception as _e:
+        log.warning("Invoice/challan payment sync skipped: %s", _e)
+        return False
+
+def render_challan_preview(challan_no: str, key_prefix: str = ""):
     _inject_css()
 
     challan_data = _q("""
@@ -505,9 +658,14 @@ def render_challan_preview(challan_no: str):
             ol.cyl                                      AS cyl,
             ol.axis                                     AS axis,
             ol.add_power                                AS add_power,
+            ol.lens_params                              AS lens_params,
+            COALESCE(ol.is_service_line, FALSE)         AS is_service_line,
             cl.quantity,
             cl.unit_price,
             cl.line_total,
+            GREATEST(0, COALESCE(ol.discount_amount,
+                ROUND(cl.unit_price * cl.quantity - COALESCE(cl.total_price, cl.line_total, 0), 2),
+                0))                                         AS discount_amount,
             COALESCE(ol.gst_percent, cl.gst_percent, 0) AS gst_percent
         FROM challan_lines cl
         LEFT JOIN orders o      ON o.id  = cl.order_id
@@ -586,34 +744,45 @@ def render_challan_preview(challan_no: str):
             try:
                 f = float(v)
                 return f"{f:+.2f}" if not _math.isnan(f) else "—"
-            except: return "—"
+            except (TypeError, ValueError): return "—"
 
         def _desc_html(ln):
-            """Tally-style: product name + eye tag + power string in one cell."""
+            """Compact: product + one horizontal line for order/eye/RX."""
             eye   = str(ln.get("eye_side") or "").upper()
+            order_no = str(ln.get("order_no") or "")
             pname = str(ln.get("product_name") or "—")
             brand = str(ln.get("brand") or "")
             _ecol = {"R":"#3b82f6","L":"#10b981","B":"#a855f7","S":"#f59e0b"}.get(eye, "#64748b")
-            _etxt = {"R":"👁 Right Eye","L":"👁 Left Eye","B":"👁👁 Both","S":"⚙️ Service"}.get(eye, eye)
+            _etxt = {"R":"R","L":"L","B":"BOTH","S":"SERVICE"}.get(eye, eye)
             # Power string
             pw_parts = []
             if ln.get("sph") is not None: pw_parts.append(f"SPH {_rx(ln['sph'])}")
             if ln.get("cyl") is not None: pw_parts.append(f"CYL {_rx(ln['cyl'])}")
             if ln.get("axis"):
                 try: pw_parts.append(f"AX {int(float(ln['axis']))}")
-                except: pass
+                except (TypeError, ValueError): pass
             if ln.get("add_power"):
                 try:
                     av = float(ln["add_power"])
                     if abs(av) > 0.001: pw_parts.append(f"ADD {av:+.2f}")
-                except: pass
+                except (TypeError, ValueError): pass
             pw_str = "  ".join(pw_parts)
-            out  = f"<b style='color:#e2e8f0'>{pname}</b>"
-            if brand: out += f"<span style='color:#475569;font-size:0.63rem'> &nbsp;{brand}</span>"
+            meta = []
+            if order_no:
+                meta.append(order_no)
             if eye and eye not in ("","O","OTHER"):
-                out += f"<br><span style='background:{_ecol}22;color:{_ecol};font-size:0.63rem;padding:1px 6px;border-radius:3px;font-weight:700'>{_etxt}</span>"
+                meta.append(f"<span style='color:{_ecol};font-weight:800'>{_etxt}</span>")
             if pw_str:
-                out += f"<br><span style='font-family:monospace;font-size:0.65rem;color:#94a3b8'>{pw_str}</span>"
+                meta.append(pw_str)
+            out  = f"<b style='color:#e2e8f0'>{pname}</b>"
+            if brand: out += f"<span style='color:#475569;font-size:0.62rem'> &nbsp;{brand}</span>"
+            if meta:
+                out += (
+                    "<br><span style='font-family:monospace;font-size:0.63rem;"
+                    "color:#94a3b8;white-space:nowrap'>"
+                    + " &nbsp;·&nbsp; ".join(meta)
+                    + "</span>"
+                )
             return out
 
         from itertools import groupby as _grp
@@ -621,17 +790,24 @@ def render_challan_preview(challan_no: str):
         sno = 0
         for order_no, grp_lines in _grp(lines, key=lambda x: x.get("order_no", "—")):
             rows_html += (
-                f"<tr><td colspan='7' style='background:#0f172a;color:#38bdf8;"
+                f"<tr><td colspan='8' style='background:#0f172a;color:#38bdf8;"
                 f"font-size:0.68rem;font-family:monospace;padding:4px 12px;"
                 f"letter-spacing:.06em;border-left:3px solid #38bdf8'>📦 {order_no}</td></tr>"
             )
             for ln in grp_lines:
                 sno += 1
-                qty_d = _fmt_qty(ln.get("quantity"), ln.get("box_size"), ln.get("unit"))
+                qty_d = _fmt_qty(
+                    ln.get("quantity"),
+                    ln.get("box_size"),
+                    ln.get("unit"),
+                    ln.get("lens_params"),
+                    ln.get("is_service_line"),
+                    ln.get("eye_side"),
+                )
                 up    = float(ln.get("unit_price") or 0)
                 lt    = float(ln.get("line_total") or 0)
+                disc  = float(ln.get("discount_amount") or 0)
                 gp    = float(ln.get("gst_percent") or 0)
-                # Per-line tax
                 _ln_tax = float(lt * gp / (100 + gp)) if is_retail else float(lt * gp / 100)
                 _ln_gst = _gst_split(_ln_tax, party_gstin=_ch_gstin)
                 if _ch_inter:
@@ -647,12 +823,18 @@ def render_challan_preview(challan_no: str):
                 _ln_mrp = float(ln.get("product_mrp") or ln.get("mrp") or 0)
                 _price_warn = (_ln_otype=="WHOLESALE" and _ln_sp<=0 and _ln_mrp>0 and abs(up-_ln_mrp)<0.01)
                 rate_lbl = ("⚠️ " if _price_warn else "") + _fmt_currency(up)
+                _disc_disp = (
+                    f"<span style='color:#f87171;font-size:0.75rem'>-{_fmt_currency(disc)}</span>"
+                    if disc > 0.005 else
+                    "<span style='color:#334155'>—</span>"
+                )
                 rows_html += (
                     f"<tr>"
                     f"<td style='text-align:center;color:#475569;font-size:0.7rem'>{sno}</td>"
                     f"<td>{_desc_html(ln)}</td>"
                     f"<td class='num'>{qty_d}</td>"
                     f"<td class='num'>{rate_lbl}</td>"
+                    f"<td class='num'>{_disc_disp}</td>"
                     f"<td class='num'>{_fmt_currency(lt)}</td>"
                     f"<td class='num' style='font-size:0.68rem'>{gp:.0f}%</td>"
                     f"<td class='num'>{_tax_disp}</td>"
@@ -754,6 +936,7 @@ def render_challan_preview(challan_no: str):
             <th>Description</th>
             <th style='text-align:right'>Qty</th>
             <th style='text-align:right'>{"MRP/Unit" if is_retail else "Rate"}</th>
+            <th style='text-align:right'>Disc ₹</th>
             <th style='text-align:right'>{"MRP Total" if is_retail else "Amount"}</th>
             <th style='text-align:right'>GST%</th>
             <th style='text-align:right'>{_gst_col_hdr}</th>
@@ -784,11 +967,17 @@ def render_challan_preview(challan_no: str):
 
     # ── Smart Print ──────────────────────────────────────────────────────
     st.markdown("---")
-    _sp_key = f"_show_ch_print_{ch['id']}"
-    if st.button("🖨️ Smart Print / PDF", key=f"chprint_{ch['id']}",
-                 type="secondary", use_container_width=True,
-                 help="A4 challan with CGST/SGST or IGST split, lens powers, signature"):
-        st.session_state[_sp_key] = not st.session_state.get(_sp_key, False)
+    _ctx_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(key_prefix or "main"))
+    _sp_key = f"_show_ch_print_{_ctx_key}_{ch['id']}"
+    _sp_open = st.session_state.get(_sp_key, False)
+    if st.button(
+        "✕ Close Print Preview" if _sp_open else "🖨️ Smart Print / PDF",
+        key=f"chprint_{_ctx_key}_{ch['id']}",
+        type="secondary", use_container_width=True,
+        help="A4 challan with CGST/SGST or IGST split, lens powers, signature",
+    ):
+        st.session_state[_sp_key] = not _sp_open
+        st.rerun()
     if st.session_state.get(_sp_key):
         try:
             from modules.billing.smart_print import render_smart_challan
@@ -799,8 +988,262 @@ def render_challan_preview(challan_no: str):
             with st.expander("Traceback"): st.code(traceback.format_exc())
 
     # ── Create Invoice from this challan ─────────────────────────────────
-    if ch.get("status") == "PENDING":
+    _ch_status_for_invoice = str(ch.get("status") or "PENDING").upper()
+    if _ch_status_for_invoice not in ("INVOICED", "CANCELLED", "VOID"):
         st.markdown("---")
+
+        # ── Discount / Price edit for PENDING challans (admin/manager only) ──
+        try:
+            from modules.security.roles import has_role as _hr_edit
+            _can_edit = _hr_edit("admin", "manager", "billing")
+        except Exception:
+            _can_edit = True  # fail open
+
+        if _can_edit and _ch_status_for_invoice == "PENDING":
+            with st.expander("✏️ Edit Line Discounts / Prices", expanded=False):
+                st.markdown(
+                    "<div style='color:#f59e0b;font-size:0.75rem;margin-bottom:8px'>"
+                    "⚠️ Edits update challan lines and recalculate challan totals. "
+                    "Only allowed while challan is PENDING (before invoice is raised).</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Re-fetch challan lines with order_line_id for the UPDATE
+                _edit_lines = _q("""
+                    SELECT
+                        cl.id::text             AS cl_id,
+                        cl.order_line_id::text  AS order_line_id,
+                        COALESCE(p.product_name, cl.product_name, 'Lens') AS product_name,
+                        COALESCE(cl.eye_side, ol.eye_side, '')  AS eye_side,
+                        cl.quantity,
+                        cl.unit_price,
+                        GREATEST(0, COALESCE(ol.discount_amount,
+                            ROUND(cl.unit_price * cl.quantity
+                                - COALESCE(cl.total_price, cl.line_total, 0), 2),
+                            0))                     AS discount_amount,
+                        COALESCE(cl.total_price, cl.line_total, 0) AS total_price,
+                        cl.line_total,
+                        COALESCE(ol.gst_percent, 0) AS gst_percent,
+                        COALESCE(o.order_type, 'WHOLESALE') AS order_type
+                    FROM challan_lines cl
+                    LEFT JOIN order_lines ol ON ol.id = cl.order_line_id
+                    LEFT JOIN orders o       ON o.id  = cl.order_id
+                    LEFT JOIN products p     ON p.id  = ol.product_id
+                    WHERE cl.challan_id = %(cid)s::uuid
+                      AND COALESCE(cl.is_deleted, FALSE) = FALSE
+                    ORDER BY cl.id
+                """, {"cid": str(ch["id"])})
+
+                if not _edit_lines:
+                    st.caption("No lines found.")
+                else:
+                    import decimal as _dec_cp
+                    def _r2cp(v):
+                        try:
+                            return float(_dec_cp.Decimal(str(v)).quantize(
+                                _dec_cp.Decimal("0.01"), rounding=_dec_cp.ROUND_HALF_UP))
+                        except Exception:
+                            return round(float(v or 0), 2)
+
+                    # Discount mode toggle — shared across all lines in this challan
+                    _disc_mode_key = f"cp_disc_mode_{ch['id']}"
+                    _disc_mode = st.radio(
+                        "Discount input as",
+                        ["₹ Amount", "% Percent"],
+                        horizontal=True,
+                        key=_disc_mode_key,
+                        help="Choose whether to enter discount as a flat amount or a percentage of unit price × qty",
+                    )
+                    _disc_by_pct = (_disc_mode == "% Percent")
+
+                    # Header — label changes with mode
+                    _disc_col_lbl = "Disc %" if _disc_by_pct else "Disc ₹"
+                    _eh = st.columns([3, 0.7, 1.2, 1.2, 1.2])
+                    for _col, _lbl in zip(_eh, ["Product", "Qty", "Unit ₹", _disc_col_lbl, "Net ₹"]):
+                        _col.markdown(
+                            f"<div style='font-size:0.65rem;font-weight:700;color:#475569;"
+                            f"text-transform:uppercase;border-bottom:1px solid #1e3a5f;"
+                            f"padding-bottom:3px'>{_lbl}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    _edit_data = []
+                    for _ei, _el in enumerate(_edit_lines):
+                        _ec1, _ec2, _ec3, _ec4, _ec5 = st.columns([3, 0.7, 1.2, 1.2, 1.2])
+                        _eye_e = str(_el.get("eye_side","")).upper()
+                        _pname_e = str(_el.get("product_name","—"))
+                        with _ec1:
+                            st.markdown(
+                                f"<div style='font-size:0.8rem;color:#e2e8f0;"
+                                f"font-weight:600;padding-top:6px'>"
+                                f"{_eye_e + ' — ' if _eye_e else ''}{_pname_e}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with _ec2:
+                            st.markdown(
+                                f"<div style='font-size:0.82rem;color:#94a3b8;"
+                                f"padding-top:6px'>{int(_el.get('quantity') or 1)}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with _ec3:
+                            _new_up = _r2cp(st.number_input(
+                                "Unit ₹", value=float(_el.get("unit_price") or 0),
+                                min_value=0.0, step=0.01, format="%.2f",
+                                key=f"cp_up_{_ei}_{_el['cl_id']}",
+                                label_visibility="collapsed",
+                            ))
+                        with _ec4:
+                            _qty_e   = int(_el.get("quantity") or 1)
+                            _gross_e = _r2cp(_new_up * _qty_e)
+                            _stored_disc_amt = float(_el.get("discount_amount") or 0)
+                            _stored_disc_pct = (
+                                _r2cp(_stored_disc_amt / _gross_e * 100)
+                                if _gross_e > 0 else 0.0
+                            )
+                            if _disc_by_pct:
+                                _input_pct = _r2cp(st.number_input(
+                                    "Disc %",
+                                    value=_stored_disc_pct,
+                                    min_value=0.0, max_value=100.0,
+                                    step=0.5, format="%.2f",
+                                    key=f"cp_disc_{_ei}_{_el['cl_id']}",
+                                    label_visibility="collapsed",
+                                    help="% of (unit price × qty)",
+                                ))
+                                _new_disc = _r2cp(_gross_e * _input_pct / 100)
+                                # Show computed amount as caption
+                                st.caption(f"= ₹{_new_disc:,.2f}")
+                            else:
+                                _new_disc = _r2cp(st.number_input(
+                                    "Disc ₹",
+                                    value=_stored_disc_amt,
+                                    min_value=0.0, step=0.5, format="%.2f",
+                                    key=f"cp_disc_{_ei}_{_el['cl_id']}",
+                                    label_visibility="collapsed",
+                                    help="Flat discount amount for this line",
+                                ))
+                                if _gross_e > 0:
+                                    st.caption(f"= {_r2cp(_new_disc/_gross_e*100):.2f}%")
+                        _taxable_e = _r2cp(max(_gross_e - _new_disc, 0))
+                        _gst_e   = float(_el.get("gst_percent") or 0)
+                        _otype_e = str(_el.get("order_type","WHOLESALE")).upper()
+
+                        if _otype_e == "RETAIL":
+                            _gst_amt_e  = _r2cp(_taxable_e * _gst_e / (100 + _gst_e)) if _gst_e else 0.0
+                            _line_tot_e = _taxable_e
+                        else:
+                            _gst_amt_e  = _r2cp(_taxable_e * _gst_e / 100)
+                            _line_tot_e = _r2cp(_taxable_e + _gst_amt_e)
+
+                        with _ec5:
+                            _changed = (
+                                abs(_new_disc - float(_el.get("discount_amount") or 0)) > 0.005
+                                or abs(_new_up - float(_el.get("unit_price") or 0)) > 0.005
+                            )
+                            _net_color = "#fbbf24" if _changed else "#10b981"
+                            st.markdown(
+                                f"<div style='font-size:0.85rem;color:{_net_color};"
+                                f"font-weight:700;padding-top:6px'>₹{_line_tot_e:,.2f}</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        _edit_data.append({
+                            "cl_id":          _el["cl_id"],
+                            "order_line_id":  _el.get("order_line_id",""),
+                            "unit_price":     _new_up,
+                            "discount_amount":_new_disc,
+                            "total_price":    _taxable_e,
+                            "line_total":     _line_tot_e,
+                            "gst_amount":     _gst_amt_e,
+                            "changed":        _changed,
+                        })
+
+                    _changed_lines = [e for e in _edit_data if e["changed"]]
+                    if _changed_lines:
+                        st.markdown(
+                            f"<div style='color:#fbbf24;font-size:0.75rem;margin:6px 0'>"
+                            f"⚡ {len(_changed_lines)} line(s) changed — click Save to apply.</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    if st.button(
+                        "💾 Save Line Edits",
+                        key=f"cp_save_edit_{ch['id']}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not _changed_lines,
+                    ):
+                        try:
+                            from modules.sql_adapter import run_write as _rw_edit, run_transaction as _rtx_edit
+                            _tx_edit = []
+                            for _ed in _changed_lines:
+                                # Update challan_lines
+                                _tx_edit.append(("""
+                                    UPDATE challan_lines SET
+                                        unit_price      = %(up)s,
+                                        discount_amount = %(disc)s,
+                                        total_price     = %(tp)s,
+                                        line_total      = %(lt)s
+                                    WHERE id = %(cid)s::uuid
+                                """, {
+                                    "up":   _ed["unit_price"],
+                                    "disc": _ed["discount_amount"],
+                                    "tp":   _ed["total_price"],
+                                    "lt":   _ed["line_total"],
+                                    "cid":  _ed["cl_id"],
+                                }))
+                                # Update order_lines for consistency
+                                if _ed["order_line_id"]:
+                                    _tx_edit.append(("""
+                                        UPDATE order_lines SET
+                                            unit_price      = %(up)s,
+                                            discount_amount = %(disc)s,
+                                            total_price     = %(tp)s,
+                                            billing_total   = %(tp)s,
+                                            gst_amount      = %(ga)s
+                                        WHERE id = %(olid)s::uuid
+                                    """, {
+                                        "up":   _ed["unit_price"],
+                                        "disc": _ed["discount_amount"],
+                                        "tp":   _ed["total_price"],
+                                        "ga":   _ed["gst_amount"],
+                                        "olid": _ed["order_line_id"],
+                                    }))
+
+                            # Recalculate challan header totals from lines
+                            _tx_edit.append(("""
+                                UPDATE challans SET
+                                    total_amount = (
+                                        SELECT COALESCE(SUM(total_price), 0)
+                                        FROM challan_lines
+                                        WHERE challan_id = %(cid)s::uuid
+                                          AND COALESCE(is_deleted, FALSE) = FALSE
+                                    ),
+                                    grand_total = (
+                                        SELECT COALESCE(SUM(line_total), 0)
+                                        FROM challan_lines
+                                        WHERE challan_id = %(cid)s::uuid
+                                          AND COALESCE(is_deleted, FALSE) = FALSE
+                                    ),
+                                    total_tax = (
+                                        SELECT COALESCE(SUM(line_total), 0) -
+                                               COALESCE(SUM(total_price), 0)
+                                        FROM challan_lines
+                                        WHERE challan_id = %(cid)s::uuid
+                                          AND COALESCE(is_deleted, FALSE) = FALSE
+                                    ),
+                                    updated_at = NOW()
+                                WHERE id = %(cid)s::uuid
+                            """, {"cid": str(ch["id"])}))
+
+                            _rtx_edit(_tx_edit)
+                            st.success(
+                                f"✅ {len(_changed_lines)} line(s) updated. "
+                                f"Challan totals recalculated."
+                            )
+                            st.rerun()
+                        except Exception as _ee:
+                            st.error(f"Save failed: {_ee}")
         _inv_exists = _q(
             "SELECT invoice_no FROM invoices WHERE challan_id=%(cid)s AND COALESCE(is_deleted,FALSE)=FALSE LIMIT 1",
             {"cid": str(ch["id"])}
@@ -881,52 +1324,12 @@ def render_challan_preview(challan_no: str):
                     if st.button("🧾 Create Invoice", type="primary",
                                  key=f"mk_inv_{ch['challan_no']}",
                                  use_container_width=True):
-                        # Create invoice directly — no redirect
-                        try:
-                            import uuid as _u_inv
-                            from datetime import date as _dt_inv, timedelta as _td_inv
-                            inv_no = _alloc_inv_no()
-                            _inv_sub = float(ch.get("total_amount") or 0)
-                            _inv_tax = float(ch.get("total_tax")    or 0)
-                            _inv_gnd = float(ch.get("grand_total")  or 0)
-                            if _inv_gnd == 0:
-                                _lt = _q("SELECT COALESCE(SUM(line_total),0) AS t FROM challan_lines WHERE challan_id=%(cid)s::uuid", {"cid": str(ch["id"])})
-                                _inv_gnd = float((_lt[0].get("t") if _lt else 0) or 0)
-                                _inv_sub = _inv_gnd
-                            _inv_party = str(ch.get("party_id") or "")
-                            _inv_oids  = ch.get("order_ids") or []
-                            ok = _write("""
-                                INSERT INTO invoices
-                                (id, invoice_no, challan_id, party_id, order_ids,
-                                 invoice_date, due_date, total_amount, total_tax, grand_total,
-                                 status, payment_status, created_by)
-                                VALUES
-                                (%(id)s, %(no)s, %(cid)s::uuid,
-                                 %(pid)s::uuid, %(oids)s,
-                                 %(idate)s, %(ddate)s,
-                                 %(sub)s, %(tax)s, %(gnd)s,
-                                 'PENDING','UNPAID', %(by)s)
-                            """, {
-                                "id":    str(_u_inv.uuid4()),
-                                "no":    inv_no,
-                                "cid":   str(ch["id"]),
-                                "pid":   _inv_party or None,
-                                "oids":  _inv_oids,
-                                "idate": _dt_inv.today(),
-                                "ddate": _dt_inv.today() + _td_inv(days=0),
-                                "sub":   _inv_sub,
-                                "tax":   _inv_tax,
-                                "gnd":   _inv_gnd,
-                                "by":    st.session_state.get("user_name","System"),
-                            })
-                            if ok:
-                                _write("UPDATE challans SET status='INVOICED', updated_at=NOW() WHERE id=%(i)s", {"i": str(ch["id"])})
-                                st.success(f"✅ Invoice **{inv_no}** created!")
-                                st.rerun()
-                            else:
-                                st.error("Invoice insert failed — check logs")
-                        except Exception as _inv_e:
-                            st.error(f"Invoice error: {_inv_e}")
+                        _ok_inv, _msg_inv = _create_invoice_from_challan_preview(ch)
+                        if _ok_inv:
+                            st.success(_msg_inv)
+                            st.rerun()
+                        else:
+                            st.error(_msg_inv)
                 else:
                     _ch_paid = float(ch.get("amount_paid") or 0)
                     _ch_bal  = round(max(_ch_grand - _ch_paid, 0), 2)
@@ -975,6 +1378,19 @@ def render_challan_preview(challan_no: str):
                         )
                 else:
                     st.info("Invoice not yet raised for this challan.")
+                    if str(ch.get("status") or "").upper() not in ("INVOICED", "CANCELLED", "VOID"):
+                        if st.button(
+                            "🧾 Convert Challan to Invoice",
+                            key=f"paypanel_convert_inv_{ch['id']}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            _ok_inv, _msg_inv = _create_invoice_from_challan_preview(ch)
+                            if _ok_inv:
+                                st.success(_msg_inv)
+                                st.rerun()
+                            else:
+                                st.error(_msg_inv)
     except Exception as _pe:
         st.caption(f"Payment panel: {_pe}")
 
@@ -1010,6 +1426,27 @@ def render_invoice_preview(invoice_no: str):
         return
 
     inv = inv_data[0]
+    if inv.get("challan_id"):
+        _sync_invoice_payment_from_challan(str(inv.get("id") or ""))
+        inv_data = _q("""
+            SELECT i.*,
+                   COALESCE(p.party_name,
+                       (SELECT o2.party_name FROM orders o2
+                        WHERE o2.id::text = ANY(i.order_ids) LIMIT 1),
+                       'Unknown') AS party_name,
+                   COALESCE(p.mobile, '')          AS mobile,
+                   COALESCE(p.address, '')         AS address,
+                   COALESCE(p.gstin, '')           AS gstin,
+                   COALESCE(p.email, '')           AS email,
+                   COALESCE(p.contact_person, '')  AS contact_person,
+                   COALESCE(p.city, '')            AS city,
+                   c.challan_no
+            FROM invoices i
+            LEFT JOIN parties p ON p.id = i.party_id
+            LEFT JOIN challans c ON c.id = i.challan_id
+            WHERE i.invoice_no = %(n)s
+        """, {"n": invoice_no}) or inv_data
+        inv = inv_data[0]
 
     # Pre-compute GSTIN for GST split (needed in line loop below)
     _gstin = str(inv.get("gstin") or "")
@@ -1030,6 +1467,8 @@ def render_invoice_preview(invoice_no: str):
             COALESCE(pr.unit, 'PCS')                   AS unit,
             COALESCE(ol.eye_side, il.eye_side)         AS eye_side,
             ol.sph, ol.cyl, ol.axis, ol.add_power,
+            ol.lens_params                             AS lens_params,
+            COALESCE(ol.is_service_line, FALSE)        AS is_service_line,
             il.quantity,
             il.unit_price,
             il.total_price,
@@ -1077,6 +1516,8 @@ def render_invoice_preview(invoice_no: str):
                 1 AS box_size, 'PCS' AS unit,
                 COALESCE(cl.eye_side, ol.eye_side) AS eye_side,
                 ol.sph, ol.cyl, ol.axis, ol.add_power,
+                ol.lens_params AS lens_params,
+                COALESCE(ol.is_service_line, FALSE) AS is_service_line,
                 cl.quantity,
                 cl.unit_price,
                 cl.total_price,
@@ -1103,30 +1544,37 @@ def render_invoice_preview(invoice_no: str):
         try:
             due_d = due if isinstance(due, date) else datetime.strptime(str(due)[:10], "%Y-%m-%d").date()
             is_overdue = due_d < date.today()
-        except: pass
+        except Exception as e:
+            log.debug("Invoice overdue date parse skipped: %s", e)
 
     # ── Header ────────────────────────────────────────────────────────────
-    st.markdown(f"""
-    <div class='doc-header'>
-      <div style='display:flex;justify-content:space-between;align-items:flex-start'>
-        <div>
-          <div style='color:#475569;font-size:0.62rem;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px'>Tax Invoice</div>
-          <div class='doc-no'>{inv['invoice_no']}</div>
-          <div class='doc-meta'>
-            Date: {_fmt_date(inv.get('invoice_date'))} &nbsp;·&nbsp;
-            Due: <span style='color:{"#ef4444" if is_overdue else "#94a3b8"}'>{_fmt_date(inv.get('due_date'))}</span>
-            {'&nbsp;⚠️ OVERDUE' if is_overdue else ''}
-            {f"&nbsp;·&nbsp; Challan: <span style='color:#38bdf8'>{inv['challan_no']}</span>" if inv.get('challan_no') else ''}
-          </div>
-        </div>
-        <div style='text-align:right'>
-          <div style='margin-bottom:6px'>{_pill(inv.get('status','PENDING'))} &nbsp; <span style='color:{pcolor};font-size:0.7rem;font-weight:700'>{pstatus}</span></div>
-          <div class='doc-meta'>Grand Total</div>
-          <div style='font-family:"IBM Plex Mono",monospace;color:#10b981;font-size:1.3rem;font-weight:700'>{_fmt_currency(inv.get('grand_total',0))}</div>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    _challan_ref = (
+        "&nbsp;&middot;&nbsp; Challan: <b style=\"color:#38bdf8\">"
+        + str(inv.get('challan_no', '')) + "</b>"
+    ) if inv.get('challan_no') else ""
+    _overdue_badge = "&nbsp;⚠️ OVERDUE" if is_overdue else ""
+    _due_color = "#ef4444" if is_overdue else "#94a3b8"
+    _inv_header_html = (
+        "<div class=\"doc-header\">"
+        "<div style=\"display:flex;justify-content:space-between;align-items:flex-start\">"
+        "<div>"
+        "<div style=\"color:#475569;font-size:0.62rem;letter-spacing:.1em;"
+        "text-transform:uppercase;margin-bottom:4px\">Tax Invoice</div>"
+        f"<div class=\"doc-no\">{inv['invoice_no']}</div>"
+        "<div class=\"doc-meta\">"
+        f"Date: {_fmt_date(inv.get('invoice_date'))} &nbsp;&middot;&nbsp; "
+        f"Due: <span style=\"color:{_due_color}\">{_fmt_date(inv.get('due_date'))}</span>"
+        f"{_overdue_badge} {_challan_ref}"
+        "</div></div>"
+        "<div style=\"text-align:right\">"
+        f"<div style=\"margin-bottom:6px\">{_pill(inv.get('status','PENDING'))} &nbsp; "
+        f"<span style=\"color:{pcolor};font-size:0.7rem;font-weight:700\">{pstatus}</span></div>"
+        "<div class=\"doc-meta\">Grand Total</div>"
+        f"<div style=\"font-family:'IBM Plex Mono',monospace;color:#10b981;"
+        f"font-size:1.3rem;font-weight:700\">{_fmt_currency(inv.get('grand_total',0))}</div>"
+        "</div></div></div>"
+    )
+    st.markdown(_inv_header_html, unsafe_allow_html=True)
 
     # ── Party + Invoice details ───────────────────────────────────────────
     c1, c2 = st.columns(2)
@@ -1181,34 +1629,44 @@ def render_invoice_preview(invoice_no: str):
             try:
                 f = float(v)
                 return f"{f:+.2f}" if not _math_inv.isnan(f) else "—"
-            except: return "—"
+            except (TypeError, ValueError): return "—"
 
         def _desc_inv(ln):
-            """Tally-style description: name + eye tag + power string."""
+            """Compact invoice description: product + order/eye/RX on one line."""
             eye   = str(ln.get("eye_side") or "").upper()
+            order_no = str(ln.get("order_no") or "")
             pname = str(ln.get("product_name") or "—")
             brand = str(ln.get("brand") or "")
             _ecol = {"R":"#3b82f6","L":"#10b981","B":"#a855f7","S":"#f59e0b"}.get(eye,"#64748b")
-            _etxt = {"R":"👁 Right Eye","L":"👁 Left Eye","B":"👁👁 Both","S":"⚙️ Service"}.get(eye, eye)
+            _etxt = {"R":"R","L":"L","B":"BOTH","S":"SERVICE"}.get(eye, eye)
             pw_parts = []
             if ln.get("sph") is not None: pw_parts.append(f"SPH {_rx_inv(ln['sph'])}")
             if ln.get("cyl") is not None: pw_parts.append(f"CYL {_rx_inv(ln['cyl'])}")
             if ln.get("axis"):
                 try: pw_parts.append(f"AX {int(float(ln['axis']))}")
-                except: pass
+                except (TypeError, ValueError): pass
             if ln.get("add_power"):
                 try:
                     av = float(ln["add_power"])
                     if abs(av) > 0.001: pw_parts.append(f"ADD {av:+.2f}")
-                except: pass
+                except (TypeError, ValueError): pass
             pw_str = "  ".join(pw_parts)
-            out = f"<b style='color:#e2e8f0'>{pname}</b>"
-            if brand: out += f"<span style='color:#475569;font-size:0.63rem'> &nbsp;{brand}</span>"
+            meta = []
+            if order_no:
+                meta.append(order_no)
             if eye and eye not in ("","O","OTHER"):
-                out += (f"<br><span style='background:{_ecol}22;color:{_ecol};"
-                        f"font-size:0.63rem;padding:1px 6px;border-radius:3px;font-weight:700'>{_etxt}</span>")
+                meta.append(f"<span style='color:{_ecol};font-weight:800'>{_etxt}</span>")
             if pw_str:
-                out += f"<br><span style='font-family:monospace;font-size:0.65rem;color:#94a3b8'>{pw_str}</span>"
+                meta.append(pw_str)
+            out = f"<b style='color:#e2e8f0'>{pname}</b>"
+            if brand: out += f"<span style='color:#475569;font-size:0.62rem'> &nbsp;{brand}</span>"
+            if meta:
+                out += (
+                    "<br><span style='font-family:monospace;font-size:0.63rem;"
+                    "color:#94a3b8;white-space:nowrap'>"
+                    + " &nbsp;·&nbsp; ".join(meta)
+                    + "</span>"
+                )
             return out
 
         from itertools import groupby as _grpinv
@@ -1222,7 +1680,14 @@ def render_invoice_preview(invoice_no: str):
             )
             for ln in grp_lines:
                 sno_inv += 1
-                qty_d = _fmt_qty(ln.get("quantity"), ln.get("box_size"), ln.get("unit"))
+                qty_d = _fmt_qty(
+                    ln.get("quantity"),
+                    ln.get("box_size"),
+                    ln.get("unit"),
+                    ln.get("lens_params"),
+                    ln.get("is_service_line"),
+                    ln.get("eye_side"),
+                )
                 tax_a = float(ln.get("tax_amount") or 0)
                 _lg   = _gst_split(tax_a, party_gstin=_gstin)
                 if _is_inter:
@@ -1345,12 +1810,19 @@ def render_invoice_preview(invoice_no: str):
         st.info("No line items found for this invoice")
 
     # ── Smart Print button ──────────────────────────────────────────────
-    if st.button("🖨️ Smart Print / PDF", key=f"smartprint_{inv['id']}", type="secondary",
-                 use_container_width=True,
-                 help="Tally-style A4/A5 invoice with CGST/SGST/IGST split, power details, bank info"):
-        st.session_state[f"_show_smart_print_{inv['id']}"] = True
+    import uuid as _sp_btn_uuid
+    _inv_print_key = f"_show_smart_print_{inv['id']}"
+    _inv_print_open = st.session_state.get(_inv_print_key, False)
+    if st.button(
+        "✕ Close Print Preview" if _inv_print_open else "🖨️ Smart Print / PDF",
+        key=f"smartprint_{inv['id']}_{str(inv.get('invoice_no') or inv.get('id')).replace('/', '_')}_{_sp_btn_uuid.uuid4().hex[:6]}", type="secondary",
+        use_container_width=True,
+        help="Tally-style A4/A5 invoice with CGST/SGST/IGST split, power details, bank info",
+    ):
+        st.session_state[_inv_print_key] = not _inv_print_open
+        st.rerun()
 
-    if st.session_state.get(f"_show_smart_print_{inv['id']}"):
+    if st.session_state.get(_inv_print_key):
         try:
             from modules.billing.smart_print import render_smart_invoice
             render_smart_invoice(inv["invoice_no"])
@@ -1359,14 +1831,286 @@ def render_invoice_preview(invoice_no: str):
 
     # ── Payment actions ───────────────────────────────────────────────────
     st.markdown("<hr class='ent-divider'>", unsafe_allow_html=True)
+
+    # ── Line discount edit (UNPAID / PENDING only, admin/manager/billing) ──
+    if pstatus not in ("PAID", "CANCELLED"):
+        try:
+            from modules.security.roles import has_role as _hr_inv
+            _can_edit_inv = _hr_inv("admin", "manager", "billing")
+        except Exception:
+            _can_edit_inv = True
+
+        if _can_edit_inv:
+            with st.expander("✏️ Edit Line Discounts / Prices", expanded=False):
+                st.markdown(
+                    "<div style='color:#f59e0b;font-size:0.75rem;margin-bottom:8px'>"
+                    "⚠️ Only allowed while invoice is UNPAID. "
+                    "For paid invoices, use the Credit/Debit Note instead.</div>",
+                    unsafe_allow_html=True,
+                )
+                # Try invoice_lines first, fall back to challan_lines
+                _inv_edit_lines = _q("""
+                    SELECT
+                        il.id::text             AS il_id,
+                        il.order_line_id::text  AS order_line_id,
+                        COALESCE(p.product_name, il.product_name, 'Lens') AS product_name,
+                        COALESCE(il.eye_side, ol.eye_side, '') AS eye_side,
+                        COALESCE(il.quantity, 1)           AS quantity,
+                        COALESCE(il.unit_price, 0)         AS unit_price,
+                        GREATEST(0, COALESCE(ol.discount_amount,
+                            ROUND(il.unit_price * il.quantity
+                                - COALESCE(il.total_price, il.line_total, 0), 2),
+                            0))                                AS discount_amount,
+                        COALESCE(il.total_price, il.line_total, 0) AS total_price,
+                        COALESCE(il.line_total, 0)         AS line_total,
+                        COALESCE(ol.gst_percent, 0)        AS gst_percent,
+                        COALESCE(o.order_type,'WHOLESALE') AS order_type
+                    FROM invoice_lines il
+                    LEFT JOIN order_lines ol ON ol.id = il.order_line_id
+                    LEFT JOIN orders o       ON o.id  = il.order_id
+                    LEFT JOIN products p     ON p.id  = ol.product_id
+                    WHERE il.invoice_id = %(iid)s::uuid
+                      AND COALESCE(il.is_deleted, FALSE) = FALSE
+                    ORDER BY il.id
+                """, {"iid": str(inv["id"])})
+
+                # Fallback to challan_lines if no invoice_lines
+                _use_challan_fb = not _inv_edit_lines
+                if _use_challan_fb and inv.get("challan_id"):
+                    _inv_edit_lines = _q("""
+                        SELECT
+                            cl.id::text             AS il_id,
+                            cl.order_line_id::text  AS order_line_id,
+                            COALESCE(p.product_name, cl.product_name,'Lens') AS product_name,
+                            COALESCE(cl.eye_side, ol.eye_side,'') AS eye_side,
+                            COALESCE(cl.quantity,1)  AS quantity,
+                            COALESCE(cl.unit_price,0) AS unit_price,
+                            GREATEST(0, COALESCE(ol.discount_amount,
+                                ROUND(cl.unit_price * cl.quantity
+                                    - COALESCE(cl.total_price, cl.line_total, 0), 2),
+                                0))                       AS discount_amount,
+                            COALESCE(cl.total_price, cl.line_total, 0) AS total_price,
+                            COALESCE(cl.line_total, 0) AS line_total,
+                            COALESCE(ol.gst_percent, 0)  AS gst_percent,
+                            COALESCE(o.order_type,'WHOLESALE') AS order_type
+                        FROM challan_lines cl
+                        LEFT JOIN order_lines ol ON ol.id = cl.order_line_id
+                        LEFT JOIN orders o       ON o.id  = cl.order_id
+                        LEFT JOIN products p     ON p.id  = ol.product_id
+                        WHERE cl.challan_id = %(cid)s::uuid
+                          AND COALESCE(cl.is_deleted, FALSE) = FALSE
+                        ORDER BY cl.id
+                    """, {"cid": str(inv["challan_id"])})
+
+                if not _inv_edit_lines:
+                    st.caption("No lines found.")
+                else:
+                    import decimal as _dec_inv
+                    def _r2inv(v):
+                        try:
+                            return float(_dec_inv.Decimal(str(v)).quantize(
+                                _dec_inv.Decimal("0.01"), rounding=_dec_inv.ROUND_HALF_UP))
+                        except Exception:
+                            return round(float(v or 0), 2)
+
+                    # Discount mode toggle for this invoice
+                    _inv_disc_mode_key = f"inv_disc_mode_{inv['id']}"
+                    _inv_disc_mode = st.radio(
+                        "Discount input as",
+                        ["₹ Amount", "% Percent"],
+                        horizontal=True,
+                        key=_inv_disc_mode_key,
+                        help="Choose whether to enter discount as a flat amount or a percentage",
+                    )
+                    _inv_disc_by_pct = (_inv_disc_mode == "% Percent")
+
+                    _disc_col_lbl_i = "Disc %" if _inv_disc_by_pct else "Disc ₹"
+                    _ih = st.columns([3, 0.7, 1.2, 1.2, 1.2])
+                    for _col, _lbl in zip(_ih, ["Product","Qty","Unit ₹", _disc_col_lbl_i,"Net ₹"]):
+                        _col.markdown(
+                            f"<div style='font-size:0.65rem;font-weight:700;color:#475569;"
+                            f"text-transform:uppercase;border-bottom:1px solid #1e3a5f;"
+                            f"padding-bottom:3px'>{_lbl}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    _inv_edit_data = []
+                    for _ii, _il in enumerate(_inv_edit_lines):
+                        _ic1, _ic2, _ic3, _ic4, _ic5 = st.columns([3, 0.7, 1.2, 1.2, 1.2])
+                        _eye_i  = str(_il.get("eye_side","")).upper()
+                        _pname_i= str(_il.get("product_name","—"))
+                        with _ic1:
+                            st.markdown(
+                                f"<div style='font-size:0.8rem;color:#e2e8f0;"
+                                f"font-weight:600;padding-top:6px'>"
+                                f"{_eye_i + ' — ' if _eye_i else ''}{_pname_i}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with _ic2:
+                            st.markdown(
+                                f"<div style='font-size:0.82rem;color:#94a3b8;"
+                                f"padding-top:6px'>{int(_il.get('quantity') or 1)}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with _ic3:
+                            _inv_up = _r2inv(st.number_input(
+                                "Unit ₹", value=float(_il.get("unit_price") or 0),
+                                min_value=0.0, step=0.01, format="%.2f",
+                                key=f"inv_up_{_ii}_{_il['il_id']}",
+                                label_visibility="collapsed",
+                            ))
+                        with _ic4:
+                            _qty_i   = int(_il.get("quantity") or 1)
+                            _gross_i = _r2inv(_inv_up * _qty_i)
+                            _stored_inv_disc = float(_il.get("discount_amount") or 0)
+                            _stored_inv_pct  = (
+                                _r2inv(_stored_inv_disc / _gross_i * 100)
+                                if _gross_i > 0 else 0.0
+                            )
+                            if _inv_disc_by_pct:
+                                _input_inv_pct = _r2inv(st.number_input(
+                                    "Disc %", value=_stored_inv_pct,
+                                    min_value=0.0, max_value=100.0,
+                                    step=0.5, format="%.2f",
+                                    key=f"inv_disc_{_ii}_{_il['il_id']}",
+                                    label_visibility="collapsed",
+                                ))
+                                _inv_disc = _r2inv(_gross_i * _input_inv_pct / 100)
+                                st.caption(f"= ₹{_inv_disc:,.2f}")
+                            else:
+                                _inv_disc = _r2inv(st.number_input(
+                                    "Disc ₹", value=_stored_inv_disc,
+                                    min_value=0.0, step=0.5, format="%.2f",
+                                    key=f"inv_disc_{_ii}_{_il['il_id']}",
+                                    label_visibility="collapsed",
+                                ))
+                                if _gross_i > 0:
+                                    st.caption(f"= {_r2inv(_inv_disc/_gross_i*100):.2f}%")
+
+                        _gst_i   = float(_il.get("gst_percent") or 0)
+                        _otype_i = str(_il.get("order_type","WHOLESALE")).upper()
+                        _taxable_i = _r2inv(max(_gross_i - _inv_disc, 0))
+                        if _otype_i == "RETAIL":
+                            _gst_i_amt  = _r2inv(_taxable_i * _gst_i / (100 + _gst_i)) if _gst_i else 0.0
+                            _line_tot_i = _taxable_i
+                        else:
+                            _gst_i_amt  = _r2inv(_taxable_i * _gst_i / 100)
+                            _line_tot_i = _r2inv(_taxable_i + _gst_i_amt)
+
+                        _changed_i = (
+                            abs(_inv_disc - float(_il.get("discount_amount") or 0)) > 0.005
+                            or abs(_inv_up - float(_il.get("unit_price") or 0)) > 0.005
+                        )
+                        with _ic5:
+                            st.markdown(
+                                f"<div style='font-size:0.85rem;"
+                                f"color:{'#fbbf24' if _changed_i else '#10b981'};"
+                                f"font-weight:700;padding-top:6px'>₹{_line_tot_i:,.2f}</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        _inv_edit_data.append({
+                            "il_id":          _il["il_id"],
+                            "order_line_id":  _il.get("order_line_id",""),
+                            "unit_price":     _inv_up,
+                            "discount_amount":_inv_disc,
+                            "total_price":    _taxable_i,
+                            "line_total":     _line_tot_i,
+                            "gst_amount":     _gst_i_amt,
+                            "changed":        _changed_i,
+                            "use_challan_fb": _use_challan_fb,
+                        })
+
+                    _inv_changed = [e for e in _inv_edit_data if e["changed"]]
+                    if _inv_changed:
+                        st.markdown(
+                            f"<div style='color:#fbbf24;font-size:0.75rem;margin:6px 0'>"
+                            f"⚡ {len(_inv_changed)} line(s) changed.</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    if st.button(
+                        "💾 Save Invoice Line Edits",
+                        key=f"inv_save_edit_{inv['id']}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not _inv_changed,
+                    ):
+                        try:
+                            from modules.sql_adapter import run_transaction as _rtx_inv
+                            _tx_inv = []
+                            _line_table = "challan_lines" if _use_challan_fb else "invoice_lines"
+                            for _ed in _inv_changed:
+                                _tx_inv.append((f"""
+                                    UPDATE {_line_table} SET
+                                        unit_price      = %(up)s,
+                                        discount_amount = %(disc)s,
+                                        total_price     = %(tp)s,
+                                        line_total      = %(lt)s
+                                    WHERE id = %(lid)s::uuid
+                                """, {
+                                    "up":   _ed["unit_price"],
+                                    "disc": _ed["discount_amount"],
+                                    "tp":   _ed["total_price"],
+                                    "lt":   _ed["line_total"],
+                                    "lid":  _ed["il_id"],
+                                }))
+                                if _ed["order_line_id"]:
+                                    _tx_inv.append(("""
+                                        UPDATE order_lines SET
+                                            unit_price      = %(up)s,
+                                            discount_amount = %(disc)s,
+                                            total_price     = %(tp)s,
+                                            billing_total   = %(tp)s,
+                                            gst_amount      = %(ga)s
+                                        WHERE id = %(olid)s::uuid
+                                    """, {
+                                        "up":   _ed["unit_price"],
+                                        "disc": _ed["discount_amount"],
+                                        "tp":   _ed["total_price"],
+                                        "ga":   _ed["gst_amount"],
+                                        "olid": _ed["order_line_id"],
+                                    }))
+
+                            # Recalculate invoice totals
+                            _src_table = "challan_lines" if _use_challan_fb else "invoice_lines"
+                            _src_filter = ("challan_id = %(sid)s::uuid" if _use_challan_fb
+                                           else "invoice_id = %(sid)s::uuid")
+                            _src_id = (str(inv.get("challan_id","")) if _use_challan_fb
+                                       else str(inv["id"]))
+                            _tx_inv.append((f"""
+                                UPDATE invoices SET
+                                    total_amount = (
+                                        SELECT COALESCE(SUM(total_price),0) FROM {_src_table}
+                                        WHERE {_src_filter}
+                                          AND COALESCE(is_deleted,FALSE)=FALSE
+                                    ),
+                                    grand_total = (
+                                        SELECT COALESCE(SUM(line_total),0) FROM {_src_table}
+                                        WHERE {_src_filter}
+                                          AND COALESCE(is_deleted,FALSE)=FALSE
+                                    ),
+                                    total_tax = (
+                                        SELECT COALESCE(SUM(line_total),0)
+                                             - COALESCE(SUM(total_price),0)
+                                        FROM {_src_table}
+                                        WHERE {_src_filter}
+                                          AND COALESCE(is_deleted,FALSE)=FALSE
+                                    ),
+                                    updated_at = NOW()
+                                WHERE id = %(inv_id)s::uuid
+                            """, {"sid": _src_id, "inv_id": str(inv["id"])}))
+
+                            _rtx_inv(_tx_inv)
+                            st.success(f"✅ Invoice updated. {len(_inv_changed)} line(s) saved.")
+                            st.rerun()
+                        except Exception as _ie:
+                            st.error(f"Save failed: {_ie}")
+
     pa1, pa2, pa3 = st.columns(3)
     with pa1:
         if pstatus != "PAID":
-            if st.button("💳 Mark as Paid", key=f"pay_{inv['id']}", type="primary", use_container_width=True):
-                if _write("UPDATE invoices SET payment_status='PAID',status='PAID',updated_at=NOW() WHERE id=%(id)s",
-                          {"id": inv["id"]}):
-                    st.success("✅ Marked as paid")
-                    st.rerun()
+            st.info("Payment status updates only after recording a receipt below.")
     with pa2:
         pass  # payment handled by panel below
     with pa3:
@@ -1457,8 +2201,8 @@ def render_challans_list():
     _inject_css()
 
     # ── Retail / Wholesale subtabs ────────────────────────────────────────
-    sub_retail, sub_wholesale = st.tabs(["🛍️ Retail Challans", "🏭 Wholesale Challans"])
-    for _tab, _otype in ((sub_retail, "RETAIL"), (sub_wholesale, "WHOLESALE")):
+    sub_all, sub_retail, sub_wholesale = st.tabs(["📋 All Challans", "🛍️ Retail Challans", "🏭 Wholesale Challans"])
+    for _tab, _otype in ((sub_all, "ALL"), (sub_retail, "RETAIL"), (sub_wholesale, "WHOLESALE")):
         with _tab:
             _render_challans_for_type(_otype)
 
@@ -1475,7 +2219,7 @@ def _render_challans_for_type(order_type_filter: str):
     with fc2:
         status_f = st.selectbox("Status", ["All", "PENDING", "INVOICED", "CANCELLED"], label_visibility="collapsed", key=f"ch_status_{_k}")
     with fc3:
-        from_d = st.date_input("From", value=date.today().replace(day=1), label_visibility="collapsed", key=f"ch_from_{_k}")
+        from_d = st.date_input("From", value=date.today() - timedelta(days=90), label_visibility="collapsed", key=f"ch_from_{_k}")
     with fc4:
         to_d = st.date_input("To", value=date.today(), label_visibility="collapsed", key=f"ch_to_{_k}")
 
@@ -1492,13 +2236,14 @@ def _render_challans_for_type(order_type_filter: str):
             OR c.challan_no ILIKE %(s)s)""")
         params["s"] = f"%{search}%"
 
-    # Filter by order_type via the first order in the challan's order_ids array
-    where.append("""EXISTS (
-        SELECT 1 FROM orders ox
-        WHERE ox.id::text = ANY(c.order_ids)
-          AND UPPER(COALESCE(ox.order_type,'WHOLESALE')) = %(otype)s
-        LIMIT 1
-    )""")
+    # Filter by order_type via linked orders. "ALL" keeps sequence visible.
+    if order_type_filter != "ALL":
+        where.append("""EXISTS (
+            SELECT 1 FROM orders ox
+            WHERE ox.id::text = ANY(c.order_ids)
+              AND UPPER(COALESCE(ox.order_type,'WHOLESALE')) = %(otype)s
+            LIMIT 1
+        )""")
 
     challans = _q(f"""
         SELECT c.id, c.challan_no, c.challan_date, c.status,
@@ -1582,6 +2327,10 @@ def _render_challans_for_type(order_type_filter: str):
                 # Add print button at the top
                 print_button_html = '<div style="text-align:center; padding:10px; background:#f0f0f0;"><button onclick="window.print()" style="padding:10px 20px; font-size:16px; background:#007bff; color:white; border:none; border-radius:5px;">🖨️ Print / Save as PDF</button></div>'
                 combined_html = combined_html.replace('</style>', '</style>' + print_button_html, 1)
+                if st.button("Open Selected Challans in Browser", key=f"ch_batch_open_{_k}", use_container_width=True):
+                    from modules.printing.print_opener import open_html_print
+                    path = open_html_print(combined_html, "challan_batch_print.html")
+                    st.success(f"Batch challan print opened: {path}")
                 st.components.v1.html(combined_html, height=920 * len(html_parts) + 50, scrolling=True)
         except Exception as _bpe:
             st.error(f"Batch print error: {_bpe}")
@@ -1656,7 +2405,7 @@ def _render_challans_for_type(order_type_filter: str):
                 f"{_fmt_date(c.get('challan_date'))}</div>",
                 unsafe_allow_html=True,
             )
-        with rcols[3]:
+        with rcols[4]:
             st.markdown(
                 f"<div style='font-size:0.82rem;font-weight:600;color:#e2e8f0;"
                 f"padding:4px 2px;line-height:1.3'>{c['party_name']}"
@@ -1664,32 +2413,32 @@ def _render_challans_for_type(order_type_filter: str):
                 f"{c.get('mobile','')}</span></div>",
                 unsafe_allow_html=True,
             )
-        with rcols[4]:
+        with rcols[5]:
             st.markdown(
                 f"<div style='font-size:0.8rem;color:#94a3b8;text-align:center;"
                 f"padding:6px 2px'>{orders_cnt}</div>",
                 unsafe_allow_html=True,
             )
-        with rcols[5]:
+        with rcols[6]:
             st.markdown(
                 f"<div style='font-size:0.8rem;color:#94a3b8;text-align:right;"
                 f"padding:6px 2px'>{_fmt_currency(c.get('total_amount',0))}</div>",
                 unsafe_allow_html=True,
             )
-        with rcols[6]:
+        with rcols[7]:
             st.markdown(
                 f"<div style='font-size:0.8rem;color:#f59e0b;text-align:right;"
                 f"padding:6px 2px'>{_fmt_currency(c.get('total_tax',0))}</div>",
                 unsafe_allow_html=True,
             )
-        with rcols[7]:
+        with rcols[8]:
             st.markdown(
                 f"<div style='font-size:0.88rem;font-weight:700;color:#10b981;"
                 f"text-align:right;padding:6px 2px'>"
                 f"{_fmt_currency(c.get('grand_total',0))}</div>",
                 unsafe_allow_html=True,
             )
-        with rcols[8]:
+        with rcols[9]:
             st.markdown(
                 f"<span style='background:{_sc}22;color:{_sc};padding:2px 8px;"
                 f"border-radius:8px;font-size:0.65rem;font-weight:700'>"
@@ -1697,13 +2446,20 @@ def _render_challans_for_type(order_type_filter: str):
                 unsafe_allow_html=True,
             )
         with rcols[10]:
+            _qk_key = f"_show_ch_print_{_k}_{ono}_qk"
+            _qk_open = bool(st.session_state.get(_qk_key))
             if st.button("🖨️", key=f"ch_qprint_{_k}_{ono}",
                          use_container_width=True,
                          help="Quick Print / PDF"):
-                st.session_state[f"_show_ch_print_{ono}_qk"] = True
+                st.session_state[_qk_key] = not _qk_open
                 st.session_state[_state_key] = ono
                 st.rerun()
-        if st.session_state.get(f"_show_ch_print_{ono}_qk"):
+        if st.session_state.get(f"_show_ch_print_{_k}_{ono}_qk"):
+            _close_cols = st.columns([1, 7])
+            with _close_cols[0]:
+                if st.button("✕ Close Print", key=f"ch_qprint_close_{_k}_{ono}", use_container_width=True):
+                    st.session_state[f"_show_ch_print_{_k}_{ono}_qk"] = False
+                    st.rerun()
             try:
                 from modules.billing.smart_print import render_smart_challan
                 render_smart_challan(ono)
@@ -1726,7 +2482,7 @@ def _render_challans_for_type(order_type_filter: str):
                                  use_container_width=True):
                         st.session_state[_state_key] = None
                         st.rerun()
-                render_challan_preview(ono)
+                render_challan_preview(ono, key_prefix=f"list_{_k}")
                 st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<hr class='ent-divider'>", unsafe_allow_html=True)
@@ -1738,8 +2494,8 @@ def _render_challans_for_type(order_type_filter: str):
 
 def render_invoices_list():
     _inject_css()
-    sub_retail, sub_wholesale = st.tabs(["🛍️ Retail Invoices", "🏭 Wholesale Invoices"])
-    for _tab, _otype in ((sub_retail, "RETAIL"), (sub_wholesale, "WHOLESALE")):
+    sub_all, sub_retail, sub_wholesale = st.tabs(["📋 All Invoices", "🛍️ Retail Invoices", "🏭 Wholesale Invoices"])
+    for _tab, _otype in ((sub_all, "ALL"), (sub_retail, "RETAIL"), (sub_wholesale, "WHOLESALE")):
         with _tab:
             _render_invoices_for_type(_otype)
 
@@ -1756,7 +2512,7 @@ def _render_invoices_for_type(order_type_filter: str):
     with fi3:
         payment_f = st.selectbox("Payment", ["All","UNPAID","PARTIAL","PAID"],              label_visibility="collapsed", key=f"inv_payment_{_k}")
     with fi4:
-        from_d = st.date_input("From", value=date.today().replace(day=1), label_visibility="collapsed", key=f"inv_from_{_k}")
+        from_d = st.date_input("From", value=date.today() - timedelta(days=90), label_visibility="collapsed", key=f"inv_from_{_k}")
     with fi5:
         to_d   = st.date_input("To",   value=date.today(),                label_visibility="collapsed", key=f"inv_to_{_k}")
 
@@ -1766,17 +2522,38 @@ def _render_invoices_for_type(order_type_filter: str):
     if payment_f != "All": where.append("i.payment_status = %(ps)s");  params["ps"] = payment_f
     if search:
         where.append("""(COALESCE(p.party_name,
-            (SELECT o2.party_name FROM orders o2 WHERE o2.id::text = ANY(i.order_ids) LIMIT 1)
+            (SELECT o2.party_name FROM orders o2 WHERE o2.id::text = ANY(COALESCE(i.order_ids::text[], c.order_ids::text[], ARRAY[]::text[])) LIMIT 1)
         ) ILIKE %(s)s OR i.invoice_no ILIKE %(s)s)""")
         params["s"] = f"%{search}%"
 
-    where.append("""(
-        SELECT UPPER(COALESCE(ox.order_type,'WHOLESALE'))
-        FROM orders ox
-        WHERE ox.id::text = ANY(i.order_ids)
-        ORDER BY ox.created_at DESC
-        LIMIT 1
-    ) = %(otype)s""")
+    # Use invoice.order_ids first, but fall back to challan.order_ids.
+    # Some challan-created wholesale invoices store the order linkage on the challan
+    # while invoice.order_ids can be NULL/empty, which made them disappear from
+    # the Wholesale Invoices tab.
+    # Service/courier invoices have order_ids = '{}' — include them based on party type
+    # They show in WHOLESALE tab if party exists, RETAIL if no party (retail courier)
+    if order_type_filter != "ALL":
+        where.append("""(
+            EXISTS (
+                SELECT 1
+                FROM orders ox
+                WHERE ox.id::text = ANY(
+                    COALESCE(i.order_ids::text[], c.order_ids::text[], ARRAY[]::text[])
+                )
+                  AND UPPER(COALESCE(ox.order_type,'WHOLESALE')) = %(otype)s
+            )
+            OR (
+                -- Standalone service invoices (courier etc.) with no order_ids
+                COALESCE(array_length(i.order_ids, 1), 0) = 0
+                AND i.challan_id IS NULL
+                AND (
+                    CASE %(otype)s
+                        WHEN 'RETAIL' THEN i.party_id IS NULL
+                        ELSE i.party_id IS NOT NULL
+                    END
+                )
+            )
+        )""")
 
     invoices = _q(f"""
         SELECT i.id, i.invoice_no, i.invoice_date, i.due_date,
@@ -1882,6 +2659,10 @@ def _render_invoices_for_type(order_type_filter: str):
                 # Add print button at the top
                 print_button_html = '<div style="text-align:center; padding:10px; background:#f0f0f0;"><button onclick="window.print()" style="padding:10px 20px; font-size:16px; background:#007bff; color:white; border:none; border-radius:5px;">🖨️ Print / Save as PDF</button></div>'
                 combined_html = combined_html.replace('</style>', '</style>' + print_button_html, 1)
+                if st.button("Open Selected Invoices in Browser", key=f"inv_batch_open_{_k}", use_container_width=True):
+                    from modules.printing.print_opener import open_html_print
+                    path = open_html_print(combined_html, "invoice_batch_print.html")
+                    st.success(f"Batch invoice print opened: {path}")
                 st.components.v1.html(combined_html, height=920 * len(html_parts) + 50, scrolling=True)
         except Exception as _ibpe:
             st.error(f"Batch print error: {_ibpe}")
@@ -1919,7 +2700,8 @@ def _render_invoices_for_type(order_type_filter: str):
             try:
                 dd = i["due_date"] if isinstance(i["due_date"], date) else                      datetime.strptime(str(i["due_date"])[:10],"%Y-%m-%d").date()
                 if dd < date.today(): overdue_flag = " ⚠️"
-            except: pass
+            except Exception as e:
+                log.debug("Invoice row overdue parse skipped: %s", e)
         _row_bg = "#1e3a5f22" if is_open else "transparent"
 
         st.markdown(f"<div style='background:{_row_bg};border-radius:6px;margin:1px 0'>",
@@ -2259,6 +3041,7 @@ def render_invoice_creation():
                 inv_sub = float(_ct.get("sub") or 0)
                 inv_tax = float(_ct.get("tax") or 0)
                 inv_gnd = float(_ct.get("gnd") or 0)
+                inv_gst_included = bool(int(_ct.get("is_retail") or 0))
                 if inv_gnd == 0:
                     # Fallback: sum line_totals directly
                     _lt = _q("SELECT COALESCE(SUM(line_total),0) AS t FROM challan_lines WHERE challan_id = ANY(%(ids)s::uuid[])", {"ids": sel_chs})
@@ -2268,11 +3051,11 @@ def render_invoice_creation():
                     INSERT INTO invoices
                     (id, invoice_no, challan_id, party_id, order_ids,
                      invoice_date, due_date, total_amount, total_tax, grand_total,
-                     status, payment_status, created_by, remarks)
+                     status, payment_status, created_by, remarks, gst_included)
                     VALUES
                     (%(id)s, %(no)s, %(cid)s, %(pid)s, %(oids)s,
                      %(idate)s, %(ddate)s, %(sub)s, %(tax)s, %(gnd)s,
-                     'PENDING','UNPAID', %(by)s, %(rmk)s)
+                     'PENDING','UNPAID', %(by)s, %(rmk)s, %(gst_inc)s)
                 """, {
                     "id":    str(_uuid.uuid4()), "no": inv_no,
                     "cid":   sel_chs[0], "pid": party_id,
@@ -2282,6 +3065,7 @@ def render_invoice_creation():
                     "sub":   inv_sub, "tax": inv_tax, "gnd": inv_gnd,
                     "by":    st.session_state.get("user_name","System"),
                     "rmk":   remarks,
+                    "gst_inc": inv_gst_included,
                 })
                 if ok:
                     for cid in sel_chs:
@@ -2297,11 +3081,11 @@ def render_invoice_creation():
                             INSERT INTO invoices
                             (id, invoice_no, challan_id, party_id, order_ids,
                              invoice_date, due_date, total_amount, total_tax, grand_total,
-                             status, payment_status, created_by, remarks)
+                             status, payment_status, created_by, remarks, gst_included)
                             VALUES
                             (%(id)s, %(no)s, %(cid)s, %(pid)s, %(oids)s,
                              %(idate)s, %(ddate)s, %(sub)s, %(tax)s, %(gnd)s,
-                             'PENDING','UNPAID', %(by)s, %(rmk)s)
+                             'PENDING','UNPAID', %(by)s, %(rmk)s, %(gst_inc)s)
                         """, {
                             "id":    str(_u_dbg.uuid4()), "no": inv_no,
                             "cid":   sel_chs[0], "pid": party_id,
@@ -2311,6 +3095,7 @@ def render_invoice_creation():
                             "sub":   inv_sub, "tax": inv_tax, "gnd": inv_gnd,
                             "by":    st.session_state.get("user_name","System"),
                             "rmk":   remarks,
+                            "gst_inc": inv_gst_included,
                         })
                         st.success(f"✅ Invoice **{inv_no}** created (retry)")
                         for cid in sel_chs:
@@ -2384,15 +3169,26 @@ def render_invoice_creation():
         if st.button("🧾 Create Direct Invoice", type="primary", use_container_width=True, key="btn_dinv"):
             try:
                 inv_no = _alloc_inv_no()
+                _otype_rows = _q("""
+                    SELECT UPPER(COALESCE(order_type,'')) AS order_type
+                    FROM orders
+                    WHERE id = ANY(%(ids)s::uuid[])
+                    ORDER BY CASE WHEN UPPER(COALESCE(order_type,''))='RETAIL' THEN 0 ELSE 1 END
+                    LIMIT 1
+                """, {"ids": sel_ords}) or []
+                _direct_gst_included = (
+                    str((_otype_rows[0].get("order_type") if _otype_rows else "") or "").upper()
+                    != "WHOLESALE"
+                )
                 ok = _write("""
                     INSERT INTO invoices
                     (id, invoice_no, party_id, order_ids,
                      invoice_date, due_date, total_amount, total_tax, grand_total,
-                     status, payment_status, created_by, remarks)
+                     status, payment_status, created_by, remarks, gst_included)
                     VALUES
                     (%(id)s, %(no)s, %(pid)s, %(oids)s,
                      %(idate)s, %(ddate)s, %(sub)s, %(tax)s, %(gnd)s,
-                     'PENDING','UNPAID', %(by)s, %(rmk)s)
+                     'PENDING','UNPAID', %(by)s, %(rmk)s, %(gst_inc)s)
                 """, {
                     "id":    str(_uuid.uuid4()), "no": inv_no,
                     "pid":   sel_party[0], "oids": order_nos,
@@ -2402,6 +3198,7 @@ def render_invoice_creation():
                     "gnd":   tots["grand_total"],
                     "by":    st.session_state.get("user_name","System"),
                     "rmk":   rmk2,
+                    "gst_inc": _direct_gst_included,
                 })
                 if ok:
                     for oid in sel_ords:
@@ -2636,8 +3433,12 @@ def render_bulk_actions():
                     _bulk_lines_all = _q("""
                         SELECT ol.id,
                                ol.order_id,
-                               COALESCE(p.product_name, ol.product_name, 'Service') AS product_name,
-                               COALESCE(p.brand, ol.brand)               AS brand,
+                               COALESCE(p.product_name,
+                                        ol.lens_params->>'service_display_name',
+                                        ol.lens_params->>'display_product_name',
+                                        ol.lens_params->>'service_description',
+                                        'Service')                       AS product_name,
+                               COALESCE(p.brand, '')                    AS brand,
                                COALESCE(ol.billing_qty, ol.quantity)     AS quantity,
                                ol.unit_price,
                                COALESCE(ol.billing_total, ol.total_price) AS total_price,
@@ -2713,7 +3514,7 @@ def render_bulk_actions():
         if created:
             st.success(f"✅ Created: {', '.join(created)}")
             try:
-                from modules.wa_hub import wa_panel, wa_challan_made, _shop
+                from modules.wa_hub import wa_document_attachment, wa_panel, wa_challan_made, _shop
                 _s = _shop()
                 for _cno in created:
                     _ch_row = _q("SELECT challan_no, grand_total, order_ids FROM challans WHERE challan_no=%s LIMIT 1", (_cno,))
@@ -2739,7 +3540,11 @@ def render_bulk_actions():
                         wa_panel(_party_mob, _msg_ch,
                                  key="ch_created_wa_" + _cno.replace("/","_"),
                                  title="📲 Send Challan WhatsApp — " + _cno,
-                                 expanded=True)
+                                 expanded=True,
+                                 party_name=str(sel_details[0].get("party_name","") if sel_details else ""),
+                                 attachments=[
+                                     wa_document_attachment("challan", _cno)
+                                 ])
             except Exception:
                 pass
             st.rerun()

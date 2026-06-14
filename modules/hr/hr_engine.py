@@ -67,6 +67,11 @@ def ensure_hr_schema() -> None:
             created_at      TIMESTAMPTZ DEFAULT NOW()
         )
     """)
+    _w("""
+        ALTER TABLE employees
+        ADD COLUMN IF NOT EXISTS staff_barcode TEXT UNIQUE,
+        ADD COLUMN IF NOT EXISTS production_stage_codes TEXT
+    """)
 
     # Attendance logs
     _w("""
@@ -161,6 +166,7 @@ def get_all_employees(active_only: bool = True) -> List[Dict]:
     af = "WHERE is_active=TRUE" if active_only else ""
     return _q(f"""
         SELECT id::text, emp_code, name, phone, role, department,
+               production_stage_codes,
                salary_type, salary_amount,
                shift_start::text, shift_end::text,
                late_grace_min, weekly_off, join_date::text, is_active, notes
@@ -174,15 +180,42 @@ def get_employee(emp_id: str) -> Optional[Dict]:
     return rows[0] if rows else None
 
 
+def normalize_shift_time(value, default: str = "10:00") -> str:
+    """Accept common typed formats like 11.00 / 11 / 8:00 and return HH:MM."""
+    raw = str(value or "").strip()
+    if not raw:
+        raw = default
+    raw = raw.replace(".", ":")
+    if raw.isdigit():
+        raw = f"{raw}:00"
+    parts = raw.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid time '{value}'. Use HH:MM, e.g. 11:00")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except Exception as exc:
+        raise ValueError(f"Invalid time '{value}'. Use HH:MM, e.g. 11:00") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"Invalid time '{value}'. Hour must be 0-23 and minute 0-59")
+    return f"{hour:02d}:{minute:02d}"
+
+
 def save_employee(data: Dict) -> str:
     """Upsert employee. Returns id."""
     eid = data.get("id") or str(uuid.uuid4())
+    emp_code = str(data.get("emp_code") or "").strip() or None
+    staff_barcode = str(data.get("staff_barcode") or emp_code or "").strip() or None
+    production_stage_codes = str(data.get("production_stage_codes") or "").strip() or None
+    shift_start = normalize_shift_time(data.get("shift_start"), "10:00")
+    shift_end = normalize_shift_time(data.get("shift_end"), "19:00")
     _w("""
         INSERT INTO employees
             (id, emp_code, name, phone, role, department,
              salary_type, salary_amount, shift_start, shift_end,
-             late_grace_min, weekly_off, join_date, notes)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             late_grace_min, weekly_off, join_date, notes, staff_barcode,
+             production_stage_codes, is_active)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (id) DO UPDATE SET
             emp_code=EXCLUDED.emp_code, name=EXCLUDED.name,
             phone=EXCLUDED.phone, role=EXCLUDED.role,
@@ -192,14 +225,18 @@ def save_employee(data: Dict) -> str:
             shift_start=EXCLUDED.shift_start, shift_end=EXCLUDED.shift_end,
             late_grace_min=EXCLUDED.late_grace_min,
             weekly_off=EXCLUDED.weekly_off, join_date=EXCLUDED.join_date,
-            notes=EXCLUDED.notes
+            notes=EXCLUDED.notes,
+            staff_barcode=EXCLUDED.staff_barcode,
+            production_stage_codes=EXCLUDED.production_stage_codes,
+            is_active=EXCLUDED.is_active
     """, (
-        eid, data.get("emp_code"), data["name"], data.get("phone"),
+        eid, emp_code, data["name"], data.get("phone"),
         data.get("role","STAFF"), data.get("department"),
         data.get("salary_type","MONTHLY"), float(data.get("salary_amount") or 0),
-        data.get("shift_start","10:00"), data.get("shift_end","19:00"),
+        shift_start, shift_end,
         int(data.get("late_grace_min") or 15), data.get("weekly_off","Sunday"),
         data.get("join_date", datetime.date.today()), data.get("notes"),
+        staff_barcode, production_stage_codes, bool(data.get("is_active", True)),
     ))
     return eid
 
@@ -223,7 +260,12 @@ def check_in(emp_id: str, lat: float, lng: float, acc: float) -> Tuple[bool, str
     # Already checked in today?
     existing = get_today_attendance(emp_id)
     if existing and existing.get("check_in_time"):
-        return False, "Already checked in today.", existing
+        if existing.get("check_out_time"):
+            return False, "Already checked out today.", existing
+        if existing.get("check_in_valid"):
+            return False, "Already checked in today.", existing
+        # Existing check-in was outside/unverified. Allow a fresh office GPS
+        # check-in to overwrite it so production access can be unlocked.
 
     within, dist, office = check_within_fence(lat, lng)
     emp = get_employee(emp_id)

@@ -69,9 +69,15 @@ def get_auto_route_metric() -> float:
         from modules.sql_adapter import run_query
         rows = run_query("""
             SELECT
-                SUM(CASE WHEN auto_routed = TRUE THEN 1 ELSE 0 END) AS auto_count,
-                COUNT(*)                                              AS total
-            FROM order_items
+                SUM(
+                    CASE
+                        WHEN UPPER(COALESCE(lens_params->>'manufacturing_route','')) <> ''
+                        THEN 1 ELSE 0
+                    END
+                ) AS auto_count,
+                COUNT(*) AS total
+            FROM order_lines
+            WHERE COALESCE(is_deleted, FALSE) = FALSE
         """) or [{}]
         r = rows[0]
         total = int(r.get("total") or 0)
@@ -93,7 +99,7 @@ def get_supplier_load() -> List[Dict]:
         return run_query("""
             SELECT p.party_name AS supplier, COUNT(so.id) AS po_count
             FROM supplier_orders so
-            JOIN parties p ON p.id = so.supplier_id
+            JOIN parties p ON p.id::text = so.supplier_id::text
             WHERE DATE(so.created_at) = %(today)s
             GROUP BY p.party_name
             ORDER BY po_count DESC

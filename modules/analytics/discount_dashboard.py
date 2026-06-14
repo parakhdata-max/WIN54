@@ -55,9 +55,9 @@ def render_discount_dashboard():
             COALESCE(AVG(NULLIF(ol.discount_percent,0)),0) AS avg_disc_pct
         FROM order_lines ol
         JOIN orders o ON o.id = ol.order_id
-        WHERE o.created_at >= NOW() - INTERVAL '%s days'
+        WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
           AND COALESCE(ol.is_deleted, FALSE) = FALSE
-    """, (period,))
+    """, {"period": period})
 
     if kpi:
         k = kpi[0]
@@ -92,12 +92,12 @@ def render_discount_dashboard():
             )                                             AS disc_ratio_pct
         FROM order_lines ol
         JOIN orders o ON o.id = ol.order_id
-        WHERE o.created_at >= NOW() - INTERVAL '%s days'
+        WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
           AND COALESCE(ol.is_deleted, FALSE) = FALSE
         GROUP BY ol.discount_rule
         ORDER BY discount_given DESC
         LIMIT 10
-    """, (period,))
+    """, {"period": period})
 
     if rules:
         import pandas as pd
@@ -138,14 +138,14 @@ def render_discount_dashboard():
               ON dr.id::text = ANY(
                     string_to_array(NULLIF(ol.applied_rule_ids, ''), ',')
                  )
-            WHERE o.created_at >= NOW() - INTERVAL '%s days'
+            WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
               AND COALESCE(ol.is_deleted, FALSE) = FALSE
               AND ol.applied_rule_ids IS NOT NULL
               AND ol.applied_rule_ids != ''
             GROUP BY dr.name, dr.type
             ORDER BY usage_count DESC
             LIMIT 15
-        """, (period,))
+        """, {"period": period})
 
         if rule_ids:
             import pandas as pd
@@ -180,11 +180,11 @@ def render_discount_dashboard():
                 )                                        AS disc_pct
             FROM orders o
             JOIN order_lines ol ON o.id = ol.order_id
-            WHERE o.created_at >= NOW() - INTERVAL '%s days'
+            WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
               AND COALESCE(ol.is_deleted, FALSE) = FALSE
             GROUP BY o.order_type
             ORDER BY revenue DESC
-        """, (period,))
+        """, {"period": period})
 
         if channel:
             import pandas as pd
@@ -208,13 +208,13 @@ def render_discount_dashboard():
             FROM order_lines ol
             JOIN orders o ON o.id = ol.order_id
             LEFT JOIN products p ON p.id = ol.product_id
-            WHERE o.created_at >= NOW() - INTERVAL '%s days'
+            WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
               AND ol.margin_status IN ('soft_warning', 'hard_stop')
               AND COALESCE(ol.is_deleted, FALSE) = FALSE
             GROUP BY p.product_name
             ORDER BY total_discount DESC
             LIMIT 8
-        """, (period,))
+        """, {"period": period})
 
         if risk:
             import pandas as pd
@@ -243,12 +243,12 @@ def render_discount_dashboard():
         FROM order_lines ol
         JOIN orders o ON o.id = ol.order_id
         LEFT JOIN products p ON p.id = ol.product_id
-        WHERE o.created_at >= NOW() - INTERVAL '%s days'
+        WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
           AND COALESCE(ol.discount_percent, 0) > 20
           AND COALESCE(ol.is_deleted, FALSE) = FALSE
         ORDER BY ol.discount_percent DESC
         LIMIT 20
-    """, (period,))
+    """, {"period": period})
 
     if alerts:
         import pandas as pd
@@ -279,11 +279,11 @@ def render_discount_dashboard():
             )                                        AS disc_pct
         FROM orders o
         JOIN order_lines ol ON o.id = ol.order_id
-        WHERE o.created_at >= NOW() - INTERVAL '%s days'
+        WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
           AND COALESCE(ol.is_deleted, FALSE) = FALSE
         GROUP BY DATE(o.created_at)
         ORDER BY day ASC
-    """, (period,))
+    """, {"period": period})
 
     if trend:
         import pandas as pd
@@ -316,14 +316,14 @@ def render_discount_dashboard():
         FROM order_lines ol
         JOIN orders o ON o.id = ol.order_id
         LEFT JOIN products p ON p.id = ol.product_id
-        WHERE o.created_at >= NOW() - INTERVAL '%s days'
+        WHERE o.created_at >= NOW() - (%(period)s * INTERVAL '1 day')
           AND ol.quantity >= 3
           AND COALESCE(ol.is_deleted, FALSE) = FALSE
         GROUP BY p.product_name, p.brand, ol.quantity
         HAVING COUNT(*) >= 3
         ORDER BY frequency DESC
         LIMIT 8
-    """, (period,))
+    """, {"period": period})
 
     if slab_hints:
         st.markdown("**📦 Frequent Bulk Quantities — Consider Slab Rules:**")

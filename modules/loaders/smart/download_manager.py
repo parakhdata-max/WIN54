@@ -61,6 +61,11 @@ def _get_cfg(file_type: str) -> dict:
     columns    = [c.db_column for c in download_cols]
     # locked = required cols (identity fields — cannot be changed)
     locked     = [c.db_column for c in writable if c.required]
+    # BLANK Recommended Base is mandatory for new/add uploads, but old stock
+    # rows may need this value filled through EDIT upload. Keep it editable
+    # while the loader enforces non-empty values for new imports.
+    if file_type == "BLANK":
+        locked = [c for c in locked if c != "base_recommended"]
     # product_cols = columns that live in products table (read-only in stock files)
     prod_cols  = [c.db_column for c in writable
                   if getattr(c, "notes", "").startswith("Stored on products") or

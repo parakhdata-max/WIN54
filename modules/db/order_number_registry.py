@@ -68,7 +68,7 @@ SERIES_CONFIG = {
     # ── Sales / Billing ───────────────────────────────────────────────────────
     "RETAIL":           {"prefix": "R",    "start": 1, "pad": 4},
     "WHOLESALE":        {"prefix": "W",    "start": 1, "pad": 4},
-    "CONSULTATION":     {"prefix": "CONS", "start": 1, "pad": 4},
+    "CONSULTATION":     {"prefix": "CS",   "start": 1, "pad": 4},
     "CHALLAN":          {"prefix": "CH",   "start": 1, "pad": 4},
     "INVOICE":          {"prefix": "INV",  "start": 1, "pad": 4},
     "CREDIT_NOTE":      {"prefix": "CN",   "start": 1, "pad": 4},
@@ -162,6 +162,21 @@ def ensure_registry(cursor) -> bool:
                 "fye": _fyss[1],
             })
 
+        # ── Repair stale fiscal_year values ──────────────────────────────
+        # Older code seeds may have written full 4-digit years (e.g. "2026")
+        # or 6-digit concatenations (e.g. "202627") instead of the correct
+        # 4-digit compact format (e.g. "2627"). Repair them now — idempotent.
+        _sp(cursor, "_er_fy_repair", """
+            UPDATE order_number_registry
+               SET fiscal_year = %(fy)s,
+                   prefix      = CASE
+                                   WHEN prefix = '' THEN prefix
+                                   ELSE prefix
+                                 END
+             WHERE LENGTH(fiscal_year) <> 4
+                OR fiscal_year = ''
+        """, {"fy": _fy})
+
         # Audit log table
         _sp(cursor, "_er_log", """
             CREATE TABLE IF NOT EXISTS doc_number_log (
@@ -232,17 +247,25 @@ def _fy_integers() -> tuple:
 
 def _sync_from_existing(cursor):
     """
-    If orders table already has display_order_no values from the old
-    PostgreSQL sequence, seed our registry to the current max so we
-    continue numbering from where we left off with no overlap.
+    Seed our registry to the current visible document number.
+
+    Prefer parsing the suffix from order_no because older repair rows can carry
+    a stale display_order_no. One such row made the next order jump from 0007
+    to 0153 even though the visible order number was R/2627/0005.
     """
     try:
         # Sync unified counter (RETAIL covers both RETAIL+WHOLESALE)
         cursor.execute("""
-            SELECT COALESCE(MAX(display_order_no), 0)
+            SELECT COALESCE(MAX(
+                CASE
+                    WHEN order_no ~ '^[A-Z]+/[0-9]{4}/[0-9]+$'
+                    THEN split_part(order_no, '/', 3)::integer
+                    ELSE NULL
+                END
+            ), 0)
             FROM orders
-            WHERE display_order_no IS NOT NULL
-              AND order_type NOT IN ('CONSULTATION','PURCHASE','RETURN')
+            WHERE order_type NOT IN ('CONSULTATION','PURCHASE','RETURN')
+              AND COALESCE(is_deleted, FALSE) = FALSE
         """)
         row = cursor.fetchone()
         max_no = int(row[0]) if row and row[0] else 0
@@ -256,10 +279,16 @@ def _sync_from_existing(cursor):
 
         # Sync CONSULTATION
         cursor.execute("""
-            SELECT COALESCE(MAX(display_order_no), 0)
+            SELECT COALESCE(MAX(
+                CASE
+                    WHEN order_no ~ '^[A-Z]+/[0-9]{4}/[0-9]+$'
+                    THEN split_part(order_no, '/', 3)::integer
+                    ELSE NULL
+                END
+            ), 0)
             FROM orders
-            WHERE display_order_no IS NOT NULL
-              AND order_type = 'CONSULTATION'
+            WHERE order_type = 'CONSULTATION'
+              AND COALESCE(is_deleted, FALSE) = FALSE
         """)
         row = cursor.fetchone()
         cons_max = int(row[0]) if row and row[0] else 0
@@ -272,6 +301,172 @@ def _sync_from_existing(cursor):
 
     except Exception as e:
         logger.debug(f"[OrderNumberRegistry] _sync_from_existing skipped: {e}")
+
+
+_SERIES_DOCUMENT_LOOKUP = {
+    # series: (table, document-number column)
+    "RETAIL":           ("orders", "order_no"),
+    "CONSULTATION":     ("orders", "order_no"),
+    "CHALLAN":          ("challans", "challan_no"),
+    "INVOICE":          ("invoices", "invoice_no"),
+    "CREDIT_NOTE":      ("credit_notes", "cn_number"),
+    "DEBIT_NOTE":       ("debit_notes", "dn_number"),
+    "PAYMENT":          ("payments", "payment_no"),
+    "RECEIPT":          ("payments", "payment_no"),
+    "JOURNAL":          ("journal_entries", "voucher_no"),
+    "PURCHASE_INVOICE": ("purchase_invoices", "invoice_no"),
+}
+
+
+def _document_exists_for_number(cursor, series: str, doc_number: str) -> bool:
+    """Return whether the allocated document number reached its final table."""
+    target = _SERIES_DOCUMENT_LOOKUP.get(_resolve_series(series))
+    if not target or not doc_number:
+        return True
+    table, column = target
+    # table/column come only from the hard-coded lookup above.
+    cursor.execute(
+        f"SELECT 1 FROM {table} WHERE {column} = %(dn)s LIMIT 1",
+        {"dn": doc_number},
+    )
+    return cursor.fetchone() is not None
+
+
+def _reuse_latest_orphan_number(cursor, series: str, last_number: int) -> Optional[int]:
+    """
+    If the latest allocated number never produced a real document row, reuse it.
+
+    This protects legacy two-step callers:
+      1. allocate number
+      2. later insert document
+
+    If step 2 fails, the next allocation reuses that same top number instead of
+    jumping ahead. Older gaps are left auditable; only the latest top allocation
+    can be safely reclaimed without disturbing already-issued documents.
+    """
+    if last_number <= 0:
+        return None
+    resolved = _resolve_series(series)
+    doc_no = format_doc_number(resolved, last_number)
+    _sp_name = "_er_reuse_top"
+    try:
+        cursor.execute(f"SAVEPOINT {_sp_name}")
+        cursor.execute("""
+            SELECT id, status
+            FROM doc_number_log
+            WHERE series = %(s)s
+              AND seq_number = %(n)s
+              AND doc_number = %(d)s
+              AND COALESCE(status,'') NOT IN ('VOID','CANCELLED')
+            ORDER BY id DESC
+            LIMIT 1
+            FOR UPDATE
+        """, {"s": resolved, "n": last_number, "d": doc_no})
+        row = cursor.fetchone()
+        if not row:
+            cursor.execute(f"RELEASE SAVEPOINT {_sp_name}")
+            return None
+        if _document_exists_for_number(cursor, resolved, doc_no):
+            cursor.execute(f"RELEASE SAVEPOINT {_sp_name}")
+            return None
+        cursor.execute("""
+            UPDATE doc_number_log
+            SET status = 'REUSED_PENDING',
+                void_reason = COALESCE(void_reason, 'Reused latest orphan allocation before issuing next number')
+            WHERE id = %(id)s
+        """, {"id": row[0]})
+        cursor.execute(f"RELEASE SAVEPOINT {_sp_name}")
+        logger.warning("[OrderNumberRegistry] Reusing orphan top number %s", doc_no)
+        return last_number
+    except Exception as e:
+        try:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {_sp_name}")
+            cursor.execute(f"RELEASE SAVEPOINT {_sp_name}")
+        except Exception:
+            pass
+        logger.debug("[OrderNumberRegistry] orphan reuse skipped for %s: %s", resolved, e)
+        return None
+
+
+def _order_series_contiguous_max(cursor, series: str) -> int:
+    """
+    Return the highest continuous visible order number from 1..N.
+
+    Retail and wholesale share the visible R/FY/NNNN series in this project.
+    A cancelled placeholder row still counts because it explains a consumed
+    number. Raw allocations in doc_number_log do not count here.
+    """
+    resolved = _resolve_series(series)
+    if resolved != "RETAIL":
+        return 0
+    fy = _fiscal_year_short()
+    cursor.execute("""
+        SELECT split_part(order_no, '/', 3)::integer AS n
+        FROM orders
+        WHERE order_no ~ %(pat)s
+          AND COALESCE(is_deleted, FALSE) = FALSE
+          AND UPPER(COALESCE(order_type,'')) NOT IN ('CONSULTATION','PURCHASE','RETURN')
+        ORDER BY 1
+    """, {"pat": rf"^R/{fy}/[0-9]+$"})
+    present = {int(r[0]) for r in (cursor.fetchall() or []) if r and r[0]}
+    n = 0
+    while (n + 1) in present:
+        n += 1
+    return n
+
+
+def _collapse_retail_orphan_tail(cursor, series: str, last_number: int) -> int:
+    """
+    Repair top-end retail allocations that never reached orders.
+
+    This is deliberately conservative:
+      - top orphan allocations are voided and the registry is moved backward;
+      - if a real order exists after an unresolved gap, allocation is blocked
+        until the visible sequence is repaired.
+    """
+    resolved = _resolve_series(series)
+    if resolved != "RETAIL" or last_number <= 0:
+        return last_number
+
+    contiguous_max = _order_series_contiguous_max(cursor, resolved)
+    current = int(last_number)
+
+    while current > contiguous_max:
+        doc_no = format_doc_number(resolved, current)
+        if _document_exists_for_number(cursor, resolved, doc_no):
+            if current > contiguous_max + 1:
+                raise RuntimeError(
+                    f"Retail order sequence gap detected before {doc_no}. "
+                    f"Expected next visible order is {format_doc_number(resolved, contiguous_max + 1)}. "
+                    "Run Order Number Health repair before posting another order."
+                )
+            break
+
+        cursor.execute("""
+            UPDATE doc_number_log
+            SET status = 'VOID',
+                voided_at = NOW(),
+                voided_by = 'system',
+                void_reason = COALESCE(
+                    void_reason,
+                    'Auto-voided top orphan retail order allocation before next order issue'
+                )
+            WHERE series = %(s)s
+              AND seq_number = %(n)s
+              AND doc_number = %(d)s
+              AND COALESCE(status,'') NOT IN ('VOID','CANCELLED')
+        """, {"s": resolved, "n": current, "d": doc_no})
+        logger.warning("[OrderNumberRegistry] Voided orphan top allocation %s", doc_no)
+        current -= 1
+
+    if current != last_number:
+        cursor.execute("""
+            UPDATE order_number_registry
+            SET last_number = %(n)s,
+                updated_at = NOW()
+            WHERE series = %(s)s
+        """, {"s": resolved, "n": current})
+    return current
 
 
 def next_order_number(
@@ -336,7 +531,13 @@ def next_order_number(
         row = cursor.fetchone() or (0,)
         logger.warning(f"[OrderNumberRegistry] Self-healed missing series: {_series}")
 
-    next_no = int(row[0]) + 1
+    last_no = int(row[0])
+    last_no = _collapse_retail_orphan_tail(cursor, _series, last_no)
+    reusable_no = _reuse_latest_orphan_number(cursor, _series, last_no)
+    if reusable_no:
+        return reusable_no, reusable_no
+
+    next_no = last_no + 1
 
     # Write the incremented value — still inside the same transaction
     cursor.execute("""
@@ -358,7 +559,7 @@ def next_order_number(
         pass
     try:
         _doc_no_preview = format_doc_number(_series, next_no)
-        cursor.execute("""
+        _sp(cursor, "_er_alloc_log", """
             INSERT INTO doc_number_log
                 (series, doc_number, seq_number, fiscal_year, allocated_by)
             VALUES (%s, %s, %s, %s, %s)
@@ -601,13 +802,66 @@ def void_doc_number(doc_number: str, reason: str = "", voided_by: str = "system"
                    voided_by   = %(by)s,
                    void_reason = %(reason)s
             WHERE  doc_number  = %(dn)s
-              AND  status      = 'USED'
+              AND  status      IN ('USED','ALLOCATED','REUSED_PENDING')
         """, {"dn": doc_number, "by": voided_by, "reason": reason or "Cancelled"})
         logger.info(f"[DocNumberLog] Voided: {doc_number} — {reason}")
         return True
     except Exception as e:
         logger.warning(f"[DocNumberLog] void_doc_number failed: {e}")
         return False
+
+
+def audit_document_number_integrity(series: Optional[str] = None) -> list[dict]:
+    """
+    Health check for all protected document series.
+
+    Reports allocations in doc_number_log that do not have a matching document
+    row. This is intentionally read-only and can be shown in an admin panel or
+    run before phase testing.
+    """
+    try:
+        from modules.sql_adapter import get_transaction_connection, close_connection
+        conn = get_transaction_connection()
+        cur = conn.cursor()
+        try:
+            ensure_registry(cur)
+            _series_list = [_resolve_series(series)] if series else sorted(_SERIES_DOCUMENT_LOOKUP)
+            issues = []
+            for _s in _series_list:
+                target = _SERIES_DOCUMENT_LOOKUP.get(_s)
+                if not target:
+                    continue
+                table, column = target
+                cur.execute("""
+                    SELECT id, doc_number, seq_number, status, allocated_at
+                    FROM doc_number_log
+                    WHERE series = %(s)s
+                      AND COALESCE(status,'') NOT IN ('VOID','CANCELLED')
+                    ORDER BY seq_number
+                """, {"s": _s})
+                for rid, doc_no, seq_no, status, allocated_at in cur.fetchall() or []:
+                    cur.execute(
+                        f"SELECT 1 FROM {table} WHERE {column} = %(dn)s LIMIT 1",
+                        {"dn": doc_no},
+                    )
+                    if cur.fetchone() is None:
+                        issues.append({
+                            "series": _s,
+                            "doc_number": doc_no,
+                            "seq_number": seq_no,
+                            "status": status,
+                            "allocated_at": allocated_at,
+                            "target_table": table,
+                            "target_column": column,
+                            "log_id": rid,
+                        })
+            conn.rollback()
+            return issues
+        finally:
+            cur.close()
+            close_connection(conn)
+    except Exception as e:
+        return [{"error": str(e)}]
 
 
 def voided_numbers(series: str = None) -> list:

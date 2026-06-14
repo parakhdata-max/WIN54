@@ -29,10 +29,22 @@ def convert_cart_to_order(
 
     total_items = len(cart_lines)
 
+    # Net total_value: prefer billing_total (already net after restamp)
+    # falling back to total_price - discount_amount. Earlier this used
+    # sum(total_price) which is gross when discount stamping happens later
+    # in the pipeline (run_finalize). The pipeline recomputes this after
+    # discounts apply, but using net here keeps the in-memory order dict
+    # internally consistent and prevents any caller that reads
+    # order["total_value"] before the pipeline finishes from seeing gross.
     total_value = sum(
-        float(line.get("total_price", 0) or 0)
+        float(line.get("billing_total")
+              if line.get("billing_total") is not None
+              else (float(line.get("total_price", 0) or 0)
+                    - float(line.get("discount_amount", 0) or 0)))
         for line in cart_lines
     )
+    if total_value < 0:
+        total_value = 0.0
 
     # ===============================
     # 🔑 CREATE PERMANENT PAIR ID

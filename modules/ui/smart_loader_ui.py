@@ -218,6 +218,24 @@ def _handle_edit_upload(uploaded, file_type: str, cfg: dict):
 
     st.success("✅ File verified — this is a valid system-downloaded edit file.")
 
+    contract_ok = True
+    try:
+        from modules.loaders.loader_contract import (
+            build_loader_contract_report,
+            render_loader_contract_panel,
+        )
+        contract_report = build_loader_contract_report(file_type, guard.df)
+        contract_ok = render_loader_contract_panel(
+            st,
+            contract_report,
+            require_ack=True,
+            key=f"smart_edit_contract_{file_type}_{uploaded.name}",
+        )
+        if not contract_ok:
+            st.stop()
+    except Exception as _contract_ex:
+        st.warning(f"Loader contract check unavailable: {_contract_ex}")
+
     # ── Detect changes ────────────────────────────────────────────────────────
     with st.spinner("Scanning for changes..."):
         report = detect_changes(guard.df, file_type)
@@ -403,7 +421,7 @@ def _handle_edit_upload(uploaded, file_type: str, cfg: dict):
         yes_clicked = st.button(
             "✅ Yes — Apply Changes",
             type="primary",
-            disabled=not can_proceed,
+            disabled=(not can_proceed or not contract_ok),
             key=f"yes_{key_prefix}",
             use_container_width=True,
         )
@@ -519,7 +537,7 @@ def _render_frame_quick_add():
         cost_price    = c4.number_input("Cost Price ₹", min_value=0.0, step=0.5, format="%.2f")
         selling_price = c5.number_input("Selling Price ₹", min_value=0.0, step=0.5, format="%.2f")
         mrp           = c6.number_input("MRP ₹ *", min_value=0.0, step=0.5, format="%.2f")
-        gst_pct       = c7.selectbox("GST %", [0, 5, 12, 18, 28], index=0)
+        gst_pct       = c7.selectbox("GST %", [0, 5, 18], index=0)
         qty           = c8.number_input("Qty *", min_value=0, step=1, value=1)
 
         submitted = st.form_submit_button("➕ Add Frame", type="primary", use_container_width=False)
@@ -699,6 +717,24 @@ def _handle_add_upload(uploaded, file_type: str, cfg: dict):
         st.warning("⚠️ No data rows found after removing example row.")
         return
 
+    contract_ok = True
+    try:
+        from modules.loaders.loader_contract import (
+            build_loader_contract_report,
+            render_loader_contract_panel,
+        )
+        contract_report = build_loader_contract_report(file_type, df)
+        contract_ok = render_loader_contract_panel(
+            st,
+            contract_report,
+            require_ack=True,
+            key=f"smart_add_contract_{file_type}_{uploaded.name}",
+        )
+        if not contract_ok:
+            st.stop()
+    except Exception as _contract_ex:
+        st.warning(f"Loader contract check unavailable: {_contract_ex}")
+
     # Preview
     st.markdown("### 📋 Preview — New Records to Add")
     st.info(f"**{len(df)} new record(s)** ready to add. Review below before confirming.")
@@ -714,6 +750,7 @@ def _handle_add_upload(uploaded, file_type: str, cfg: dict):
             f"✅ Add {len(df)} Records to Database",
             type="primary",
             key=f"confirm_add_{file_type}_{uploaded.name}",
+            disabled=not contract_ok,
             use_container_width=True,
         )
     with col2:
@@ -880,7 +917,7 @@ def _render_main_groups():
         "SELECT id, name, gst_percent, hsn_code, description FROM main_groups ORDER BY name"
     ) or []
 
-    GST_OPTIONS = [0, 5, 12, 18, 28]
+    GST_OPTIONS = [0, 5, 18]
 
     # ── Existing groups ───────────────────────────────────────────────────────
     if not rows:
@@ -947,4 +984,3 @@ def _render_main_groups():
                 st.rerun()
             except Exception as e:
                 st.error(f"Add failed: {e}")
-

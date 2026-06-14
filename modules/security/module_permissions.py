@@ -110,18 +110,33 @@ PERMISSIONS: dict[str, list[str]] = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _current_role() -> str:
-    """Get role from session state."""
+    """Role of the logged-in user, as the matrix expects it (UPPER).
+
+    Stage 1 fix: previously read st.session_state['user_role'], a key that
+    LOGIN NEVER SET — so this always returned VIEWER and the entire action
+    matrix was inert. Now sourced from the canonical principal written at
+    login. Falls back to the old behaviour only if roles.py is unavailable.
+    """
     try:
-        return str(st.session_state.get("user_role", VIEWER)).upper()
+        from modules.security.roles import current_role
+        return current_role().upper()
     except Exception:
-        return VIEWER
+        try:
+            return str(st.session_state.get("user_role", VIEWER)).upper()
+        except Exception:
+            return VIEWER
 
 
 def _current_user() -> str:
+    """Display name of the logged-in user, for permission-denied messages."""
     try:
-        return str(st.session_state.get("user_name", "unknown"))
+        from modules.security.roles import current_user_name
+        return current_user_name()
     except Exception:
-        return "unknown"
+        try:
+            return str(st.session_state.get("user_name", "unknown"))
+        except Exception:
+            return "unknown"
 
 
 def can(action: str, role: str = None) -> bool:

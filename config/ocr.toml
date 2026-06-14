@@ -1,0 +1,11 @@
+# WIN54 OCR Configuration
+# Set tesseract_cmd to the full path of your Tesseract executable.
+# Or set the environment variable TESSERACT_CMD instead.
+# Leave blank to auto-detect from standard install locations.
+
+[ocr]
+# Windows example:
+# tesseract_cmd = "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+# Linux/Mac (usually on PATH):
+# tesseract_cmd = "tesseract"
+tesseract_cmd = "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"

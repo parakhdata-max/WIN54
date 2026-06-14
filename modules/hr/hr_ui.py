@@ -9,6 +9,15 @@ import streamlit.components.v1 as _stc
 from datetime import date, timedelta
 import calendar
 
+PRODUCTION_STAGE_OPTIONS = {
+    "Production In": "PRODUCTION_PICKED",
+    "Production Done": "PRODUCTION_DONE",
+    "Inspection Done": "INSPECTION",
+    "Hardcoat In": "HARDCOAT_PICKED",
+    "Hardcoat Done": "HARDCOAT_DONE",
+    "Inspection after Hardcoat": "INSPECTION_AFTER_HC",
+}
+
 
 def _q(sql, params=None):
     from modules.sql_adapter import run_query
@@ -365,8 +374,12 @@ def _tab_monthly():
     grid_data = []
     for emp in employees:
         edf = df[df["name"] == emp]
-        day_status = {int(r["day"]): status_map.get(r["status"], "A")
-                      for _, r in edf.iterrows()}
+        day_status = {}
+        for _, r in edf.iterrows():
+            day_val = pd.to_numeric(r.get("day"), errors="coerce")
+            if pd.isna(day_val):
+                continue
+            day_status[int(day_val)] = status_map.get(r.get("status"), "A")
         row = {"Employee": emp}
         for d in range(1, days_in_month+1):
             row[str(d)] = day_status.get(d, "")
@@ -472,66 +485,111 @@ def _tab_employees():
 
     with st.expander("➕ Add / Edit Employee", expanded=False):
         emps = get_all_employees(active_only=False)
-        edit_opts = {"New Employee":{}} | {e["name"]: e for e in emps}
+        edit_opts = {"New Employee": {}}
+        for e in emps:
+            status = "" if e.get("is_active", True) else " · inactive"
+            code_part = f"{e.get('emp_code') or 'NO-CODE'}"
+            edit_opts[f"{code_part} · {e.get('name') or 'Unnamed'}{status}"] = e
         editing = st.selectbox("Edit existing or add new",
                                 list(edit_opts.keys()), key="emp_edit_sel")
         ed = edit_opts.get(editing, {})
+        form_key = str(ed.get("id") or "new")[:8]
 
         c1,c2 = st.columns(2)
-        name    = c1.text_input("Name *",      value=ed.get("name",""),      key="emp_name")
-        code    = c2.text_input("Emp Code",    value=ed.get("emp_code",""),  key="emp_code")
-        phone   = c1.text_input("Phone",       value=ed.get("phone",""),     key="emp_phone")
+        name    = c1.text_input("Name *",      value=ed.get("name",""),      key=f"emp_name_{form_key}")
+        code    = c2.text_input("Emp Code",    value=ed.get("emp_code",""),  key=f"emp_code_{form_key}")
+        phone   = c1.text_input("Phone",       value=ed.get("phone",""),     key=f"emp_phone_{form_key}")
+        role_options = ["STAFF","DELIVERY","MANAGER","ADMIN"]
+        role_value = str(ed.get("role") or "STAFF").upper()
+        if role_value not in role_options:
+            role_value = "STAFF"
         role    = c2.selectbox("Role",
-                               ["STAFF","DELIVERY","MANAGER","ADMIN"],
-                               index=["STAFF","DELIVERY","MANAGER","ADMIN"].index(
-                                   ed.get("role","STAFF")), key="emp_role")
-        dept    = c1.text_input("Department",  value=ed.get("department",""), key="emp_dept")
-        stype   = c2.selectbox("Salary Type", ["MONTHLY","DAILY"],
-                               index=["MONTHLY","DAILY"].index(
-                                   ed.get("salary_type","MONTHLY")), key="emp_stype")
+                               role_options,
+                               index=role_options.index(role_value), key=f"emp_role_{form_key}")
+        dept    = c1.text_input("Department",  value=ed.get("department",""), key=f"emp_dept_{form_key}")
+        salary_types = ["MONTHLY","DAILY"]
+        stype_value = str(ed.get("salary_type") or "MONTHLY").upper()
+        if stype_value not in salary_types:
+            stype_value = "MONTHLY"
+        stype   = c2.selectbox("Salary Type", salary_types,
+                               index=salary_types.index(stype_value), key=f"emp_stype_{form_key}")
         salary  = c1.number_input("Salary ₹", value=float(ed.get("salary_amount") or 0),
-                                   step=500.0, key="emp_sal")
+                                   step=500.0, key=f"emp_sal_{form_key}")
         shift_s = c2.text_input("Shift Start", value=str(ed.get("shift_start","10:00"))[:5],
-                                 key="emp_shiftstart", placeholder="HH:MM")
+                                 key=f"emp_shiftstart_{form_key}", placeholder="HH:MM")
         shift_e = c1.text_input("Shift End",   value=str(ed.get("shift_end","19:00"))[:5],
-                                 key="emp_shiftend",   placeholder="HH:MM")
+                                 key=f"emp_shiftend_{form_key}",   placeholder="HH:MM")
         grace   = c2.number_input("Late grace (min)", value=int(ed.get("late_grace_min") or 15),
-                                   step=5, key="emp_grace")
+                                   step=5, key=f"emp_grace_{form_key}")
+        weekly_options = ["Sunday","Monday","Saturday","None"]
+        weekly_value = str(ed.get("weekly_off") or "Sunday")
+        if weekly_value not in weekly_options:
+            weekly_value = "Sunday"
         weekly  = c1.selectbox("Weekly Off",
-                               ["Sunday","Monday","Saturday","None"],
-                               index=["Sunday","Monday","Saturday","None"].index(
-                                   ed.get("weekly_off","Sunday")), key="emp_woff")
+                               weekly_options,
+                               index=weekly_options.index(weekly_value), key=f"emp_woff_{form_key}")
         j_date  = c2.date_input("Join Date",
                                  value=date.fromisoformat(str(ed.get("join_date",date.today()))[:10]),
-                                 key="emp_jdate")
-        notes   = st.text_area("Notes", value=ed.get("notes","") or "", height=60, key="emp_notes")
+                                 key=f"emp_jdate_{form_key}")
+        notes   = st.text_area("Notes", value=ed.get("notes","") or "", height=60, key=f"emp_notes_{form_key}")
+        is_active = st.checkbox("Active employee", value=bool(ed.get("is_active", True)), key=f"emp_active_{form_key}")
+
+        saved_stage_codes = {
+            x.strip().upper()
+            for x in str(ed.get("production_stage_codes") or "").replace("|", ",").replace(";", ",").split(",")
+            if x.strip()
+        }
+        default_stage_labels = [
+            label for label, code_val in PRODUCTION_STAGE_OPTIONS.items()
+            if code_val in saved_stage_codes
+        ]
+        stage_labels = st.multiselect(
+            "Production stage access",
+            list(PRODUCTION_STAGE_OPTIONS.keys()),
+            default=default_stage_labels,
+            key=f"emp_prod_stage_access_{form_key}",
+            help="Controls which production jobs and stage buttons this staff can see on mobile scanner.",
+        )
+        stage_codes = ",".join(PRODUCTION_STAGE_OPTIONS[label] for label in stage_labels)
 
         if st.button("💾 Save Employee", type="primary", key="emp_save",
-                      disabled=not name.strip()):
-            save_employee({
-                "id":           ed.get("id"),
-                "emp_code":     code.strip() or None,
-                "name":         name.strip(),
-                "phone":        phone.strip() or None,
-                "role":         role,
-                "department":   dept.strip() or None,
-                "salary_type":  stype,
-                "salary_amount":salary,
-                "shift_start":  shift_s,
-                "shift_end":    shift_e,
-                "late_grace_min": grace,
-                "weekly_off":   weekly,
-                "join_date":    j_date,
-                "notes":        notes.strip() or None,
-            })
-            st.success(f"✅ {name} saved.")
-            st.rerun()
+                      disabled=not (name or "").strip()):
+            try:
+                from modules.hr.hr_engine import normalize_shift_time
+                save_employee({
+                    "id":           ed.get("id"),
+                    "emp_code":     (code or "").strip() or None,
+                    "name":         (name or "").strip(),
+                    "phone":        (phone or "").strip() or None,
+                    "role":         role,
+                    "department":   (dept or "").strip() or None,
+                    "salary_type":  stype,
+                    "salary_amount":salary,
+                    "shift_start":  normalize_shift_time(shift_s, "10:00"),
+                    "shift_end":    normalize_shift_time(shift_e, "19:00"),
+                    "late_grace_min": grace,
+                    "weekly_off":   weekly,
+                    "join_date":    j_date,
+                    "notes":        (notes or "").strip() or None,
+                    "production_stage_codes": stage_codes,
+                    "is_active":    is_active,
+                })
+                st.success(f"✅ {name} saved.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
 
     # Employee list
     emps = get_all_employees()
     if emps:
         df = _df(emps)
-        show_cols = ["emp_code","name","role","phone","salary_type",
+        df["production_access"] = df.get("production_stage_codes", "").fillna("").apply(
+            lambda raw: ", ".join(
+                label for label, code_val in PRODUCTION_STAGE_OPTIONS.items()
+                if code_val in {x.strip().upper() for x in str(raw or "").replace("|", ",").replace(";", ",").split(",")}
+            )
+        )
+        show_cols = ["emp_code","name","role","phone","department","production_access","salary_type",
                      "salary_amount","shift_start","shift_end","weekly_off"]
         st.dataframe(df[[c for c in show_cols if c in df.columns]],
                      width='stretch', hide_index=True,
@@ -712,6 +770,9 @@ def render_hr():
         "👤 Employees",
         "🏢 Office Setup",
         "💰 Payroll",
+        "📱 Scanner Setup",
+        "⚙️ Production Log",
+        "🔑 Admin Clearance",
     ])
 
     with tabs[0]: _tab_my_attendance()
@@ -721,3 +782,12 @@ def render_hr():
     with tabs[4]: _tab_employees()
     with tabs[5]: _tab_office_setup()
     with tabs[6]: _tab_payroll()
+    with tabs[7]:
+        from modules.hr.hr_scanner_ui import _tab_scanner_setup
+        _tab_scanner_setup()
+    with tabs[8]:
+        from modules.hr.hr_scanner_ui import _tab_production_log
+        _tab_production_log()
+    with tabs[9]:
+        from modules.hr.hr_scanner_ui import _tab_admin_clearance
+        _tab_admin_clearance()

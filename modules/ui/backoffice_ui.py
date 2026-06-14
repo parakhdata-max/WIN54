@@ -809,9 +809,32 @@ def render_order_detail():
     # 
     order = None
     for o in st.session_state.bo_active_orders:
-        if get_display_order_id(o) == order_id:
+        if get_display_order_id(o) == order_id or str(o.get("order_id","")) == str(order_id):
             order = o
             break
+
+    # Lazy load: if we only have a summary row (no lines), load full detail now
+    if order is not None and not order.get("lines") and not order.get("_existed_in_db"):
+        try:
+            from modules.backoffice.order_loader import load_single_order as _lso
+            _full = _lso(str(order.get("id") or order.get("order_id") or order_id))
+            if _full:
+                order = _full
+                # Update the session state entry so next open is instant
+                for _i, _o in enumerate(st.session_state.bo_active_orders):
+                    if get_display_order_id(_o) == order_id:
+                        st.session_state.bo_active_orders[_i] = _full
+                        break
+        except Exception as _le:
+            pass  # fall through with summary row — UI will show what it has
+
+    if not order:
+        # Not in session list — try direct DB load
+        try:
+            from modules.backoffice.order_loader import load_single_order as _lso2
+            order = _lso2(str(order_id))
+        except Exception:
+            pass
 
     if not order:
         st.error("Order not found")
@@ -897,6 +920,9 @@ def render_order_detail():
     all_lines.extend(order.get('lab_order_lines', []))
 
     # Tabs for different sections
+    # Auto-jump to billing tab if coming from production page
+    _jump_billing = st.session_state.pop("bo_jump_to_billing", False)
+
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📦 Order Items", 
         "📄 Documents", 
@@ -1532,64 +1558,230 @@ def render_order_detail():
         render_order_status_window(order)
     
     with tab4:
-        # Billing tab
-        st.markdown("###  Billing Summary")
-        
-        # 🔐 Check if any pricing is locked
-        locked_count = sum(1 for line in all_lines if line.get('pricing_locked', False))
+        # ── Billing Summary ───────────────────────────────────────────────
+        st.markdown("### 💰 Billing Summary")
+
+        # ── Pricing summary ───────────────────────────────────────────────
+        locked_count    = sum(1 for line in all_lines if line.get("pricing_locked", False))
+        total_billing   = sum(float(line.get("billing_total") or 0) for line in all_lines)
+        total_discount  = sum(float(line.get("discount_amount") or 0) for line in all_lines)
+        total_allocated = sum(int(line.get("allocated_qty") or 0) for line in all_lines)
+
         if locked_count > 0:
-            st.info(f"🔒 {locked_count} of {len(all_lines)} line items have locked pricing")
-        
-        total_billing = sum(line.get('billing_total', 0) for line in all_lines)
-        total_allocated = sum(line.get('allocated_qty', 0) for line in all_lines)
-        
-        col_x, col_y, col_z = st.columns(3)
-        
-        with col_x:
-            st.metric("Total Items", len(all_lines))
-        with col_y:
-            st.metric("Total Allocated", total_allocated)
-        with col_z:
-            st.metric("Total Billing", f"{total_billing:.2f}")
-        
-        # Billing details
-        
+            st.info(f"🔒 {locked_count} of {len(all_lines)} line(s) have locked pricing")
+
+        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+        _mc1.metric("Lines",          len(all_lines))
+        _mc2.metric("Allocated",      total_allocated)
+        _mc3.metric("Discount",       f"₹{total_discount:.2f}")
+        _mc4.metric("Billing Total",  f"₹{total_billing:.2f}")
+
+        # ── Line table with discount ──────────────────────────────────────
         billing_data = []
-        for idx, line in enumerate(all_lines, 1):
+        for _bi, line in enumerate(all_lines, 1):
+            _bqty   = int(line.get("billing_qty") or 0)
+            _bprice = float(line.get("unit_price") or 0)
+            _bdisc  = float(line.get("discount_amount") or 0)
+            _btotal = float(line.get("billing_total") or 0)
+            _bgross = _bqty * _bprice
             billing_data.append({
-                'Line #': idx,
-                'Product': line.get('product_name', 'N/A'),
-                'Qty': int(line.get('billing_qty', 0) or 0),  #  FIX: Use billing_qty for billing
-                'Unit Price': f"{line.get('unit_price', 0):.2f}",
-                'Total': f"{line.get('billing_total', 0):.2f}",
-                '🔒': '🔒' if line.get('pricing_locked', False) else ''
+                "#":        _bi,
+                "Product":  line.get("product_name", "N/A"),
+                "Eye":      str(line.get("eye_side", "")).upper(),
+                "Qty":      _bqty,
+                "Unit ₹":   f"{_bprice:.2f}",
+                "Gross ₹":  f"{_bgross:.2f}",
+                "Disc ₹":   f"{_bdisc:.2f}" if _bdisc else "—",
+                "Total ₹":  f"{_btotal:.2f}",
+                "Route":    str(line.get("manufacturing_route") or "—").upper(),
+                "🔒":       "🔒" if line.get("pricing_locked") else "",
             })
-        
-        st.dataframe(pd.DataFrame(billing_data), use_container_width=True)
-        
-        # 📊 PRICING DEBUG TOGGLE
+        st.dataframe(pd.DataFrame(billing_data), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ── INLINE BILL NOW ───────────────────────────────────────────────
+        # Check which lines are ready to bill (not yet on any challan)
+        _bill_ready = []
+        _bill_blocked = ""
+        try:
+            from modules.sql_adapter import run_query as _rq_b4
+            _BILL_READY_STAGES = {
+                "READY_TO_BILL", "READY_FOR_PACK", "FITTING_DONE", "READY_FOR_BILLING",
+            }
+            for _bl in all_lines:
+                _bl_id    = str(_bl.get("line_id") or _bl.get("id") or "")
+                _bl_route = str(_bl.get("manufacturing_route") or "").upper()
+                _bl_price = float(_bl.get("billing_total") or 0)
+                if _bl_price <= 0:
+                    continue  # skip zero-value lines
+
+                # Already billed?
+                _already = _rq_b4("""
+                    SELECT 1 FROM challan_lines cl
+                    JOIN challans c ON c.id = cl.challan_id
+                    WHERE cl.order_line_id = %(lid)s::uuid
+                      AND c.status NOT IN ('CANCELLED','VOID')
+                    LIMIT 1
+                """, {"lid": _bl_id}) if _bl_id else []
+                if _already:
+                    continue
+
+                if _bl_route != "INHOUSE":
+                    # Non-inhouse: always billable
+                    _bill_ready.append(_bl)
+                else:
+                    # Inhouse: check job stage
+                    _jm = _rq_b4("""
+                        SELECT current_stage, is_closed FROM job_master
+                        WHERE order_line_id = %(lid)s::uuid LIMIT 1
+                    """, {"lid": _bl_id}) if _bl_id else []
+                    if _jm:
+                        _stg   = str(_jm[0].get("current_stage") or "").upper()
+                        _clsd  = bool(_jm[0].get("is_closed"))
+                        if _clsd or _stg in _BILL_READY_STAGES:
+                            _bill_ready.append(_bl)
+                        else:
+                            _bill_blocked = (
+                                f"{str(_bl.get('product_name',''))[:20]} "
+                                f"[{_bl_route}]: stage {_stg or 'NOT STARTED'}"
+                            )
+                    else:
+                        # No job card yet — not ready
+                        _bill_blocked = (
+                            f"{str(_bl.get('product_name',''))[:20]}: "
+                            "Job card not created yet"
+                        )
+        except Exception as _b4e:
+            st.caption(f"Billing readiness check: {_b4e}")
+
+        _bill_total = sum(float(l.get("billing_total") or 0) for l in _bill_ready)
+        _bill_lbl = (
+            f"💰 Bill Now — {len(_bill_ready)} line(s) · ₹{_bill_total:,.2f}"
+            if _bill_ready else "💰 Billing (not ready)"
+        )
+
+        with st.expander(
+            _bill_lbl,
+            expanded=bool(_bill_ready) and not _bill_blocked and _jump_billing
+        ):
+            if _bill_blocked:
+                st.warning(
+                    "Cannot bill — INHOUSE job not ready: "
+                    + _bill_blocked
+                    + ". Advance to Ready for Pack then Ready to Bill first."
+                )
+            if not _bill_ready:
+                if not _bill_blocked:
+                    st.info("No unbilled lines ready on this order.")
+            else:
+                # Show what will be billed
+                for _rl in _bill_ready:
+                    _rl_eye   = str(_rl.get("eye_side","")).upper()
+                    _rl_name  = str(_rl.get("product_name","")).split(" | ")[0][:35]
+                    _rl_disc  = float(_rl.get("discount_amount") or 0)
+                    _rl_total = float(_rl.get("billing_total") or 0)
+                    st.markdown(
+                        f"<div style='display:flex;justify-content:space-between;"
+                        f"padding:3px 0;border-bottom:1px solid #1e293b;font-size:0.8rem'>"
+                        f"<span>{_rl_eye} {_rl_name}</span>"
+                        f"<span style='color:#10b981;font-weight:700'>₹{_rl_total:,.2f}"
+                        + (f" <span style='color:#64748b;font-size:0.7rem'>(-₹{_rl_disc:.2f})</span>"
+                           if _rl_disc > 0 else "")
+                        + "</span></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown(
+                    f"<div style='text-align:right;color:#10b981;font-weight:800;"
+                    f"font-size:1rem;padding:8px 0'>Total: ₹{_bill_total:,.2f}</div>",
+                    unsafe_allow_html=True,
+                )
+
+                _xc1, _xc2 = st.columns(2)
+                _chal_no  = _xc1.text_input("Challan No",
+                                              key=f"bo_chal_{order_id}",
+                                              placeholder="Auto-generated if blank")
+                _remarks  = _xc2.text_input("Remarks",
+                                              key=f"bo_rem_{order_id}",
+                                              placeholder="Optional")
+
+                _do_chal = st.button(
+                    f"🧾 Create Challan — ₹{_bill_total:,.2f}",
+                    key=f"bo_do_chal_{order_id}",
+                    type="primary", use_container_width=True,
+                )
+                _do_inv = st.button(
+                    "🧾 → 📄 Challan + Invoice",
+                    key=f"bo_do_inv_{order_id}",
+                    use_container_width=True,
+                )
+
+                if _do_chal or _do_inv:
+                    try:
+                        from modules.billing.challan_invoice_manager import (
+                            create_challan_for_order,
+                        )
+                        _result = create_challan_for_order(
+                            order_id=str(order.get("id") or order_id),
+                            order_no=str(order.get("order_no") or order_id),
+                            party_id=str(order.get("party_id") or ""),
+                            party_name=str(order.get("party_name") or
+                                          order.get("patient_name") or ""),
+                            line_ids=[str(l.get("line_id") or l.get("id",""))
+                                      for l in _bill_ready],
+                            challan_no=_chal_no.strip() or None,
+                            remarks=_remarks.strip() or None,
+                        )
+                        if _result and _result.get("challan_no"):
+                            st.success(
+                                f"✅ Challan {_result['challan_no']} created · "
+                                f"₹{_bill_total:,.2f}"
+                            )
+                            if _do_inv and _result.get("challan_id"):
+                                try:
+                                    from modules.billing.challan_invoice_manager import (
+                                        create_invoice_from_challan,
+                                    )
+                                    _inv = create_invoice_from_challan(_result["challan_id"])
+                                    if _inv and _inv.get("invoice_no"):
+                                        st.success(f"📄 Invoice {_inv['invoice_no']} created")
+                                except Exception as _ie:
+                                    st.warning(f"Invoice error: {_ie}")
+                            import time; time.sleep(0.4)
+                            st.rerun()
+                        else:
+                            st.error(f"Challan creation failed: {_result}")
+                    except ImportError:
+                        st.info(
+                            "Direct billing not available in this module. "
+                            "Use the Billing Gate tab to create a challan."
+                        )
+                    except Exception as _ce:
+                        st.error(f"Billing error: {_ce}")
+
+        # ── Pricing debug toggle ──────────────────────────────────────────
         st.markdown("---")
         if st.checkbox("🔍 Debug Pricing (Advanced)", key=f"debug_pricing_{order_id}"):
-            st.markdown("####  Line Item Debug Information")
-            st.caption("Shows detailed pricing calculations for each line item")
-            
-            for idx, line in enumerate(all_lines, 1):
-                with st.expander(f"Line {idx}: {line.get('product_name', 'N/A')}", expanded=False):
-                    debug_info = {
-                        "Product ID": line.get('product_id', 'N/A'),
-                        "Price Source": line.get('price_source', 'unknown'),
-                        "Eye Side": line.get('eye_side', 'N/A'),
-                        "Billing Qty": line.get('billing_qty', 0),
-                        "Allocated Qty": line.get('allocated_qty', 0),
-                        "Pending Qty": max(0, int(line.get('billing_qty', 0) or 0) - int(line.get('allocated_qty', 0) or 0)),
-                        "Unit Price": line.get('unit_price', 0),
-                        "Discount %": line.get('discount_percent', 0),
-                        "Billing Total": line.get('billing_total', 0),
-                        "Manufacturing Route": line.get('manufacturing_route', 'N/A'),
-                        "Batch Allocation": line.get('batch_allocation', []),
-                        "Pricing Locked": line.get('pricing_locked', False),
-                    }
-                    st.json(debug_info, expanded=False)
+            st.markdown("#### Line Item Debug")
+            for _di, line in enumerate(all_lines, 1):
+                with st.expander(f"Line {_di}: {line.get('product_name', 'N/A')}", expanded=False):
+                    st.json({
+                        "product_id":           line.get("product_id", "N/A"),
+                        "price_source":         line.get("price_source", "unknown"),
+                        "eye_side":             line.get("eye_side", "N/A"),
+                        "billing_qty":          line.get("billing_qty", 0),
+                        "allocated_qty":        line.get("allocated_qty", 0),
+                        "pending_qty":          max(0, int(line.get("billing_qty") or 0) -
+                                                     int(line.get("allocated_qty") or 0)),
+                        "unit_price":           line.get("unit_price", 0),
+                        "discount_amount":      line.get("discount_amount", 0),
+                        "discount_percent":     line.get("discount_percent", 0),
+                        "billing_total":        line.get("billing_total", 0),
+                        "manufacturing_route":  line.get("manufacturing_route", "N/A"),
+                        "batch_allocation":     line.get("batch_allocation", []),
+                        "pricing_locked":       line.get("pricing_locked", False),
+                    }, expanded=False)
     
     # =====================================================
     # TAB 5: SUPPLIER ORDERS PANEL

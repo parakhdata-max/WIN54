@@ -500,7 +500,7 @@ def _tab_invoice_builder(rules):
         ln_name  = la.text_input("Product",  "Frame A", key="ln_name")
         ln_price = lb.number_input("Price ₹", value=500.0, min_value=0.0, key="ln_price")
         ln_qty   = lc.number_input("Qty",     value=10, min_value=1, key="ln_qty")
-        ln_gst   = ld.number_input("GST %",   value=12.0, min_value=0.0, key="ln_gst")
+        ln_gst   = ld.number_input("GST %",   value=5.0, min_value=0.0, key="ln_gst")
         ln_cat   = st.text_input("Product Cat", "frame", key="ln_cat")
         if st.button("Add Line", key="add_inv_line"):
             st.session_state.inv_lines.append({
@@ -612,7 +612,7 @@ def _tab_add_rule():
 
         r6, r7, r8 = st.columns(3)
         value       = r6.number_input("Value (% or ₹)", value=0.0, min_value=0.0, step=0.5)
-        gst_rate    = r7.number_input("GST Rate %", value=12.0, min_value=0.0, step=0.5)
+        gst_rate    = r7.number_input("GST Rate %", value=5.0, min_value=0.0, step=0.5)
         priority    = r8.number_input("Priority (1=highest)", value=3, min_value=1, max_value=5)
 
         st.markdown("**Conditions (all optional)**")
@@ -690,7 +690,7 @@ def _tab_validator_test():
                 "unit_price":   800.0,
                 "total_price":  8000.0,
                 "billing_total":8000.0,
-                "gst_percent":  12.0,
+                "gst_percent":  5.0,
                 "sph":   -2.50,
                 "cyl":   -0.75,
                 "axis":  90,

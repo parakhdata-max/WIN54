@@ -26,8 +26,17 @@ from typing import Dict, List, Tuple, Optional
 def normalize_to_pcs(price, unit, box_size):
     """
     Convert BOX price → PCS price
+
+    Keep this aligned with modules.core.price_qty_governor:
+    box_size > 1 is the definitive box-product signal because legacy stock rows
+    may store unit as PCS/NOS even when the price is per box.
     """
-    if unit == "BOX" and box_size and box_size > 0:
+    try:
+        box_size = int(box_size or 0)
+    except (TypeError, ValueError):
+        box_size = 0
+
+    if box_size > 1:
         return price / box_size
     return price
 
