@@ -1,11 +1,55 @@
-node_modules/
-dist/
-build/
-.env
-*.log
-coverage/
-.cache/
-
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Logs
 logs/
+*.log
+
+# Backups / database dumps
+backups/
+*.sql
+*.dump
+*.backup
+
+# Uploads / generated files
+uploads/
+generated_docs/
+exports/
+reports/
+invoices/
+challans/
+receipts/
+
+# Archives
+*.zip
+*.rar
+*.7z
+
+# OS / editor
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# Temporary / debug
+debug_*.py
+test_*.py
+*_backup.py
+*.bak
+*.tmp
+
+# Streamlit
+.streamlit/secrets.toml
